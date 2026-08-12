@@ -220,7 +220,6 @@ licensed, Copyright (c) 2023 Tim Delisle, Nicolas Joseph. See [`NOTICE`](../../N
 full attribution.
 
 - **Original project**: https://github.com/514-labs/moosestack
-- **Fork**: https://github.com/bayoudhi/moosestack
 
 ## License
 
