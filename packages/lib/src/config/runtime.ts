@@ -11,21 +11,9 @@ interface RuntimeClickHouseConfig {
   rlsPassword?: string;
 }
 
-interface RuntimeKafkaConfig {
-  broker: string;
-  messageTimeoutMs: number;
-  saslUsername?: string;
-  saslPassword?: string;
-  saslMechanism?: string;
-  securityProtocol?: string;
-  namespace?: string;
-  schemaRegistryUrl?: string;
-}
-
 class ConfigurationRegistry {
   private static instance: ConfigurationRegistry;
   private clickhouseConfig?: RuntimeClickHouseConfig;
-  private kafkaConfig?: RuntimeKafkaConfig;
 
   static getInstance(): ConfigurationRegistry {
     if (!ConfigurationRegistry.instance) {
@@ -36,10 +24,6 @@ class ConfigurationRegistry {
 
   setClickHouseConfig(config: RuntimeClickHouseConfig): void {
     this.clickhouseConfig = config;
-  }
-
-  setKafkaConfig(config: RuntimeKafkaConfig): void {
-    this.kafkaConfig = config;
   }
 
   private _env(name: string): string | undefined {
@@ -178,64 +162,10 @@ class ConfigurationRegistry {
     };
   }
 
-  async getKafkaConfig(): Promise<RuntimeKafkaConfig> {
-    if (this.kafkaConfig) {
-      return this.kafkaConfig;
-    }
-
-    const projectConfig = await readProjectConfig();
-
-    const envBroker =
-      this._env("TCH_REDPANDA_CONFIG__BROKER") ??
-      this._env("TCH_KAFKA_CONFIG__BROKER");
-    const envMsgTimeout =
-      this._env("TCH_REDPANDA_CONFIG__MESSAGE_TIMEOUT_MS") ??
-      this._env("TCH_KAFKA_CONFIG__MESSAGE_TIMEOUT_MS");
-    const envSaslUsername =
-      this._env("TCH_REDPANDA_CONFIG__SASL_USERNAME") ??
-      this._env("TCH_KAFKA_CONFIG__SASL_USERNAME");
-    const envSaslPassword =
-      this._env("TCH_REDPANDA_CONFIG__SASL_PASSWORD") ??
-      this._env("TCH_KAFKA_CONFIG__SASL_PASSWORD");
-    const envSaslMechanism =
-      this._env("TCH_REDPANDA_CONFIG__SASL_MECHANISM") ??
-      this._env("TCH_KAFKA_CONFIG__SASL_MECHANISM");
-    const envSecurityProtocol =
-      this._env("TCH_REDPANDA_CONFIG__SECURITY_PROTOCOL") ??
-      this._env("TCH_KAFKA_CONFIG__SECURITY_PROTOCOL");
-    const envNamespace =
-      this._env("TCH_REDPANDA_CONFIG__NAMESPACE") ??
-      this._env("TCH_KAFKA_CONFIG__NAMESPACE");
-    const envSchemaRegistryUrl =
-      this._env("TCH_REDPANDA_CONFIG__SCHEMA_REGISTRY_URL") ??
-      this._env("TCH_KAFKA_CONFIG__SCHEMA_REGISTRY_URL");
-
-    const fileKafka =
-      projectConfig.kafka_config ?? projectConfig.redpanda_config;
-
-    return {
-      broker: envBroker ?? fileKafka?.broker ?? "localhost:19092",
-      messageTimeoutMs:
-        envMsgTimeout ?
-          parseInt(envMsgTimeout, 10)
-        : (fileKafka?.message_timeout_ms ?? 1000),
-      saslUsername: envSaslUsername ?? fileKafka?.sasl_username,
-      saslPassword: envSaslPassword ?? fileKafka?.sasl_password,
-      saslMechanism: envSaslMechanism ?? fileKafka?.sasl_mechanism,
-      securityProtocol: envSecurityProtocol ?? fileKafka?.security_protocol,
-      namespace: envNamespace ?? fileKafka?.namespace,
-      schemaRegistryUrl: envSchemaRegistryUrl ?? fileKafka?.schema_registry_url,
-    };
-  }
-
   hasRuntimeConfig(): boolean {
-    return !!this.clickhouseConfig || !!this.kafkaConfig;
+    return !!this.clickhouseConfig;
   }
 }
 
 (globalThis as any)._tchConfigRegistry = ConfigurationRegistry.getInstance();
-export type {
-  ConfigurationRegistry,
-  RuntimeClickHouseConfig,
-  RuntimeKafkaConfig,
-};
+export type { ConfigurationRegistry, RuntimeClickHouseConfig };
