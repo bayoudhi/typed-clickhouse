@@ -340,7 +340,13 @@ jobs:
         run: |
           set -eo pipefail
           shopt -s nullglob
-          tarballs=(platform-packages/*.tgz)
+          # The ./ prefix is load-bearing. npm reads a bare "dir/file.tgz" as a
+          # GitHub shorthand "owner/repo" and tries to clone it:
+          #   npm error command git ls-remote
+          #     ssh://git@github.com/platform-packages/...-0.1.0.tgz.git
+          #   npm error git@github.com: Permission denied (publickey)
+          # A path starting with ./ is unambiguously a file.
+          tarballs=(./platform-packages/*.tgz)
           # One tarball per matrix leg. Publishing fewer would ship a release
           # whose wrapper resolves a platform package that does not exist.
           if [ "${#tarballs[@]}" -ne 3 ]; then
@@ -364,6 +370,10 @@ jobs:
     needs:
       - version
       - publish-binaries
+      # Also the library: bin.rs compares the CLI's version to
+      # `tch-runner print-version` with strict equality, so a wrapper published
+      # without its matching @typed-clickhouse/core is dead on arrival.
+      - publish-library
     if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
     permissions:
       contents: "read"
@@ -461,8 +471,23 @@ jobs:
           fi
         working-directory: ./packages/core
 
+      # Idempotent so a release can be re-run. npm versions are immutable, so
+      # once this package is on the registry at this version, republishing is a
+      # hard error -- and the run's remaining jobs (the platform packages and
+      # the wrapper) would never get their chance to finish a half-published
+      # release. Skipping lets a re-run complete the parts that did not publish.
+      # The guard is an exact name@version lookup, so it can only skip the
+      # identical coordinates, never a genuinely new version.
       - name: Publish
-        run: pnpm publish --access public --no-git-checks
+        run: |
+          set -eo pipefail
+          name=$(node -p "require('./package.json').name")
+          version="${{ needs.version.outputs.version }}"
+          if npm view "${name}@${version}" version >/dev/null 2>&1; then
+            echo "${name}@${version} is already published; skipping."
+            exit 0
+          fi
+          pnpm publish --access public --no-git-checks
         working-directory: ./packages/core
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
