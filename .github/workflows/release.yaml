@@ -111,24 +111,15 @@ jobs:
           path: THIRD-PARTY-NOTICES.md
           retention-days: 7
 
-  build-and-publish-binaries:
+  build-binaries:
     name: Build CLI binary (${{ matrix.build.NAME }})
     runs-on: ${{ matrix.build.OS }}
     needs: [version, release-guard, third-party-notices]
     permissions:
       contents: "read"
       id-token: "write"
-    env:
-      TAG_LATEST: "true"
-      # npm provenance requires a *public* source repository -- npm rejects
-      # the attestation with "422 Unprocessable Entity: Unsupported GitHub
-      # Actions source repository visibility: 'private'" otherwise. This repo
-      # is currently private, so provenance is off. It killed a real release
-      # on the predecessor project after the platform packages had already
-      # published, burning a version number, so don't re-add it speculatively:
-      # flip this back to NPM_CONFIG_PROVENANCE: "true" (in all three
-      # publishing jobs) once the repository is made public. Provenance is
-      # genuinely valuable and worth restoring at that point.
+    # This job builds and packs only; publishing happens in publish-binaries,
+    # once every leg has succeeded. See release-bin.sh's PACK_ONLY comment.
     strategy:
       fail-fast: false
       matrix:
@@ -147,10 +138,9 @@ jobs:
       # No sccache. maturin compiles inside its own manylinux container, so the
       # wrapper never saw a single compile request on any leg ("compile_requests":0,
       # "0% - 0 hits"), while its post-job step failed on macOS with
-      # "failed to get stats from server" and marked the whole job failed. On a
-      # tagged run that lands after `Publish platform package`, so the platform
-      # package reaches npm, `publish-wrapper` is skipped for a failed dependency,
-      # and the version is burned with no wrapper published.
+      # "failed to get stats from server" and marked the whole job failed. Since
+      # this job no longer publishes, that would now cost a re-run rather than a
+      # burnt version -- but it still fails releases for nothing it caches.
 
       - uses: actions/setup-node@v4
         with:
@@ -259,8 +249,10 @@ jobs:
               protoc --version
             fi
 
+      # Not gated on the run being a real release: packing is most of what
+      # release-bin.sh does, and gating it meant dry runs never exercised it at
+      # all -- the script could be broken and only a tagged run would find out.
       - name: Download THIRD-PARTY-NOTICES.md
-        if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
         uses: actions/download-artifact@v4
         with:
           name: third-party-notices
@@ -268,8 +260,7 @@ jobs:
           # (it runs with working-directory ./apps/cli-npm).
           path: .
 
-      - name: Publish platform package
-        if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
+      - name: Pack platform package
         run: |
           ./scripts/release-bin.sh \
             "${{ needs.version.outputs.version }}" \
@@ -278,6 +269,71 @@ jobs:
             "${{ matrix.build.NAME }}"
         working-directory: ./apps/cli-npm
         env:
+          PACK_ONLY: "true"
+          PACK_DESTINATION: ${{ github.workspace }}/platform-packages
+
+      - name: Upload platform package tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: platform-package-${{ matrix.build.NAME }}
+          path: platform-packages/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-binaries:
+    name: Publish platform packages
+    runs-on: ubuntu-latest
+    needs: [version, build-binaries]
+    # Every leg of build-binaries must have succeeded to get here: `needs` on a
+    # matrix job waits for the whole matrix. That is the point of this job --
+    # the three platform packages reach npm together or not at all.
+    if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
+    permissions:
+      contents: "read"
+      id-token: "write"
+    env:
+      TAG_LATEST: "true"
+      # NPM_CONFIG_PROVENANCE is intentionally not set while this repo is
+      # private -- npm rejects the attestation with "422 Unprocessable Entity:
+      # Unsupported GitHub Actions source repository visibility: 'private'".
+      # It killed a real release on the predecessor project after the platform
+      # packages had already published, burning a version number, so don't
+      # re-add it speculatively: flip this to NPM_CONFIG_PROVENANCE: "true" (in
+      # all three publishing jobs) once the repository is made public.
+      # Provenance is genuinely valuable and worth restoring at that point.
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download platform package tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: platform-package-*
+          path: platform-packages
+          merge-multiple: true
+
+      - name: Publish platform packages
+        run: |
+          set -eo pipefail
+          shopt -s nullglob
+          tarballs=(platform-packages/*.tgz)
+          # One tarball per matrix leg. Publishing fewer would ship a release
+          # whose wrapper resolves a platform package that does not exist.
+          if [ "${#tarballs[@]}" -ne 3 ]; then
+            echo "expected 3 platform package tarballs, found ${#tarballs[@]}: ${tarballs[*]}" >&2
+            exit 1
+          fi
+          for tarball in "${tarballs[@]}"; do
+            echo "Publishing ${tarball}"
+            if [ "${TAG_LATEST}" = "true" ]; then
+              npm publish "${tarball}" --access public
+            else
+              npm publish "${tarball}" --access public --tag dev
+            fi
+          done
+        env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-wrapper:
@@ -285,13 +341,13 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - version
-      - build-and-publish-binaries
+      - publish-binaries
     if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
     permissions:
       contents: "read"
       id-token: "write"
     # NPM_CONFIG_PROVENANCE is intentionally not set here while this repo is
-    # private -- see the comment in build-and-publish-binaries' env block for
+    # private -- see the comment in publish-binaries' env block for
     # why, and re-add `NPM_CONFIG_PROVENANCE: "true"` here too once public.
     steps:
       - uses: actions/checkout@v4
@@ -327,7 +383,7 @@ jobs:
       contents: "read"
       id-token: "write"
     # NPM_CONFIG_PROVENANCE is intentionally not set here while this repo is
-    # private -- see the comment in build-and-publish-binaries' env block for
+    # private -- see the comment in publish-binaries' env block for
     # why, and re-add `NPM_CONFIG_PROVENANCE: "true"` here too once public.
     steps:
       - uses: actions/checkout@v4

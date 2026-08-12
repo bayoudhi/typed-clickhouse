@@ -44,8 +44,24 @@ if [ ! -f "../../THIRD-PARTY-NOTICES.md" ]; then
     exit 1
 fi
 cp "../../THIRD-PARTY-NOTICES.md" "${node_pkg}/"
-# publish the package
 cd "${node_pkg}"
+
+# PACK_ONLY builds the tarball and stops short of the registry.
+#
+# The platform packages are built by a three-leg matrix, one per target. If each
+# leg published its own package, a failure on any leg after the others had
+# published would leave that version half-released on npm: published packages
+# are immutable, so the version is burnt and the release has to move to the next
+# number. That is not hypothetical -- a flaky protoc download failed exactly one
+# leg during a dry run, and a vendored-OpenSSL or linker break would do the same
+# for real. So every leg packs, and a single downstream job publishes the
+# complete set only once all three have succeeded.
+if [ "${PACK_ONLY}" = "true" ]; then
+    npm pack --pack-destination "${PACK_DESTINATION:-.}"
+    exit 0
+fi
+
+# publish the package
 # For CI builds (TAG_LATEST=false), publish with version-specific tag
 # For release builds (TAG_LATEST=true), publish and update the 'latest' tag
 if [ "${TAG_LATEST}" = "true" ]; then
