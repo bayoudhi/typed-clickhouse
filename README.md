@@ -26,11 +26,9 @@ schema-as-code and migrations for ClickHouse.
 dry run). It cannot complete a real publish yet — before the first release,
 this repository still needs:
 
-- **An `NPM_TOKEN` secret.** `build-and-publish-binaries`, `publish-wrapper`,
-  and `publish-library` all authenticate to the npm registry with
-  `secrets.NPM_TOKEN`, which does not exist in this repository yet. It must
-  be added under repo Settings → Secrets and variables → Actions before any
-  tag push can publish.
+- ~~**An `NPM_TOKEN` secret.**~~ Configured. `build-and-publish-binaries`,
+  `publish-wrapper` and `publish-library` authenticate to the npm registry
+  with `secrets.NPM_TOKEN`.
 - **`THIRD-PARTY-NOTICES.md` generated at publish time**, not committed
   stale. The published artifacts redistribute other people's code — the Rust
   binary statically links its full dependency tree, and tsup bundles
