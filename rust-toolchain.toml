@@ -10,4 +10,4 @@
 # To move Rust versions, change the channel here and fix whatever new lints the
 # newer clippy reports, in one commit.
 [toolchain]
-channel = "1.94"
+channel = "1.97"
