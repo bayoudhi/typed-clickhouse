@@ -73,16 +73,62 @@ jobs:
       # regression in that logic stops the release instead of shipping.
       - run: cargo test --package typed-clickhouse state_storage
 
+  third-party-notices:
+    name: Generate THIRD-PARTY-NOTICES.md
+    runs-on: ubuntu-latest
+    # Runs unconditionally, including dry runs: cargo-about fails the step if
+    # a dependency's license isn't in about.toml's accepted list, so this
+    # doubles as an early warning the next time a Rust dependency changes,
+    # not just a release-time formality.
+    outputs:
+      artifact-name: third-party-notices
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+          cache-shared-key: ${{ runner.os }}-${{ runner.arch }}-rust-about
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - uses: pnpm/action-setup@v4
+
+      # Needed to resolve commander's on-disk LICENSE file the same way
+      # tsup's noExternal bundles it -- see packages/core/tsup.config.ts.
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli
+
+      - name: Generate THIRD-PARTY-NOTICES.md
+        run: ./scripts/gen-third-party-notices.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: third-party-notices
+          path: THIRD-PARTY-NOTICES.md
+          retention-days: 7
+
   build-and-publish-binaries:
     name: Build CLI binary (${{ matrix.build.NAME }})
     runs-on: ${{ matrix.build.OS }}
-    needs: [version, release-guard]
+    needs: [version, release-guard, third-party-notices]
     permissions:
       contents: "read"
       id-token: "write"
     env:
       TAG_LATEST: "true"
-      NPM_CONFIG_PROVENANCE: "true"
+      # npm provenance requires a *public* source repository -- npm rejects
+      # the attestation with "422 Unprocessable Entity: Unsupported GitHub
+      # Actions source repository visibility: 'private'" otherwise. This repo
+      # is currently private, so provenance is off. It killed a real release
+      # on the predecessor project after the platform packages had already
+      # published, burning a version number, so don't re-add it speculatively:
+      # flip this back to NPM_CONFIG_PROVENANCE: "true" (in all three
+      # publishing jobs) once the repository is made public. Provenance is
+      # genuinely valuable and worth restoring at that point.
     strategy:
       fail-fast: false
       matrix:
@@ -213,6 +259,15 @@ jobs:
               protoc --version
             fi
 
+      - name: Download THIRD-PARTY-NOTICES.md
+        if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
+        uses: actions/download-artifact@v4
+        with:
+          name: third-party-notices
+          # Repo root, matching release-bin.sh's `../../THIRD-PARTY-NOTICES.md`
+          # (it runs with working-directory ./apps/cli-npm).
+          path: .
+
       - name: Publish platform package
         if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
         run: |
@@ -235,8 +290,9 @@ jobs:
     permissions:
       contents: "read"
       id-token: "write"
-    env:
-      NPM_CONFIG_PROVENANCE: "true"
+    # NPM_CONFIG_PROVENANCE is intentionally not set here while this repo is
+    # private -- see the comment in build-and-publish-binaries' env block for
+    # why, and re-add `NPM_CONFIG_PROVENANCE: "true"` here too once public.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -265,13 +321,14 @@ jobs:
     # Consumes the same tag-derived version as the CLI jobs. bin.rs compares
     # the CLI version to `tch-runner print-version` with strict equality, so
     # the two packages must ship the same number by construction.
-    needs: [version, release-guard]
+    needs: [version, release-guard, third-party-notices]
     if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
     permissions:
       contents: "read"
       id-token: "write"
-    env:
-      NPM_CONFIG_PROVENANCE: "true"
+    # NPM_CONFIG_PROVENANCE is intentionally not set here while this repo is
+    # private -- see the comment in build-and-publish-binaries' env block for
+    # why, and re-add `NPM_CONFIG_PROVENANCE: "true"` here too once public.
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -285,6 +342,12 @@ jobs:
       - name: Set version
         run: npm version "${{ needs.version.outputs.version }}" --no-git-tag-version --allow-same-version
         working-directory: ./packages/core
+
+      - name: Download THIRD-PARTY-NOTICES.md
+        uses: actions/download-artifact@v4
+        with:
+          name: third-party-notices
+          path: ./packages/core
 
       # The library's declarations are bundled from @typed-clickhouse/lib's SOURCE, so
       # its dist/ .d.ts files are not required -- but its JavaScript is still

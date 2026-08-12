@@ -1,0 +1,38 @@
+{{!-- Markdown THIRD-PARTY-NOTICES.md generator for the typed-clickhouse CLI's
+    Rust dependency tree. Run via `cargo about generate about.hbs -c about.toml`.
+    See apps/cli-npm/scripts/gen-third-party-notices.sh for how release.yaml
+    invokes this and where the output is copied.
+
+    Triple-stash is used everywhere below: this is a plain-text Markdown
+    file, not HTML, and the default double-stash escapes quotes and
+    ampersands (e.g. Apache-2.0's text turns into "&quot;License&quot;..."),
+    which would corrupt license text and code-block contents. --}}
+# Third-Party Notices
+
+This binary statically links the crates listed below. Their licences require
+this notice to travel with the distributed artifact.
+
+## License overview
+
+{{#each overview}}
+- [{{{name}}}](#{{id}}) ({{count}})
+{{/each}}
+
+## License texts
+
+{{#each licenses}}
+{{#if first_of_kind}}
+## {{{name}}} ({{id}})
+
+{{/if}}
+### Used by
+
+{{#each used_by}}
+- {{{crate.name}}} {{crate.version}}{{#if crate.repository}} — {{{crate.repository}}}{{/if}}
+{{/each}}
+
+```
+{{{text}}}
+```
+
+{{/each}}

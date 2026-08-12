@@ -33,6 +33,17 @@ envsubst < package.json.tmpl > "${node_pkg}/package.json"
 # copy the binary into the package
 ls "../../target/${build_target}/release/${current_bin}"
 cp "../../target/${build_target}/release/${current_bin}" "${node_pkg}/bin"
+# copy the generated third-party notices into the package. This binary
+# statically links its entire Rust dependency tree, so the notices must
+# ship in the same tarball; package.json.tmpl's "files" array only allows
+# "bin" and "THIRD-PARTY-NOTICES.md" through, so a missing file here means
+# a platform package publishes without them rather than silently omitting
+# them -- fail loudly instead.
+if [ ! -f "../../THIRD-PARTY-NOTICES.md" ]; then
+    echo "../../THIRD-PARTY-NOTICES.md not found; run scripts/gen-third-party-notices.sh first" >&2
+    exit 1
+fi
+cp "../../THIRD-PARTY-NOTICES.md" "${node_pkg}/"
 # publish the package
 cd "${node_pkg}"
 # For CI builds (TAG_LATEST=false), publish with version-specific tag

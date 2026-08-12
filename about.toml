@@ -1,0 +1,23 @@
+# cargo-about config for generating THIRD-PARTY-NOTICES.md at release time.
+# See https://embarkstudios.github.io/cargo-about/cli/generate/config.html
+#
+# Licenses accepted for redistribution in the compiled binary. Kept narrow on
+# purpose: an unlisted license fails the release step instead of silently
+# shipping something we haven't reviewed.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Apache-2.0 WITH LLVM-exception",
+]
+
+# There is only one workspace member (apps/cli), and it is the only thing
+# statically linked into a distributed artifact, so no per-crate filtering
+# is needed here.

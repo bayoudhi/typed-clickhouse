@@ -81,3 +81,8 @@ content-generation.mdc
 
 # Upstream tarball mirror — blobs are large and reconstructible from SHA256SUMS
 vendor/upstream-mirror/*.tgz
+
+# Generated at release time by scripts/gen-third-party-notices.sh; a
+# committed copy would silently go stale as dependencies change. See
+# .github/workflows/release.yaml's `third-party-notices` job.
+/THIRD-PARTY-NOTICES.md
