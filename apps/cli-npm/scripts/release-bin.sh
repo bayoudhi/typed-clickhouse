@@ -57,7 +57,11 @@ cd "${node_pkg}"
 # for real. So every leg packs, and a single downstream job publishes the
 # complete set only once all three have succeeded.
 if [ "${PACK_ONLY}" = "true" ]; then
-    npm pack --pack-destination "${PACK_DESTINATION:-.}"
+    pack_destination="${PACK_DESTINATION:-.}"
+    # npm pack does not create --pack-destination, it just fails to open the
+    # tarball inside it: "ENOENT: no such file or directory, open '.../foo.tgz'".
+    mkdir -p "${pack_destination}"
+    npm pack --pack-destination "${pack_destination}"
     exit 0
 fi
 

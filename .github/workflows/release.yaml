@@ -241,7 +241,14 @@ jobs:
               mkdir -p /usr/local/bin
               mkdir -p /usr/local/include
 
-              curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/$PROTOC_ZIP
+              # Retry explicitly. Release runs have died here on transient
+              # github.com trouble -- "curl: (56) Connection died" and, on the
+              # host-side setup-protoc step, "socket hang up" -- and a download
+              # blip should cost a few seconds, not a release. --fail so an
+              # error page is never unzipped as if it were an archive.
+              curl --fail --location --remote-name \
+                --retry 5 --retry-delay 5 --retry-all-errors \
+                https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/$PROTOC_ZIP
               unzip -o $PROTOC_ZIP -d /usr/local bin/protoc
               unzip -o $PROTOC_ZIP -d /usr/local 'include/*'
               rm -f $PROTOC_ZIP
