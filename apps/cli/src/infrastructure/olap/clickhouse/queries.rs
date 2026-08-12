@@ -4827,7 +4827,7 @@ SETTINGS keeper_path = '/clickhouse/s3queue/test_table', mode = 'unordered', s3q
 
     #[test]
     fn test_s3queue_parsing_with_credentials() {
-        let engine_str = "S3Queue('https://test-s3-queue-engine.s3.eu-north-1.amazonaws.com/*', 'AKIA6OQXSVQF4HIUAX5J', 'secret123', 'CSV')";
+        let engine_str = "S3Queue('https://test-s3-queue-engine.s3.eu-north-1.amazonaws.com/*', 'AKIAIOSFODNN7EXAMPLE', 'secret123', 'CSV')";
         let result = ClickhouseEngine::try_from(engine_str);
         assert!(result.is_ok());
 
@@ -4844,7 +4844,7 @@ SETTINGS keeper_path = '/clickhouse/s3queue/test_table', mode = 'unordered', s3q
                 "https://test-s3-queue-engine.s3.eu-north-1.amazonaws.com/*"
             );
             assert_eq!(format, "CSV");
-            assert_eq!(aws_access_key_id, Some("AKIA6OQXSVQF4HIUAX5J".to_string()));
+            assert_eq!(aws_access_key_id, Some("AKIAIOSFODNN7EXAMPLE".to_string()));
             assert_eq!(aws_secret_access_key, Some("secret123".to_string()));
         } else {
             panic!("Expected S3Queue engine");
