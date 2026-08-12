@@ -29,16 +29,30 @@ this repository still needs:
 - ~~**An `NPM_TOKEN` secret.**~~ Configured. `build-and-publish-binaries`,
   `publish-wrapper` and `publish-library` authenticate to the npm registry
   with `secrets.NPM_TOKEN`.
-- **`THIRD-PARTY-NOTICES.md` generated at publish time**, not committed
-  stale. The published artifacts redistribute other people's code — the Rust
-  binary statically links its full dependency tree, and tsup bundles
-  `commander` into `dist/` — so the notices must be regenerated (e.g. with
-  `cargo about`/`cargo-deny` for Rust and a license checker for npm) as part
-  of the release, not carried over from a previous version.
+- ~~**`THIRD-PARTY-NOTICES.md` generated at publish time.**~~ Implemented.
+  The `third-party-notices` job runs `scripts/gen-third-party-notices.sh` on
+  every run (including dry runs), which uses `cargo-about` to collect
+  license text for every crate statically linked into the Rust binary and
+  resolves the license for `commander` (the one npm dependency tsup bundles
+  into `packages/core/dist/`). The result is uploaded as a build artifact and
+  downloaded by both `build-and-publish-binaries` (platform packages) and
+  `publish-library` (`@typed-clickhouse/core`) before they publish — it's in
+  the `files` allowlist of `packages/core/package.json` and
+  `apps/cli-npm/package.json.tmpl`, so each release regenerates it fresh
+  rather than carrying over a stale copy.
 - **The `@typed-clickhouse` npm scope claimed** by the publishing account.
   `publish-wrapper` and `publish-library` publish under `@typed-clickhouse/*`
   with `--access public`; that scope has not been registered on npm yet, and
   the first publish will fail until it is.
+
+npm provenance (`NPM_CONFIG_PROVENANCE`) is deliberately left unset in all
+three publishing jobs while this repository is private. npm rejects
+provenance attestations from a private source repository with `422
+Unprocessable Entity`, and that failure previously burned a version number
+on the predecessor project after some artifacts had already published. Set
+`NPM_CONFIG_PROVENANCE: "true"` in `build-and-publish-binaries`,
+`publish-wrapper`, and `publish-library` once this repository is made
+public — provenance is genuinely worth having back at that point.
 
 ## License
 

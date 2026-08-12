@@ -7,7 +7,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/bayoudhi/moosestack"
+    "url": "https://github.com/bayoudhi/typed-clickhouse"
   },
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",

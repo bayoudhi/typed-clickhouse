@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/bayoudhi/moosestack"
+    "url": "https://github.com/bayoudhi/typed-clickhouse"
   },
   "bin": {
     "typed-clickhouse": "dist/index.js"
