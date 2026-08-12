@@ -74,7 +74,7 @@ echo "$bin_call_block" | sed -n '5p' | grep -q 'matrix.build.NAME' || fail "rele
 
 # publish-wrapper must depend on publish-binaries so the platform packages
 # exist on the registry before the wrapper is published.
-wrapper_block=$(grep -A8 '^  publish-wrapper:' "$W") || fail "publish-wrapper job not found"
+wrapper_block=$(grep -A14 '^  publish-wrapper:' "$W") || fail "publish-wrapper job not found"
 echo "$wrapper_block" | grep -q 'needs:' || fail "publish-wrapper job has no needs: block"
 echo "$wrapper_block" | grep -q 'publish-binaries' || fail "publish-wrapper job does not need publish-binaries"
 
@@ -100,6 +100,23 @@ echo "$publish_bin" | grep -q 'needs: \[version, build-binaries\]' \
   || fail "publish-binaries must depend on version and the whole build-binaries matrix"
 echo "$publish_bin" | grep -q -- '-ne 3' \
   || fail "publish-binaries must assert it has all three platform tarballs before publishing any"
+# npm resolves a bare "dir/file.tgz" as the GitHub shorthand "owner/repo" and
+# tries to git-clone it, which fails with "Permission denied (publickey)". Only
+# a ./-prefixed path is unambiguously a file.
+echo "$publish_bin" | grep -q 'tarballs=(\./platform-packages/\*\.tgz)' \
+  || fail "publish-binaries must glob ./platform-packages/*.tgz; a bare path is read as a git shorthand"
+
+# publish-wrapper must also wait for the library: bin.rs enforces version
+# equality between the CLI and tch-runner, so a wrapper published without its
+# matching core is broken on arrival.
+echo "$wrapper_block" | grep -q 'publish-library' \
+  || fail "publish-wrapper job does not need publish-library"
+
+# Publishing the library must be idempotent, so re-running a release that
+# half-published can finish rather than dying on the immutable version.
+lib_block=$(sed -n '/^  publish-library:/,$p' "$W")
+echo "$lib_block" | grep -q 'already published; skipping' \
+  || fail "publish-library must skip an already-published version instead of failing the re-run"
 
 grep -q 'wait-for-npm-package.sh' "$W" || fail "release.yaml does not wait for npm packages to be available"
 
