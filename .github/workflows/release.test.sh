@@ -72,11 +72,34 @@ echo "$bin_call_block" | sed -n '3p' | grep -q 'matrix.build.TARGET' || fail "re
 echo "$bin_call_block" | sed -n '4p' | grep -q 'matrix.build.OS' || fail "release-bin.sh call must pass OS as arg 3"
 echo "$bin_call_block" | sed -n '5p' | grep -q 'matrix.build.NAME' || fail "release-bin.sh call must pass NAME as arg 4"
 
-# publish-wrapper must depend on build-and-publish-binaries so the platform
-# packages exist on the registry before the wrapper is published.
+# publish-wrapper must depend on publish-binaries so the platform packages
+# exist on the registry before the wrapper is published.
 wrapper_block=$(grep -A8 '^  publish-wrapper:' "$W") || fail "publish-wrapper job not found"
 echo "$wrapper_block" | grep -q 'needs:' || fail "publish-wrapper job has no needs: block"
-echo "$wrapper_block" | grep -q 'build-and-publish-binaries' || fail "publish-wrapper job does not need build-and-publish-binaries"
+echo "$wrapper_block" | grep -q 'publish-binaries' || fail "publish-wrapper job does not need publish-binaries"
+
+# The build matrix must not publish. Each leg builds one platform package; if a
+# leg published its own, a failure on any other leg would leave the version
+# half-released on npm, and published versions are immutable. Publishing belongs
+# in publish-binaries, which `needs: build-binaries` and therefore runs only
+# once every leg has succeeded.
+build_block=$(sed -n '/^  build-binaries:/,/^  publish-binaries:/p' "$W") \
+  || fail "build-binaries job not found"
+[ -n "$build_block" ] || fail "build-binaries job not found (is it still named build-and-publish-binaries?)"
+echo "$build_block" | grep -q 'npm publish' \
+  && fail "build-binaries publishes from inside the matrix; a failure on another leg would burn the version"
+echo "$build_block" | grep -q 'PACK_ONLY' \
+  || fail "build-binaries must invoke release-bin.sh with PACK_ONLY"
+echo "$build_block" | grep -q 'NPM_TOKEN' \
+  && fail "the build matrix should not need a registry token; it does not publish"
+
+publish_bin=$(sed -n '/^  publish-binaries:/,/^  publish-wrapper:/p' "$W") \
+  || fail "publish-binaries job not found"
+[ -n "$publish_bin" ] || fail "publish-binaries job not found"
+echo "$publish_bin" | grep -q 'needs: \[version, build-binaries\]' \
+  || fail "publish-binaries must depend on version and the whole build-binaries matrix"
+echo "$publish_bin" | grep -q -- '-ne 3' \
+  || fail "publish-binaries must assert it has all three platform tarballs before publishing any"
 
 grep -q 'wait-for-npm-package.sh' "$W" || fail "release.yaml does not wait for npm packages to be available"
 
