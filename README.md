@@ -2,43 +2,162 @@
 
 # typed-clickhouse
 
-**typed-clickhouse** is a type-safe, code-first migration and query tool for ClickHouse.
+**typed-clickhouse** is a type-safe, code-first schema and migration tool for
+ClickHouse.
 
-Declare your ClickHouse tables and views as TypeScript types, and typed-clickhouse:
+You declare your tables and views as TypeScript types. A compiler plugin
+derives the ClickHouse schema from those types at build time. The CLI diffs
+that schema against a live database, shows you the migration plan, and applies
+it.
 
-- **Diffs** your declared schema against a live database and generates a migration plan
-- **Applies** that plan to bring the database in line with your code
-- **Queries** ClickHouse through a typed layer generated from the same schema
+- **Diff** your declared schema against a live database
+- **Review** the generated migration plan before anything runs
+- **Apply** it to bring the database in line with your code
+- **Query** ClickHouse through a typed SQL layer built from the same types
 
-There is no runtime, no streaming layer, and no workflow orchestrator here — just
-schema-as-code and migrations for ClickHouse.
+There is no runtime, no streaming layer, and no workflow orchestrator here —
+just schema-as-code and migrations for ClickHouse.
 
-## How it works
+## Packages
 
-1. Model your tables and views as TypeScript classes/types in your project.
-2. Run the CLI to compare that model against a live ClickHouse database.
-3. Review the generated migration plan.
-4. Apply it, and query the result through the generated typed client.
+| Package | What it is |
+| --- | --- |
+| [`@typed-clickhouse/core`](packages/core) | The TypeScript library: `OlapTable`, `MaterializedView`, the typed query layer, and the compiler plugin |
+| `@typed-clickhouse/cli` | The `typed-clickhouse` CLI, a Rust binary distributed through npm |
 
-## Releasing
+## Installation
 
-`release.yaml` builds and publishes on push of a `v*.*.*` tag (or via manual
-dry run). It cannot complete a real publish yet — before the first release,
-this repository still needs:
+```bash
+npm install @typed-clickhouse/core
+npm install -D @typed-clickhouse/cli ts-patch typia typescript
+```
 
-- ~~**An `NPM_TOKEN` secret.**~~ Configured. `build-and-publish-binaries`,
-  `publish-wrapper` and `publish-library` authenticate to the npm registry
-  with `secrets.NPM_TOKEN`.
-- **`THIRD-PARTY-NOTICES.md` generated at publish time**, not committed
-  stale. The published artifacts redistribute other people's code — the Rust
-  binary statically links its full dependency tree, and tsup bundles
-  `commander` into `dist/` — so the notices must be regenerated (e.g. with
-  `cargo about`/`cargo-deny` for Rust and a license checker for npm) as part
-  of the release, not carried over from a previous version.
-- **The `@typed-clickhouse` npm scope claimed** by the publishing account.
-  `publish-wrapper` and `publish-library` publish under `@typed-clickhouse/*`
-  with `--access public`; that scope has not been registered on npm yet, and
-  the first publish will fail until it is.
+The compiler plugin is what turns `new OlapTable<Event>("events")` into a real
+schema, so it is not optional. Add it to your `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "plugins": [
+      { "transform": "@typed-clickhouse/core/compilerPlugin" },
+      { "transform": "typia/lib/transform" }
+    ]
+  }
+}
+```
+
+Then activate it and build with `tspc` instead of `tsc`:
+
+```bash
+npx ts-patch install
+npx tspc
+```
+
+Full plugin setup, including what the error message looks like when it isn't
+wired up, is in the [`@typed-clickhouse/core` README](packages/core/README.md).
+
+## Quick start
+
+**1. Point the CLI at your database.** Create `tch.config.toml` in your project
+root:
+
+```toml
+language = "typescript"
+
+[clickhouse_config]
+host = "localhost"
+host_port = 8123
+user = "default"
+password = ""
+db_name = "analytics"
+use_ssl = false
+```
+
+**2. Declare a table.** By default the CLI reads your models from `app/`:
+
+```typescript
+// app/index.ts
+import { OlapTable } from "@typed-clickhouse/core";
+
+interface Event {
+  id: string;
+  createdAt: Date;
+  label: string;
+}
+
+export const events = new OlapTable<Event>("events", {
+  orderByFields: ["id", "createdAt"],
+});
+```
+
+**3. See what would change:**
+
+```bash
+npx tspc
+npx typed-clickhouse plan
+```
+
+**4. Apply it:**
+
+```bash
+npx typed-clickhouse migrate
+```
+
+`plan` and `migrate` both accept `--clickhouse-url` if you'd rather pass the
+connection inline than put it in the config file — useful in CI, and the way
+to keep credentials out of the repository.
+
+## Working from an existing database
+
+If the tables already exist and you want them described in TypeScript rather
+than created from it, `db pull` writes their definitions into your project:
+
+```bash
+npx typed-clickhouse db pull --clickhouse-url clickhouse://user:pass@host:9440/db
+```
+
+Definitions land in `app/externalModels.ts` by default. Pulled tables are
+marked externally managed, which means `migrate` will never create or drop
+them — the database stays the owner of their existence.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `plan` | Show the changes the next `migrate` would apply |
+| `migrate` | Apply the migration plan to the database |
+| `check` | Check the project for non-runtime errors |
+| `build` | Build the project |
+| `ls` | List the infrastructure the project declares |
+| `peek <table>` | Show a few rows from a table |
+| `query` | Run SQL against ClickHouse |
+| `seed clickhouse` | Copy rows from another ClickHouse into your tables |
+| `truncate` | Delete all rows, or the last N rows, from tables |
+| `db pull` | Import existing table definitions into your project |
+| `generate migration` | Write the migration plan to files |
+| `generate hash-token` | Generate an API key hash and bearer token pair |
+| `logs` | View the CLI logs |
+
+Run `typed-clickhouse <command> --help` for the flags on any of these.
+
+## Configuration
+
+`tch.config.toml` in the project root configures the CLI. Every value can also
+be set through the environment with the `TCH_` prefix — for example
+`TCH_CLICKHOUSE_CONFIG__HOST`.
+
+Projects carried over from the predecessor tool may still have a
+`moose.config.toml`; the CLI reads that as a fallback, so renaming it is
+optional.
+
+## Documentation
+
+- [`@typed-clickhouse/core` README](packages/core/README.md) — library API,
+  compiler plugin setup, and serverless configuration
+- [`MIGRATION.md`](MIGRATION.md) — moving a project over from the predecessor
+  tool
+- [`AGENTS.md`](AGENTS.md) — building this repository, running the tests, and
+  the release process
 
 ## License
 

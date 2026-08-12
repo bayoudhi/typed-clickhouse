@@ -84,8 +84,8 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/bayoudhi/moosestack",
+    "url": "https://github.com/bayoudhi/typed-clickhouse",
     "directory": "packages/core"
   },
-  "homepage": "https://github.com/bayoudhi/moosestack/tree/main/packages/core#readme"
+  "homepage": "https://github.com/bayoudhi/typed-clickhouse/tree/main/packages/core#readme"
 }

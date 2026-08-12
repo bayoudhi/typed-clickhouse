@@ -89,14 +89,44 @@ users; the short version for contributors:
 
 ## Release
 
-- **`THIRD-PARTY-NOTICES.md` must be generated at publish time**, not committed
+`release.yaml` builds and publishes on push of a `v*.*.*` tag, or via manual
+dry run (`workflow_dispatch`).
+
+### Invariants
+
+- **`THIRD-PARTY-NOTICES.md` is generated at publish time**, not committed
   stale. The published artifacts redistribute other people's code: the Rust
   binary statically links its full dependency tree, and tsup bundles
   `commander` into `dist/`. Those licences — predominantly MIT and Apache-2.0 —
   require their notices to travel with the binary, and Apache-2.0 propagates any
-  upstream `NOTICE`. Generate with `cargo about` or `cargo-deny` for Rust and a
-  licence checker for npm, and list the file in each package's `files`.
+  upstream `NOTICE`. The `third-party-notices` job runs
+  `scripts/gen-third-party-notices.sh` on every run, including dry runs: it
+  uses `cargo-about` for the crates and resolves `commander` for the bundle.
+  The result is uploaded as a build artifact and downloaded by both
+  `build-and-publish-binaries` and `publish-library` before they publish, and
+  it is listed in the `files` allowlist of `packages/core/package.json` and
+  `apps/cli-npm/package.json.tmpl` — so every release regenerates it fresh
+  rather than carrying a stale copy.
 - **The CLI and the library version in lockstep.** `bin.rs` compares the CLI's
   version to `tch-runner print-version` with strict equality, so both packages
   must publish from the same tag. `release.yaml`'s `version` job computes it
   once and every publishing job consumes that output.
+
+### Before the first release
+
+- **The `@typed-clickhouse` npm scope must be claimed** by the publishing
+  account. `publish-wrapper` and `publish-library` publish under
+  `@typed-clickhouse/*` with `--access public`; the first publish fails until
+  that organization exists on npm.
+- `NPM_TOKEN` is configured. `build-and-publish-binaries`, `publish-wrapper`
+  and `publish-library` authenticate with `secrets.NPM_TOKEN`.
+
+### Provenance
+
+npm provenance (`NPM_CONFIG_PROVENANCE`) is deliberately unset in all three
+publishing jobs while this repository is private. npm rejects provenance
+attestations from a private source repository with `422 Unprocessable Entity`,
+and that failure previously burned a version number on the predecessor project
+after some artifacts had already published. Set `NPM_CONFIG_PROVENANCE: "true"`
+in `build-and-publish-binaries`, `publish-wrapper`, and `publish-library` once
+this repository is public — provenance is worth having back at that point.
