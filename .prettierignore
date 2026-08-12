@@ -1,0 +1,6 @@
+apps/cli/tests/test_project
+*.mdx
+*.md
+
+pnpm-lock.yaml
+docker-compose.yml.hbs

@@ -1,0 +1,191 @@
+import http from "http";
+import { getInternalRegistry } from "../internal";
+import { getSourceLocationFromStack } from "../utils/stackTrace";
+
+export type WebAppHandler = (
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+) => void | Promise<void>;
+
+export interface FrameworkApp {
+  handle?: (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    next?: (err?: any) => void,
+  ) => void;
+  callback?: () => WebAppHandler;
+  routing?: (req: http.IncomingMessage, res: http.ServerResponse) => void;
+  ready?: () => PromiseLike<unknown>; // Fastify's ready method (returns FastifyInstance)
+}
+
+export interface WebAppConfig {
+  mountPath: string;
+  metadata?: { description?: string };
+  injectHandlerUtils?: boolean;
+}
+
+const RESERVED_MOUNT_PATHS = [
+  "/admin",
+  "/api",
+  "/consumption",
+  "/health",
+  "/ingest",
+  "/liveness",
+  "/tch", // reserved for future use
+  "/ready",
+  "/workflows",
+] as const;
+
+export class WebApp {
+  name: string;
+  handler: WebAppHandler;
+  config: WebAppConfig;
+  /** @internal Source file path where this web app was declared */
+  sourceFile?: string;
+  /** @internal Source line number where this web app was declared */
+  sourceLine?: number;
+  /** @internal Source column number where this web app was declared */
+  sourceColumn?: number;
+  private _rawApp?: FrameworkApp;
+
+  constructor(
+    name: string,
+    appOrHandler: FrameworkApp | WebAppHandler,
+    config: WebAppConfig,
+  ) {
+    this.name = name;
+    this.config = config;
+
+    const stack = new Error().stack;
+    const location = getSourceLocationFromStack(stack);
+    if (location) {
+      this.sourceFile = location.file;
+      this.sourceLine = location.line;
+      this.sourceColumn = location.column;
+    }
+
+    // Validate mountPath - it is required
+    if (!this.config.mountPath) {
+      throw new Error(
+        `mountPath is required. Please specify a mount path for your WebApp (e.g., "/myapi").`,
+      );
+    }
+
+    const mountPath = this.config.mountPath;
+
+    // Check for root path - not allowed as it would overlap reserved paths
+    if (mountPath === "/") {
+      throw new Error(
+        `mountPath cannot be "/" as it would allow routes to overlap with reserved paths: ${RESERVED_MOUNT_PATHS.join(", ")}`,
+      );
+    }
+
+    // Check for trailing slash
+    if (mountPath.endsWith("/")) {
+      throw new Error(
+        `mountPath cannot end with a trailing slash. Remove the '/' from: "${mountPath}"`,
+      );
+    }
+
+    // Check for reserved path prefixes
+    for (const reserved of RESERVED_MOUNT_PATHS) {
+      if (mountPath === reserved || mountPath.startsWith(`${reserved}/`)) {
+        throw new Error(
+          `mountPath cannot begin with a reserved path: ${RESERVED_MOUNT_PATHS.join(", ")}. Got: "${mountPath}"`,
+        );
+      }
+    }
+
+    this.handler = this.toHandler(appOrHandler);
+    this._rawApp =
+      typeof appOrHandler === "function" ? undefined : appOrHandler;
+
+    const webApps = getInternalRegistry().webApps;
+    if (webApps.has(name)) {
+      throw new Error(`WebApp with name ${name} already exists`);
+    }
+
+    // Check for duplicate mountPath
+    if (this.config.mountPath) {
+      for (const [existingName, existingApp] of webApps) {
+        if (existingApp.config.mountPath === this.config.mountPath) {
+          throw new Error(
+            `WebApp with mountPath "${this.config.mountPath}" already exists (used by WebApp "${existingName}")`,
+          );
+        }
+      }
+    }
+
+    webApps.set(name, this);
+  }
+
+  private toHandler(appOrHandler: FrameworkApp | WebAppHandler): WebAppHandler {
+    if (typeof appOrHandler === "function") {
+      return appOrHandler as WebAppHandler;
+    }
+
+    const app = appOrHandler as FrameworkApp;
+
+    if (typeof app.handle === "function") {
+      return (req, res) => {
+        app.handle!(req, res, (err?: any) => {
+          if (err) {
+            console.error("WebApp handler error:", err);
+            if (!res.headersSent) {
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "Internal Server Error" }));
+            }
+          }
+        });
+      };
+    }
+
+    if (typeof app.callback === "function") {
+      return app.callback();
+    }
+
+    // Fastify: routing is a function that handles requests directly
+    // Fastify requires .ready() to be called before routes are available
+    if (typeof app.routing === "function") {
+      // Capture references to avoid TypeScript narrowing issues in closure
+      const routing = app.routing;
+      const appWithReady = app;
+
+      // Use lazy initialization - don't call ready() during module loading
+      // This prevents blocking the event loop when streaming functions import the app module
+      // The ready() call is deferred to the first actual HTTP request
+      let readyPromise: PromiseLike<unknown> | null = null;
+
+      return async (req, res) => {
+        // Lazy init - only call ready() when first request comes in
+        if (readyPromise === null) {
+          readyPromise =
+            typeof appWithReady.ready === "function" ?
+              appWithReady.ready()
+            : Promise.resolve();
+        }
+        await readyPromise;
+        routing(req, res);
+      };
+    }
+
+    throw new Error(
+      `Unable to convert app to handler. The provided object must be:
+      - A function (raw Node.js handler)
+      - An object with .handle() method (Express, Connect)
+      - An object with .callback() method (Koa)
+      - An object with .routing function (Fastify)
+      
+Examples:
+  Express: new WebApp("name", expressApp)
+  Koa:     new WebApp("name", koaApp)
+  Fastify: new WebApp("name", fastifyApp)
+  Raw:     new WebApp("name", (req, res) => { ... })
+      `,
+    );
+  }
+
+  getRawApp(): FrameworkApp | undefined {
+    return this._rawApp;
+  }
+}

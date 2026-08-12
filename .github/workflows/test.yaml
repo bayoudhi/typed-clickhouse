@@ -1,0 +1,116 @@
+name: Test
+
+on:
+  pull_request:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - uses: actions/checkout@v4
+
+      # No `toolchain:` input. That makes the action honour rust-toolchain.toml
+      # instead of running `rustup override set stable`, which would lint and
+      # test on a different compiler than the one that builds the release.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+          cache: true
+          cache-shared-key: ${{ runner.os }}-${{ runner.arch }}-rust
+          cache-on-failure: true
+          cache-all-crates: true
+
+      - run: cargo build --locked
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+      # CLI smoke test, folded in from the retired scripts/prune-gate.sh:
+      # `cargo test` exercises library logic but never invokes the compiled
+      # binary's arg parsing end to end.
+      - name: CLI smoke test
+        run: |
+          BIN=target/debug/typed-clickhouse
+          $BIN --version
+          $BIN generate migration --help
+          $BIN migrate --help
+
+  typescript:
+    name: TypeScript (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "pnpm"
+
+      - run: pnpm install --frozen-lockfile
+      - name: "@typed-clickhouse/lib tests"
+        run: pnpm --filter @typed-clickhouse/lib test
+
+  library:
+    name: "@typed-clickhouse/core"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "pnpm"
+
+      - run: pnpm install --frozen-lockfile
+
+      # @typed-clickhouse/core inlines @typed-clickhouse/lib's JavaScript via tsup
+      # `noExternal`, so the library's dist/ must exist first. `pnpm --filter`
+      # runs only the named package's script — it has no turbo-style
+      # `dependsOn` awareness — so this step is required.
+      #
+      # --no-dts because only the JavaScript is consumed: the serverless
+      # declarations are bundled from this library's SOURCE via tsconfig paths,
+      # never from its dist/. Emitting them here costs ~45s and OOMs the runner
+      # (ERR_WORKER_OUT_OF_MEMORY in tsup's dts worker) for output nothing reads.
+      - run: pnpm --filter @typed-clickhouse/lib exec tsup --no-dts
+      - run: pnpm --filter @typed-clickhouse/core build
+
+      - name: "@typed-clickhouse/core tests"
+        run: pnpm --filter @typed-clickhouse/core test
+
+      # The mocha specs above run against the workspace. These two install the
+      # packed tarball the way a consumer would, which is the only way to catch
+      # a dist/ that is internally consistent but broken once published.
+      - name: Golden-output equivalence
+        run: ./tests/golden.test.sh
+        working-directory: ./packages/core
+
+      - name: Strict-hoisting regression
+        run: ./tests/hoisting-regression.sh
+        working-directory: ./packages/core
+
+      - name: Release script assertions
+        run: |
+          bash .github/workflows/release.test.sh
+          bash apps/cli-npm/scripts/release.test.sh
+
+      - name: "@typed-clickhouse/cli wrapper tests"
+        run: pnpm --filter @typed-clickhouse/cli test

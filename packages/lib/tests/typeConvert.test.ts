@@ -1,0 +1,443 @@
+import { expect } from "chai";
+import ts from "typescript";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { toColumns } from "../src/dataModels/typeConvert";
+
+function createProgramWithSource(tempDir: string, sourceText: string) {
+  const srcFile = path.join(tempDir, "model.ts");
+  fs.writeFileSync(srcFile, sourceText, "utf8");
+
+  const compilerOptions: ts.CompilerOptions = {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.CommonJS,
+    moduleResolution: ts.ModuleResolutionKind.Node10,
+    strict: true,
+    esModuleInterop: true,
+    skipLibCheck: true,
+    baseUrl: path.resolve(__dirname, ".."),
+    paths: {
+      "@514labs/moose-lib": [
+        path.resolve(__dirname, "../src/browserCompatible.ts"),
+      ],
+    },
+  };
+
+  const program = ts.createProgram({
+    rootNames: [
+      srcFile,
+      path.resolve(__dirname, "../src/browserCompatible.ts"),
+    ],
+    options: compilerOptions,
+  });
+
+  const checker = program.getTypeChecker();
+  const sourceFile = program.getSourceFile(srcFile)!;
+
+  const interfaceDecl = sourceFile.statements.find(
+    (s): s is ts.InterfaceDeclaration =>
+      ts.isInterfaceDeclaration(s) && s.name.text === "TestModel",
+  );
+  if (!interfaceDecl) throw new Error("TestModel interface not found");
+  const type = checker.getTypeAtLocation(interfaceDecl);
+  return { checker, type };
+}
+
+describe("typeConvert mappings for helper types", function () {
+  this.timeout(20000); // Increase timeout for TypeScript compilation
+
+  it("maps DateTime, DateTime64, numeric aliases, Decimal and LowCardinality", function () {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+
+    const source = `
+      import { DateTime, DateTime64, Int8, UInt16, Float32, Float64, Decimal, LowCardinality } from "@514labs/moose-lib";
+
+      export interface TestModel {
+        dt: DateTime;
+        dtMs: DateTime64<3>;
+        i8: Int8;
+        u16: UInt16;
+        f32: Float32;
+        f64: Float64;
+        price: Decimal<10, 2>;
+        status: string & LowCardinality;
+      }
+    `;
+
+    const { checker, type } = createProgramWithSource(tempDir, source);
+    const columns = toColumns(type, checker);
+    const byName: Record<string, any> = Object.fromEntries(
+      columns.map((c) => [c.name, c]),
+    );
+
+    expect(byName.dt.data_type).to.equal("DateTime");
+    expect(byName.dtMs.data_type).to.equal("DateTime(3)");
+
+    expect(byName.i8.data_type).to.equal("Int8");
+    expect(byName.u16.data_type).to.equal("UInt16");
+    expect(byName.f32.data_type).to.equal("Float32");
+    expect(byName.f64.data_type).to.equal("Float64");
+
+    expect(byName.price.data_type).to.equal("Decimal(10, 2)");
+
+    expect(byName.status.data_type).to.equal("String");
+    expect(byName.status.annotations).to.deep.include(["LowCardinality", true]);
+  });
+
+  it('maps Date & Aggregated<"argMax", [Date, Date]> to AggregateFunction(argMax, DateTime, DateTime)', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+
+    const source = `
+      import { Aggregated } from "@514labs/moose-lib";
+
+      export interface TestModel {
+        // return type is Date, but AggregateFunction argument types should be DateTime, DateTime
+        created: Date & Aggregated<"argMax", [Date, Date]>;
+      }
+    `;
+
+    const { checker, type } = createProgramWithSource(tempDir, source);
+    const columns = toColumns(type, checker);
+    expect(columns).to.have.length(1);
+    const col = columns[0];
+
+    // Column data type for Date should remain DateTime (framework default)
+    expect(col.data_type).to.equal("DateTime");
+
+    // Aggregation annotation should be present and use DateTime for arguments
+    const agg = col.annotations.find(([k]) => k === "aggregationFunction");
+    expect(agg).to.not.be.undefined;
+    const aggPayload = (agg as any)[1];
+
+    expect(aggPayload.functionName).to.equal("argMax");
+    expect(aggPayload.argumentTypes).to.deep.equal(["DateTime", "DateTime"]);
+  });
+
+  it('maps DateTime64<3> & Aggregated<"argMax", [DateTime64<3>, DateTime64<6>]> to preserve precision', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+
+    const source = `
+      import { Aggregated, DateTime64 } from "@514labs/moose-lib";
+
+      export interface TestModel {
+        // Test that DateTime64 with precision is preserved in aggregation arguments
+        created: DateTime64<3> & Aggregated<"argMax", [DateTime64<3>, DateTime64<6>]>;
+      }
+    `;
+
+    const { checker, type } = createProgramWithSource(tempDir, source);
+    const columns = toColumns(type, checker);
+    expect(columns).to.have.length(1);
+    const col = columns[0];
+
+    // Column data type should be DateTime(3) for DateTime64<3>
+    expect(col.data_type).to.equal("DateTime(3)");
+
+    // Aggregation annotation should preserve the DateTime64 precisions
+    const agg = col.annotations.find(([k]) => k === "aggregationFunction");
+    expect(agg).to.not.be.undefined;
+    const aggPayload = (agg as any)[1];
+
+    expect(aggPayload.functionName).to.equal("argMax");
+    expect(aggPayload.argumentTypes).to.deep.equal([
+      "DateTime(3)",
+      "DateTime(6)",
+    ]);
+  });
+
+  it('maps UInt64 & SimpleAggregated<"sum", UInt64> to SimpleAggregateFunction annotation', () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+
+    const source = `
+      import { SimpleAggregated, UInt64 } from "@514labs/moose-lib";
+
+      export interface TestModel {
+        row_count: UInt64 & SimpleAggregated<"sum", UInt64>;
+      }
+    `;
+
+    const { checker, type } = createProgramWithSource(tempDir, source);
+    const columns = toColumns(type, checker);
+    expect(columns).to.have.length(1);
+    const col = columns[0];
+
+    expect(col.name).to.equal("row_count");
+    expect(col.data_type).to.equal("UInt64");
+
+    const simpleAgg = col.annotations.find(
+      ([k]) => k === "simpleAggregationFunction",
+    );
+    expect(simpleAgg).to.not.be.undefined;
+    const simpleAggPayload = (simpleAgg as any)[1];
+    expect(simpleAggPayload.functionName).to.equal("sum");
+    expect(simpleAggPayload.argumentType).to.equal("UInt64");
+  });
+
+  it("handles multiple SimpleAggregated fields with different functions", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+
+    const source = `
+      import { SimpleAggregated, DateTime } from "@514labs/moose-lib";
+
+      export interface TestModel {
+        row_count: number & SimpleAggregated<"sum", number>;
+        max_value: number & SimpleAggregated<"max", number>;
+        min_value: number & SimpleAggregated<"min", number>;
+        last_updated: Date & SimpleAggregated<"anyLast", Date>;
+      }
+    `;
+
+    const { checker, type } = createProgramWithSource(tempDir, source);
+    const columns = toColumns(type, checker);
+    expect(columns).to.have.length(4);
+
+    // Test sum
+    const sumCol = columns.find((c) => c.name === "row_count");
+    expect(sumCol).to.not.be.undefined;
+    const sumAgg = sumCol!.annotations.find(
+      ([k]) => k === "simpleAggregationFunction",
+    );
+    expect(sumAgg).to.not.be.undefined;
+    expect((sumAgg as any)[1].functionName).to.equal("sum");
+
+    // Test max
+    const maxCol = columns.find((c) => c.name === "max_value");
+    expect(maxCol).to.not.be.undefined;
+    const maxAgg = maxCol!.annotations.find(
+      ([k]) => k === "simpleAggregationFunction",
+    );
+    expect(maxAgg).to.not.be.undefined;
+    expect((maxAgg as any)[1].functionName).to.equal("max");
+
+    // Test min
+    const minCol = columns.find((c) => c.name === "min_value");
+    expect(minCol).to.not.be.undefined;
+    const minAgg = minCol!.annotations.find(
+      ([k]) => k === "simpleAggregationFunction",
+    );
+    expect(minAgg).to.not.be.undefined;
+    expect((minAgg as any)[1].functionName).to.equal("min");
+
+    // Test anyLast with Date -> DateTime conversion
+    const lastCol = columns.find((c) => c.name === "last_updated");
+    expect(lastCol).to.not.be.undefined;
+    expect(lastCol!.data_type).to.equal("DateTime");
+    const lastAgg = lastCol!.annotations.find(
+      ([k]) => k === "simpleAggregationFunction",
+    );
+    expect(lastAgg).to.not.be.undefined;
+    expect((lastAgg as any)[1].functionName).to.equal("anyLast");
+    expect((lastAgg as any)[1].argumentType).to.equal("DateTime");
+  });
+
+  it("maps FixedString with size parameter", function () {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+    const source = `
+      import { FixedString, Key, DateTime } from "@514labs/moose-lib";
+
+      export interface TestModel {
+        id: Key<string>;
+        created_at: DateTime;
+        md5_hash: string & FixedString<16>;
+        sha256_hash: string & FixedString<32>;
+        ipv6_address: string & FixedString<16>;
+      }
+    `;
+
+    const { checker, type } = createProgramWithSource(tempDir, source);
+    const columns = toColumns(type, checker);
+    const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+
+    expect(byName.md5_hash.data_type).to.equal("FixedString(16)");
+    expect(byName.sha256_hash.data_type).to.equal("FixedString(32)");
+    expect(byName.ipv6_address.data_type).to.equal("FixedString(16)");
+
+    // Verify other fields still work
+    expect(byName.id.data_type).to.equal("String");
+    expect(byName.created_at.data_type).to.equal("DateTime");
+  });
+
+  it("maps Codec annotations for compression", function () {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+    try {
+      const source = `
+        import { ClickHouseCodec } from "@514labs/moose-lib";
+
+        export interface TestModel {
+          id: string;
+          log_blob: Record<string, any> & ClickHouseCodec<"ZSTD(3)">;
+          timestamp: Date & ClickHouseCodec<"Delta, LZ4">;
+          temperature: number & ClickHouseCodec<"Gorilla, ZSTD(3)">;
+          user_agent: string & ClickHouseCodec<"ZSTD(3)">;
+          tags: string[] & ClickHouseCodec<"ZSTD(1)">;
+          no_codec: string;
+        }
+      `;
+      const { checker, type } = createProgramWithSource(tempDir, source);
+      const columns = toColumns(type, checker);
+      const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+
+      expect(byName.id.codec).to.equal(null);
+      expect(byName.log_blob.codec).to.equal("ZSTD(3)");
+      expect(byName.timestamp.codec).to.equal("Delta, LZ4");
+      expect(byName.temperature.codec).to.equal("Gorilla, ZSTD(3)");
+      expect(byName.user_agent.codec).to.equal("ZSTD(3)");
+      expect(byName.tags.codec).to.equal("ZSTD(1)");
+      expect(byName.no_codec.codec).to.equal(null);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("maps Materialized annotations for computed columns", function () {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+    try {
+      const source = `
+        import { ClickHouseMaterialized, UInt64 } from "@514labs/moose-lib";
+
+        export interface TestModel {
+          timestamp: Date;
+          userId: string;
+          eventDate: Date & ClickHouseMaterialized<"toDate(timestamp)">;
+          userHash: UInt64 & ClickHouseMaterialized<"cityHash64(userId)">;
+          no_materialized: string;
+        }
+      `;
+      const { checker, type } = createProgramWithSource(tempDir, source);
+      const columns = toColumns(type, checker);
+      const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+
+      expect(byName.timestamp.materialized).to.equal(null);
+      expect(byName.userId.materialized).to.equal(null);
+      expect(byName.eventDate.materialized).to.equal("toDate(timestamp)");
+      expect(byName.userHash.materialized).to.equal("cityHash64(userId)");
+      expect(byName.no_materialized.materialized).to.equal(null);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("extracts TSDoc comments from interface properties", function () {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+    try {
+      const source = `
+        export interface TestModel {
+          /** The unique identifier for the record */
+          id: string;
+
+          /** Unix timestamp when the event occurred */
+          timestamp: number;
+
+          /**
+           * Multi-line comment describing the status.
+           * Can be active, inactive, or pending.
+           */
+          status: string;
+
+          // Regular comment - should NOT be extracted
+          regularComment: string;
+
+          noComment: boolean;
+        }
+      `;
+      const { checker, type } = createProgramWithSource(tempDir, source);
+      const columns = toColumns(type, checker);
+      const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+
+      // TSDoc comments should be extracted
+      expect(byName.id.comment).to.equal(
+        "The unique identifier for the record",
+      );
+      expect(byName.timestamp.comment).to.equal(
+        "Unix timestamp when the event occurred",
+      );
+
+      // Multi-line TSDoc should be preserved
+      expect(byName.status.comment).to.include(
+        "Multi-line comment describing the status",
+      );
+      expect(byName.status.comment).to.include(
+        "Can be active, inactive, or pending",
+      );
+
+      // Regular // comments should NOT be extracted
+      expect(byName.regularComment.comment).to.equal(null);
+
+      // Fields without comments should have null
+      expect(byName.noComment.comment).to.equal(null);
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("extracts TSDoc comments with special characters", function () {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+    try {
+      const source = `
+        export interface TestModel {
+          /** User's email address (must be valid) */
+          email: string;
+
+          /** Price in USD ($) */
+          price: number;
+
+          /** Contains "quoted" text */
+          quoted: string;
+
+          /** SQL expression: SELECT * FROM users WHERE id = 1 */
+          sqlExample: string;
+        }
+      `;
+      const { checker, type } = createProgramWithSource(tempDir, source);
+      const columns = toColumns(type, checker);
+      const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+
+      expect(byName.email.comment).to.equal(
+        "User's email address (must be valid)",
+      );
+      expect(byName.price.comment).to.equal("Price in USD ($)");
+      expect(byName.quoted.comment).to.equal('Contains "quoted" text');
+      expect(byName.sqlExample.comment).to.equal(
+        "SQL expression: SELECT * FROM users WHERE id = 1",
+      );
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("extracts TSDoc comments alongside other column metadata", function () {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+    try {
+      const source = `
+        import { Key, DateTime, ClickHouseDefault, ClickHouseCodec } from "@514labs/moose-lib";
+
+        export interface TestModel {
+          /** Primary identifier for the record */
+          id: Key<string>;
+
+          /** When the record was created */
+          createdAt: DateTime & ClickHouseDefault<"now()">;
+
+          /** Compressed payload data */
+          payload: string & ClickHouseCodec<"ZSTD(3)">;
+        }
+      `;
+      const { checker, type } = createProgramWithSource(tempDir, source);
+      const columns = toColumns(type, checker);
+      const byName = Object.fromEntries(columns.map((c) => [c.name, c]));
+
+      // Comments should be extracted alongside other metadata
+      expect(byName.id.comment).to.equal("Primary identifier for the record");
+      expect(byName.id.primary_key).to.equal(true);
+
+      expect(byName.createdAt.comment).to.equal("When the record was created");
+      expect(byName.createdAt.default).to.equal("now()");
+
+      expect(byName.payload.comment).to.equal("Compressed payload data");
+      expect(byName.payload.codec).to.equal("ZSTD(3)");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+});

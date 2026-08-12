@@ -1,0 +1,248 @@
+{
+  "apis": {},
+  "ingestApis": {},
+  "materializedViews": {
+    "aggregates_mv": {
+      "metadata": {
+        "source": {
+          "file": "/private/var/folders/xz/jl51lh6d4hz7nd865p8j42cm0000gn/T/tmp.UiC3NpFp7N/dist/app/index.js"
+        }
+      },
+      "name": "aggregates_mv",
+      "selectSql": "SELECT label AS bucket, count() AS total, max(createdAt) AS updatedAt FROM events GROUP BY label",
+      "sourceTables": ["`events`"],
+      "targetTable": "aggregates"
+    }
+  },
+  "selectRowPolicies": {},
+  "sqlResources": {},
+  "tables": {
+    "aggregates": {
+      "columns": [
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "String",
+          "default": null,
+          "materialized": null,
+          "name": "bucket",
+          "primary_key": true,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        },
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "Float64",
+          "default": null,
+          "materialized": null,
+          "name": "total",
+          "primary_key": false,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        },
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "DateTime",
+          "default": null,
+          "materialized": null,
+          "name": "updatedAt",
+          "primary_key": false,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        }
+      ],
+      "engineConfig": {
+        "engine": "MergeTree"
+      },
+      "indexes": [],
+      "metadata": {
+        "source": {
+          "file": "/private/var/folders/xz/jl51lh6d4hz7nd865p8j42cm0000gn/T/tmp.UiC3NpFp7N/dist/app/index.js",
+          "line": "552"
+        }
+      },
+      "name": "aggregates",
+      "orderBy": [],
+      "projections": []
+    },
+    "audit": {
+      "columns": [
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "String",
+          "default": null,
+          "materialized": null,
+          "name": "bucket",
+          "primary_key": true,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        },
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "Float64",
+          "default": null,
+          "materialized": null,
+          "name": "total",
+          "primary_key": false,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        },
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "DateTime",
+          "default": null,
+          "materialized": null,
+          "name": "updatedAt",
+          "primary_key": false,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        }
+      ],
+      "engineConfig": {
+        "engine": "MergeTree"
+      },
+      "indexes": [],
+      "metadata": {
+        "source": {
+          "file": "/private/var/folders/xz/jl51lh6d4hz7nd865p8j42cm0000gn/T/tmp.UiC3NpFp7N/dist/app/index.js",
+          "line": "353"
+        }
+      },
+      "name": "audit",
+      "orderBy": [],
+      "projections": []
+    },
+    "events": {
+      "columns": [
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "String",
+          "default": null,
+          "materialized": null,
+          "name": "id",
+          "primary_key": true,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        },
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "DateTime",
+          "default": null,
+          "materialized": null,
+          "name": "createdAt",
+          "primary_key": false,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        },
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "Float64",
+          "default": null,
+          "materialized": null,
+          "name": "count",
+          "primary_key": false,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        },
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "String",
+          "default": null,
+          "materialized": null,
+          "name": "label",
+          "primary_key": false,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        },
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": "String",
+          "default": null,
+          "materialized": null,
+          "name": "optionalNote",
+          "primary_key": false,
+          "required": false,
+          "ttl": null,
+          "unique": false
+        },
+        {
+          "alias": null,
+          "annotations": [],
+          "codec": null,
+          "comment": null,
+          "data_type": {
+            "elementNullable": false,
+            "elementType": "String"
+          },
+          "default": null,
+          "materialized": null,
+          "name": "tags",
+          "primary_key": false,
+          "required": true,
+          "ttl": null,
+          "unique": false
+        }
+      ],
+      "engineConfig": {
+        "engine": "MergeTree"
+      },
+      "indexes": [],
+      "metadata": {
+        "source": {
+          "file": "/private/var/folders/xz/jl51lh6d4hz7nd865p8j42cm0000gn/T/tmp.UiC3NpFp7N/dist/app/index.js",
+          "line": "48"
+        }
+      },
+      "name": "events",
+      "orderBy": ["id", "createdAt"],
+      "projections": []
+    }
+  },
+  "topics": {},
+  "unloadedFiles": [],
+  "views": {},
+  "webApps": {},
+  "workflows": {}
+}

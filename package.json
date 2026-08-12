@@ -1,0 +1,39 @@
+{
+  "private": true,
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "lint": "turbo lint",
+    "clean": "turbo clean",
+    "prepare": "husky install",
+    "format": "prettier --write './apps/**/*.{ts,tsx}'"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.3.6",
+    "@eslint/js": "^9.39.0",
+    "@repo/ts-config": "workspace:*",
+    "eslint": "^9.33.0",
+    "eslint-config-prettier": "^10.1.1",
+    "husky": "^8.0.3",
+    "lint-staged": "16.2.0",
+    "prettier": "^3.6.2",
+    "prettier-plugin-tailwindcss": "^0.1.13",
+    "turbo": "^2.5.5",
+    "typescript-eslint": "^8.28.0"
+  },
+  "packageManager": "pnpm@9.9.0",
+  "pnpm": {
+    "overrides": {
+      "tar": "7.5.7"
+    }
+  },
+  "lint-staged": {
+    "*.rs": "rustfmt --edition 2021",
+    "**/*.{ts,tsx,js,jsx,json,md}": "prettier --write",
+    "*.py": "black",
+    "!**/*.hbs": "echo 'Skipping Handlebars template files'"
+  }
+}

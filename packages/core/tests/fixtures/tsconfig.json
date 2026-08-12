@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "rootDir": ".",
+    "outDir": "./dist",
+    "plugins": [
+      { "transform": "@typed-clickhouse/core/dist/compilerPlugin.js" },
+      { "transform": "typia/lib/transform" }
+    ]
+  },
+  "include": ["app/**/*.ts"]
+}

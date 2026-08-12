@@ -1,0 +1,2420 @@
+use crate::framework::core::infrastructure::table::{
+    ColumnType, DataEnum, EnumValue, FloatType, JsonOptions, Nested, OrderBy, Table,
+};
+use crate::framework::core::partial_infrastructure_map::LifeCycle;
+use crate::utilities::identifiers as ident;
+use convert_case::{Case, Casing};
+use itertools::Itertools;
+use serde_json::json;
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+use std::fmt::Write;
+
+// Use shared, language-agnostic sanitization (underscores) from utilities
+use crate::infrastructure::olap::clickhouse::extract_version_from_table_name;
+use crate::infrastructure::olap::clickhouse::queries::BufferEngine;
+pub use ident::sanitize_identifier;
+
+/// Map a string to a valid TypeScript PascalCase identifier (for types/classes/consts).
+pub fn sanitize_typescript_identifier(name: &str) -> String {
+    let preprocessed = sanitize_identifier(name);
+    let mut ident = preprocessed.to_case(Case::Pascal);
+    if ident.is_empty() || {
+        let first = ident.chars().next().unwrap();
+        !(first.is_ascii_alphabetic() || first == '_' || first == '$')
+    } {
+        ident.insert(0, '_');
+    }
+    ident
+}
+
+fn map_column_type_to_typescript(
+    column_type: &ColumnType,
+    enums: &HashMap<&DataEnum, String>,
+    nested: &HashMap<&Nested, String>,
+    json_types: &HashMap<&JsonOptions, String>,
+) -> String {
+    match column_type {
+        ColumnType::String => "string".to_string(),
+        ColumnType::FixedString { length } => {
+            format!("string & FixedString<{length}>")
+        }
+        ColumnType::Boolean => "boolean".to_string(),
+        ColumnType::Int(int_type) => {
+            let lowercase_int_type = format!("{int_type:?}").to_lowercase();
+            format!("number & ClickHouseInt<\"{lowercase_int_type}\">")
+        }
+        ColumnType::BigInt => "bigint".to_string(),
+        ColumnType::Float(FloatType::Float64) => "number".to_string(),
+        ColumnType::Float(FloatType::Float32) => "number & typia.tags.Type<\"float\">".to_string(),
+        ColumnType::Decimal { precision, scale } => {
+            format!("string & ClickHouseDecimal<{precision}, {scale}>")
+        }
+        ColumnType::DateTime { precision: None } => "Date".to_string(),
+        ColumnType::DateTime {
+            precision: Some(precision),
+        } => {
+            format!("string & typia.tags.Format<\"date-time\"> & ClickHousePrecision<{precision}>")
+        }
+        // Framework Date (standard) -> ClickHouse Date32 (4 bytes)
+        ColumnType::Date => "string & typia.tags.Format<\"date\">".to_string(),
+        // Framework Date16 (memory-optimized) -> ClickHouse Date (2 bytes)
+        ColumnType::Date16 => {
+            "string & typia.tags.Format<\"date\"> & ClickHouseByteSize<2>".to_string()
+        }
+        ColumnType::Enum(data_enum) => enums.get(data_enum).unwrap().to_string(),
+        ColumnType::Array {
+            element_type,
+            element_nullable,
+        } => {
+            let mut inner_type =
+                map_column_type_to_typescript(element_type, enums, nested, json_types);
+            if *element_nullable {
+                inner_type = format!("({inner_type} | undefined)")
+            };
+            if inner_type.contains(' ') {
+                inner_type = format!("({inner_type})")
+            }
+            format!("{inner_type}[]")
+        }
+        ColumnType::Nested(nested_type) => nested.get(nested_type).unwrap().to_string(),
+        ColumnType::Json(opts) => {
+            if opts.typed_paths.is_empty() {
+                "Record<string, any>".to_string()
+            } else {
+                let class_name = json_types.get(opts).unwrap();
+                let mut parts = Vec::new();
+                if let Some(n) = opts.max_dynamic_paths {
+                    parts.push(format!("{n}"));
+                } else {
+                    parts.push("undefined".to_string());
+                }
+                if let Some(n) = opts.max_dynamic_types {
+                    parts.push(format!("{n}"));
+                } else {
+                    parts.push("undefined".to_string());
+                }
+                if !opts.skip_paths.is_empty() {
+                    let paths = opts
+                        .skip_paths
+                        .iter()
+                        .map(|p| format!("{:?}", p))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    parts.push(format!("[{}]", paths));
+                } else {
+                    parts.push("[]".to_string());
+                }
+                if !opts.skip_regexps.is_empty() {
+                    let regexps = opts
+                        .skip_regexps
+                        .iter()
+                        .map(|r| format!("{:?}", r))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    parts.push(format!("[{}]", regexps));
+                } else {
+                    parts.push("[]".to_string());
+                }
+                format!("{class_name} & ClickHouseJson<{}>", parts.join(", "))
+            }
+        }
+        ColumnType::Bytes => "Uint8Array".to_string(),
+        ColumnType::Uuid => "string & typia.tags.Format<\"uuid\">".to_string(),
+        ColumnType::IpV4 => "string & typia.tags.Format<\"ipv4\">".to_string(),
+        ColumnType::IpV6 => "string & typia.tags.Format<\"ipv6\">".to_string(),
+        ColumnType::Nullable(inner) => {
+            let inner_type = map_column_type_to_typescript(inner, enums, nested, json_types);
+            format!("{inner_type} | undefined")
+        }
+        ColumnType::NamedTuple(fields) => {
+            let mut field_types = Vec::new();
+            for (name, field_type) in fields {
+                let type_str = map_column_type_to_typescript(field_type, enums, nested, json_types);
+                field_types.push(format!("{name}: {type_str}"));
+            }
+            format!("{{ {} }} & ClickHouseNamedTuple", field_types.join("; "))
+        }
+        ColumnType::Point => "ClickHousePoint".to_string(),
+        ColumnType::Ring => "ClickHouseRing".to_string(),
+        ColumnType::LineString => "ClickHouseLineString".to_string(),
+        ColumnType::MultiLineString => "ClickHouseMultiLineString".to_string(),
+        ColumnType::Polygon => "ClickHousePolygon".to_string(),
+        ColumnType::MultiPolygon => "ClickHouseMultiPolygon".to_string(),
+        ColumnType::Map {
+            key_type,
+            value_type,
+        } => {
+            let key_type_str = map_column_type_to_typescript(key_type, enums, nested, json_types);
+            let value_type_str =
+                map_column_type_to_typescript(value_type, enums, nested, json_types);
+            format!("Record<{key_type_str}, {value_type_str}>")
+        }
+    }
+}
+
+fn generate_enum(data_enum: &DataEnum, name: &str) -> String {
+    let mut enum_def = String::new();
+    writeln!(enum_def, "export enum {name} {{").unwrap();
+    for member in &data_enum.values {
+        match &member.value {
+            EnumValue::Int(i) => {
+                if member.name.chars().all(char::is_numeric) {
+                    writeln!(enum_def, "    // \"{}\" = {},", member.name, i).unwrap()
+                } else {
+                    writeln!(enum_def, "    \"{}\" = {},", member.name, i).unwrap()
+                }
+            }
+            EnumValue::String(s) => writeln!(enum_def, "    {} = \"{}\",", member.name, s).unwrap(),
+        }
+    }
+    writeln!(enum_def, "}}").unwrap();
+    writeln!(enum_def).unwrap();
+    enum_def
+}
+
+fn quote_name_if_needed(column_name: &str) -> String {
+    // Valid TS identifier: /^[A-Za-z_$][A-Za-z0-9_$]*$/ and not a TS keyword
+    // We conservatively quote if it doesn't match identifier pattern or contains any non-identifier chars
+    let mut chars = column_name.chars();
+    let first_ok = match chars.next() {
+        Some(c) => c.is_ascii_alphabetic() || c == '_' || c == '$',
+        None => false,
+    };
+    let rest_ok = first_ok
+        && column_name
+            .chars()
+            .skip(1)
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+    if !rest_ok || is_typescript_keyword(column_name) {
+        format!("'{column_name}'")
+    } else {
+        column_name.to_string()
+    }
+}
+
+fn is_typescript_keyword(name: &str) -> bool {
+    // Minimal set to avoid false negatives; quoting keywords is always safe
+    const KEYWORDS: &[&str] = &[
+        "any",
+        "as",
+        "boolean",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "constructor",
+        "continue",
+        "debugger",
+        "declare",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "enum",
+        "export",
+        "extends",
+        "false",
+        "finally",
+        "for",
+        "from",
+        "function",
+        "get",
+        "if",
+        "implements",
+        "import",
+        "in",
+        "instanceof",
+        "interface",
+        "let",
+        "module",
+        "never",
+        "new",
+        "null",
+        "number",
+        "of",
+        "package",
+        "private",
+        "protected",
+        "public",
+        "readonly",
+        "require",
+        "return",
+        "set",
+        "static",
+        "string",
+        "super",
+        "switch",
+        "symbol",
+        "this",
+        "throw",
+        "true",
+        "try",
+        "type",
+        "typeof",
+        "unknown",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+    ];
+    KEYWORDS.binary_search_by(|k| k.cmp(&name)).is_ok()
+}
+
+fn generate_interface(
+    nested: &Nested,
+    name: &str,
+    enums: &HashMap<&DataEnum, String>,
+    nested_models: &HashMap<&Nested, String>,
+    json_types: &HashMap<&JsonOptions, String>,
+) -> String {
+    let mut interface = String::new();
+    writeln!(interface, "export interface {name} {{").unwrap();
+
+    for column in &nested.columns {
+        // Output TSDoc comment if present
+        if let Some(ref comment) = column.comment {
+            // Sanitize comment to prevent breaking TSDoc block
+            let sanitized = comment.replace("*/", "*\\/");
+            writeln!(interface, "    /** {} */", sanitized).unwrap();
+        }
+
+        let type_str =
+            map_column_type_to_typescript(&column.data_type, enums, nested_models, json_types);
+        let type_str = if column.primary_key {
+            format!("Key<{type_str}>")
+        } else {
+            type_str
+        };
+        let type_str = if !column.required {
+            format!("{type_str} | undefined")
+        } else {
+            type_str
+        };
+        let name = quote_name_if_needed(&column.name);
+        writeln!(interface, "    {name}: {type_str};").unwrap();
+    }
+    writeln!(interface, "}}").unwrap();
+    writeln!(interface).unwrap();
+    interface
+}
+
+fn generate_json_inner_interface(
+    opts: &JsonOptions,
+    name: &str,
+    enums: &HashMap<&DataEnum, String>,
+    nested_models: &HashMap<&Nested, String>,
+    json_types: &HashMap<&JsonOptions, String>,
+) -> String {
+    let mut interface = String::new();
+    writeln!(interface, "export interface {name} {{").unwrap();
+
+    for (field_name, field_type) in &opts.typed_paths {
+        let type_str = map_column_type_to_typescript(field_type, enums, nested_models, json_types);
+        writeln!(interface, "    {field_name}: {type_str};").unwrap();
+    }
+    writeln!(interface, "}}").unwrap();
+    writeln!(interface).unwrap();
+    interface
+}
+
+/// Symbols unconditionally imported from `@typed-clickhouse/core` at
+/// the top of every file `typed-clickhouse db pull` writes.
+///
+/// Every entry here MUST actually be exported by
+/// `packages/lib/src/serverless.ts` (the source `@typed-clickhouse/core`
+/// re-exports), or the generated TypeScript fails to typecheck (TS2305) and
+/// breaks every subsequent `check`/`plan`/`migrate` on the pulled project.
+/// `tests::base_imports_are_actually_exported_by_the_library` guards this
+/// list against drift — update that test's expectations if you intentionally
+/// change what's exported.
+const BASE_IMPORTS: &[&str] = &[
+    "OlapTable",
+    "Key",
+    "ClickHouseInt",
+    "ClickHouseDecimal",
+    "ClickHousePrecision",
+    "ClickHouseByteSize",
+    "ClickHouseNamedTuple",
+    "ClickHouseEngines",
+    "ClickHouseDefault",
+    "WithDefault",
+    "LifeCycle",
+    "ClickHouseTTL",
+    "ClickHouseCodec",
+    "ClickHouseMaterialized",
+    "ClickHouseAlias",
+];
+
+/// Symbols conditionally appended to [`BASE_IMPORTS`] when a table actually
+/// uses the corresponding feature (see `uses_simple_aggregate` /
+/// `uses_low_cardinality` below). Same export-surface requirement applies.
+const SIMPLE_AGGREGATED_IMPORT: &str = "SimpleAggregated";
+const LOW_CARDINALITY_IMPORT: &str = "LowCardinality";
+
+/// Symbols unconditionally imported from `@typed-clickhouse/core` in
+/// a second import line, for the ClickHouse geometry types referenced by
+/// [`map_column_type_to_typescript`] (`ColumnType::Point`, `Ring`,
+/// `LineString`, `MultiLineString`, `Polygon`, `MultiPolygon`). Same
+/// export-surface requirement as [`BASE_IMPORTS`] applies -- these are
+/// type-only names, so they must appear in
+/// `packages/lib/src/serverless.ts`'s export surface even though
+/// they never show up in `golden/exports.json`.
+const GEO_IMPORTS: &[&str] = &[
+    "ClickHousePoint",
+    "ClickHouseRing",
+    "ClickHouseLineString",
+    "ClickHouseMultiLineString",
+    "ClickHousePolygon",
+    "ClickHouseMultiPolygon",
+];
+
+pub fn tables_to_typescript(tables: &[Table], life_cycle: Option<LifeCycle>) -> String {
+    let mut output = String::new();
+
+    let uses_simple_aggregate = tables.iter().any(|table| {
+        table.columns.iter().any(|column| {
+            column
+                .annotations
+                .iter()
+                .any(|(k, _)| k == "simpleAggregationFunction")
+        })
+    });
+
+    let uses_low_cardinality = tables.iter().any(|table| {
+        table.columns.iter().any(|column| {
+            column
+                .annotations
+                .iter()
+                .any(|(k, v)| k == "LowCardinality" && v == &serde_json::json!(true))
+        })
+    });
+
+    // Add imports
+    let mut base_imports = BASE_IMPORTS.to_vec();
+
+    if uses_simple_aggregate {
+        base_imports.push(SIMPLE_AGGREGATED_IMPORT);
+    }
+
+    if uses_low_cardinality {
+        base_imports.push(LOW_CARDINALITY_IMPORT);
+    }
+
+    writeln!(
+        output,
+        "import {{ {} }} from \"@typed-clickhouse/core\";",
+        base_imports.join(", ")
+    )
+    .unwrap();
+
+    writeln!(
+        output,
+        "import {{ {} }} from \"@typed-clickhouse/core\";",
+        GEO_IMPORTS.join(", ")
+    )
+    .unwrap();
+    writeln!(output, "import typia from \"typia\";").unwrap();
+    writeln!(output).unwrap();
+
+    // Collect all enums, nested types, and json types
+    let mut enums: HashMap<&DataEnum, String> = HashMap::new();
+    let mut extra_type_names: HashMap<String, usize> = HashMap::new();
+    let mut nested_models: HashMap<&Nested, String> = HashMap::new();
+    let mut json_types: HashMap<&JsonOptions, String> = HashMap::new();
+
+    // Helper function to recursively collect all nested types
+    fn collect_all_types<'a>(
+        column_type: &'a ColumnType,
+        column_name: &str,
+        enums: &mut HashMap<&'a DataEnum, String>,
+        extra_type_names: &mut HashMap<String, usize>,
+        nested_models: &mut HashMap<&'a Nested, String>,
+        json_types: &mut HashMap<&'a JsonOptions, String>,
+    ) {
+        match column_type {
+            ColumnType::Enum(data_enum) => {
+                if !enums.contains_key(data_enum) {
+                    let name = sanitize_typescript_identifier(column_name);
+                    let name = match extra_type_names.entry(name.clone()) {
+                        Entry::Occupied(mut entry) => {
+                            *entry.get_mut() = entry.get() + 1;
+                            format!("{}{}", name, entry.get())
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(0);
+                            name
+                        }
+                    };
+                    enums.insert(data_enum, name);
+                }
+            }
+            ColumnType::Nested(nested) => {
+                if !nested_models.contains_key(nested) {
+                    let name = sanitize_typescript_identifier(column_name);
+                    let name = match extra_type_names.entry(name.clone()) {
+                        Entry::Occupied(mut entry) => {
+                            *entry.get_mut() = entry.get() + 1;
+                            format!("{}{}", name, entry.get())
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(0);
+                            name
+                        }
+                    };
+                    nested_models.insert(nested, name);
+
+                    // Recursively collect types from nested columns
+                    for nested_column in &nested.columns {
+                        collect_all_types(
+                            &nested_column.data_type,
+                            &nested_column.name,
+                            enums,
+                            extra_type_names,
+                            nested_models,
+                            json_types,
+                        );
+                    }
+                }
+            }
+            ColumnType::Json(opts) => {
+                if !opts.typed_paths.is_empty() && !json_types.contains_key(opts) {
+                    let name = format!("{}Json", sanitize_typescript_identifier(column_name));
+                    let name = match extra_type_names.entry(name.clone()) {
+                        Entry::Occupied(mut entry) => {
+                            *entry.get_mut() = entry.get() + 1;
+                            format!("{}{}", name, entry.get())
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(0);
+                            name
+                        }
+                    };
+                    json_types.insert(opts, name);
+
+                    // Recursively collect types from typed paths
+                    for (path_name, path_type) in &opts.typed_paths {
+                        collect_all_types(
+                            path_type,
+                            path_name,
+                            enums,
+                            extra_type_names,
+                            nested_models,
+                            json_types,
+                        );
+                    }
+                }
+            }
+            ColumnType::Array { element_type, .. } => {
+                collect_all_types(
+                    element_type,
+                    column_name,
+                    enums,
+                    extra_type_names,
+                    nested_models,
+                    json_types,
+                );
+            }
+            ColumnType::Nullable(inner) => {
+                collect_all_types(
+                    inner,
+                    column_name,
+                    enums,
+                    extra_type_names,
+                    nested_models,
+                    json_types,
+                );
+            }
+            ColumnType::NamedTuple(fields) => {
+                for (field_name, field_type) in fields {
+                    collect_all_types(
+                        field_type,
+                        field_name,
+                        enums,
+                        extra_type_names,
+                        nested_models,
+                        json_types,
+                    );
+                }
+            }
+            ColumnType::Map {
+                key_type,
+                value_type,
+            } => {
+                collect_all_types(
+                    key_type,
+                    column_name,
+                    enums,
+                    extra_type_names,
+                    nested_models,
+                    json_types,
+                );
+                collect_all_types(
+                    value_type,
+                    column_name,
+                    enums,
+                    extra_type_names,
+                    nested_models,
+                    json_types,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // First pass: collect all nested types, enums, and json types
+    for table in tables {
+        for column in &table.columns {
+            collect_all_types(
+                &column.data_type,
+                &column.name,
+                &mut enums,
+                &mut extra_type_names,
+                &mut nested_models,
+                &mut json_types,
+            );
+        }
+    }
+
+    // Generate enum definitions
+    for (data_enum, name) in enums.iter() {
+        output.push_str(&generate_enum(data_enum, name));
+    }
+
+    // Generate JSON inner interface definitions
+    for (opts, name) in json_types.iter() {
+        output.push_str(&generate_json_inner_interface(
+            opts,
+            name,
+            &enums,
+            &nested_models,
+            &json_types,
+        ));
+    }
+
+    // Generate nested interface definitions
+    for (nested, name) in nested_models.iter() {
+        output.push_str(&generate_interface(
+            nested,
+            name,
+            &enums,
+            &nested_models,
+            &json_types,
+        ));
+    }
+
+    // Generate model interfaces
+    for table in tables {
+        // list_tables sets primary_key_expression to Some if Key wrapping is insufficient to represent the PK
+        let can_use_key_wrapping = table.primary_key_expression.is_none();
+
+        writeln!(output, "export interface {} {{", table.name).unwrap();
+
+        for column in &table.columns {
+            // Output TSDoc comment if present
+            if let Some(ref comment) = column.comment {
+                // Sanitize comment to prevent breaking TSDoc block
+                let sanitized = comment.replace("*/", "*\\/");
+                writeln!(output, "    /** {} */", sanitized).unwrap();
+            }
+
+            let mut type_str = map_column_type_to_typescript(
+                &column.data_type,
+                &enums,
+                &nested_models,
+                &json_types,
+            );
+
+            if let Some((_, simple_agg_func)) = column
+                .annotations
+                .iter()
+                .find(|(k, _)| k == "simpleAggregationFunction")
+            {
+                if let Some(function_name) =
+                    simple_agg_func.get("functionName").and_then(|v| v.as_str())
+                {
+                    type_str = format!(
+                        "{} & SimpleAggregated<{:?}, {}>",
+                        type_str, function_name, type_str
+                    );
+                }
+            }
+
+            if column
+                .annotations
+                .iter()
+                .any(|(k, v)| k == "LowCardinality" && v == &serde_json::json!(true))
+            {
+                type_str = format!("{type_str} & LowCardinality");
+            }
+
+            // Apply TTL and Codec first (these can coexist with DEFAULT/MATERIALIZED)
+            let type_str = if let Some(expr) = &column.ttl {
+                format!("{type_str} & ClickHouseTTL<\"{}\">", expr)
+            } else {
+                type_str
+            };
+
+            let type_str = match column.codec.as_ref() {
+                None => type_str,
+                Some(ref codec) => format!("{type_str} & ClickHouseCodec<{codec:?}>"),
+            };
+
+            // Handle DEFAULT, MATERIALIZED, and ALIAS (mutually exclusive)
+            // Apply these AFTER TTL/Codec to prevent WithDefault<Date> when Date has other annotations
+            let type_str = match (&column.default, &column.materialized, &column.alias) {
+                (Some(default), None, None) if type_str == "Date" => {
+                    // https://github.com/samchon/typia/issues/1658
+                    // WithDefault only for plain Date (not "Date & ClickHouse...")
+                    format!("WithDefault<{type_str}, {:?}>", default)
+                }
+                (Some(default), None, None) => {
+                    format!("{type_str} & ClickHouseDefault<{:?}>", default)
+                }
+                (None, Some(materialized), None) => {
+                    format!("{type_str} & ClickHouseMaterialized<{:?}>", materialized)
+                }
+                (None, None, Some(alias)) => {
+                    format!("{type_str} & ClickHouseAlias<{:?}>", alias)
+                }
+                (None, None, None) => type_str,
+                _ => {
+                    panic!(
+                        "Column '{}' has multiple of DEFAULT/MATERIALIZED/ALIAS set. \
+                        These are mutually exclusive in ClickHouse.",
+                        column.name
+                    )
+                }
+            };
+            let type_str = if can_use_key_wrapping && column.primary_key {
+                format!("Key<{type_str}>")
+            } else {
+                type_str
+            };
+            let type_str = if !column.required {
+                format!("{type_str} | undefined")
+            } else {
+                type_str
+            };
+            let name = quote_name_if_needed(&column.name);
+            writeln!(output, "    {name}: {type_str};").unwrap();
+        }
+        writeln!(output, "}}").unwrap();
+        writeln!(output).unwrap();
+    }
+
+    // Generate table configurations
+    for table in tables {
+        let order_by_spec = match &table.order_by {
+            OrderBy::Fields(v) if v.is_empty() => "orderByExpression: \"tuple()\"".to_string(),
+            OrderBy::Fields(v) => {
+                format!(
+                    "orderByFields: [{}]",
+                    v.iter().map(|name| format!("{:?}", name)).join(", ")
+                )
+            }
+            OrderBy::SingleExpr(expr) => format!("orderByExpression: {:?}", expr),
+        };
+
+        let var_name = sanitize_typescript_identifier(&table.name);
+
+        // Skip version extraction for externally managed tables — they don't follow
+        // the `tablename_version` naming convention, so parsing their names for
+        // version segments would corrupt the table name (e.g. UUIDs contain digit-only
+        // segments that look like versions).
+        let (base_name, version) = if life_cycle == Some(LifeCycle::ExternallyManaged) {
+            (table.name.clone(), table.version.clone())
+        } else {
+            extract_version_from_table_name(&table.name)
+        };
+        let table_name = if version == table.version {
+            &base_name
+        } else {
+            &table.name
+        };
+        writeln!(
+            output,
+            "export const {}Table = new OlapTable<{}>(\"{}\", {{",
+            var_name, table.name, table_name
+        )
+        .unwrap();
+
+        if table.engine.supports_order_by() {
+            writeln!(output, "    {order_by_spec},").unwrap();
+        }
+
+        if let Some(ref pk_expr) = table.primary_key_expression {
+            // Use the explicit primary_key_expression directly
+            writeln!(output, "    primaryKeyExpression: {:?},", pk_expr).unwrap();
+        }
+        if let Some(partition_by) = &table.partition_by {
+            writeln!(output, "    partitionBy: {:?},", partition_by).unwrap();
+        }
+        if let Some(sample_by) = &table.sample_by {
+            writeln!(output, "    sampleByExpression: {:?},", sample_by).unwrap();
+        }
+        if let Some(database) = &table.database {
+            writeln!(output, "    database: {:?},", database).unwrap();
+        }
+        match &table.engine {
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::S3Queue {
+                s3_path,
+                format,
+                compression,
+                headers,
+                aws_access_key_id,
+                aws_secret_access_key,
+            } => {
+                // For S3Queue, properties are at the same level as orderByFields
+                writeln!(output, "    engine: ClickHouseEngines.S3Queue,").unwrap();
+                writeln!(output, "    s3Path: {:?},", s3_path).unwrap();
+                writeln!(output, "    format: {:?},", format).unwrap();
+                if let Some(compression) = compression {
+                    writeln!(output, "    compression: {:?},", compression).unwrap();
+                }
+                if let Some(key_id) = aws_access_key_id {
+                    writeln!(output, "    awsAccessKeyId: {:?},", key_id).unwrap();
+                }
+                if let Some(secret) = aws_secret_access_key {
+                    writeln!(output, "    awsSecretAccessKey: {:?},", secret).unwrap();
+                }
+                if let Some(headers) = headers {
+                    write!(output, "    headers: {{").unwrap();
+                    for (i, (key, value)) in headers.iter().enumerate() {
+                        if i > 0 { write!(output, ",").unwrap(); }
+                        write!(output, " {:?}: {:?}", key, value).unwrap();
+                    }
+                    writeln!(output, " }},").unwrap();
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::MergeTree => {
+                writeln!(output, "    engine: ClickHouseEngines.MergeTree,").unwrap();
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::ReplacingMergeTree { ver, is_deleted } => {
+                // Emit ReplacingMergeTree engine configuration
+                writeln!(output, "    engine: ClickHouseEngines.ReplacingMergeTree,").unwrap();
+                if let Some(ver_col) = ver {
+                    writeln!(output, "    ver: \"{}\",", ver_col).unwrap();
+                }
+                if let Some(is_deleted_col) = is_deleted {
+                    writeln!(output, "    isDeleted: \"{}\",", is_deleted_col).unwrap();
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::AggregatingMergeTree => {
+                writeln!(output, "    engine: ClickHouseEngines.AggregatingMergeTree,").unwrap();
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::SummingMergeTree { columns } => {
+                writeln!(output, "    engine: ClickHouseEngines.SummingMergeTree,").unwrap();
+                if let Some(cols) = columns {
+                    if !cols.is_empty() {
+                        let col_list = cols.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>().join(", ");
+                        writeln!(output, "    columns: [{}],", col_list).unwrap();
+                    }
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::CollapsingMergeTree { sign } => {
+                writeln!(output, "    engine: ClickHouseEngines.CollapsingMergeTree,").unwrap();
+                writeln!(output, "    sign: {:?},", sign).unwrap();
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::VersionedCollapsingMergeTree { sign, version } => {
+                writeln!(output, "    engine: ClickHouseEngines.VersionedCollapsingMergeTree,").unwrap();
+                writeln!(output, "    sign: {:?},", sign).unwrap();
+                writeln!(output, "    ver: {:?},", version).unwrap();
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::ReplicatedMergeTree { keeper_path, replica_name } => {
+                writeln!(output, "    engine: ClickHouseEngines.ReplicatedMergeTree,").unwrap();
+                if let (Some(path), Some(name)) = (keeper_path, replica_name) {
+                    writeln!(output, "    keeperPath: {:?},", path).unwrap();
+                    writeln!(output, "    replicaName: {:?},", name).unwrap();
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::ReplicatedReplacingMergeTree { keeper_path, replica_name, ver, is_deleted } => {
+                writeln!(output, "    engine: ClickHouseEngines.ReplicatedReplacingMergeTree,").unwrap();
+                if let (Some(path), Some(name)) = (keeper_path, replica_name) {
+                    writeln!(output, "    keeperPath: {:?},", path).unwrap();
+                    writeln!(output, "    replicaName: {:?},", name).unwrap();
+                }
+                if let Some(ver_col) = ver {
+                    writeln!(output, "    ver: {:?},", ver_col).unwrap();
+                }
+                if let Some(is_deleted_col) = is_deleted {
+                    writeln!(output, "    isDeleted: {:?},", is_deleted_col).unwrap();
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::ReplicatedAggregatingMergeTree { keeper_path, replica_name } => {
+                writeln!(output, "    engine: ClickHouseEngines.ReplicatedAggregatingMergeTree,").unwrap();
+                if let (Some(path), Some(name)) = (keeper_path, replica_name) {
+                    writeln!(output, "    keeperPath: {:?},", path).unwrap();
+                    writeln!(output, "    replicaName: {:?},", name).unwrap();
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::ReplicatedSummingMergeTree { keeper_path, replica_name, columns } => {
+                writeln!(output, "    engine: ClickHouseEngines.ReplicatedSummingMergeTree,").unwrap();
+                if let (Some(path), Some(name)) = (keeper_path, replica_name) {
+                    writeln!(output, "    keeperPath: {:?},", path).unwrap();
+                    writeln!(output, "    replicaName: {:?},", name).unwrap();
+                }
+                if let Some(cols) = columns {
+                    if !cols.is_empty() {
+                        let col_list = cols.iter().map(|c| format!("{:?}", c)).collect::<Vec<_>>().join(", ");
+                        writeln!(output, "    columns: [{}],", col_list).unwrap();
+                    }
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::ReplicatedCollapsingMergeTree { keeper_path, replica_name, sign } => {
+                writeln!(output, "    engine: ClickHouseEngines.ReplicatedCollapsingMergeTree,").unwrap();
+                if let (Some(path), Some(name)) = (keeper_path, replica_name) {
+                    writeln!(output, "    keeperPath: {:?},", path).unwrap();
+                    writeln!(output, "    replicaName: {:?},", name).unwrap();
+                }
+                writeln!(output, "    sign: {:?},", sign).unwrap();
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::ReplicatedVersionedCollapsingMergeTree { keeper_path, replica_name, sign, version } => {
+                writeln!(output, "    engine: ClickHouseEngines.ReplicatedVersionedCollapsingMergeTree,").unwrap();
+                if let (Some(path), Some(name)) = (keeper_path, replica_name) {
+                    writeln!(output, "    keeperPath: {:?},", path).unwrap();
+                    writeln!(output, "    replicaName: {:?},", name).unwrap();
+                }
+                writeln!(output, "    sign: {:?},", sign).unwrap();
+                writeln!(output, "    ver: {:?},", version).unwrap();
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::S3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                compression,
+                partition_strategy,
+                partition_columns_in_data_file,
+            } => {
+                writeln!(output, "    engine: ClickHouseEngines.S3,").unwrap();
+                writeln!(output, "    path: {:?},", path).unwrap();
+                writeln!(output, "    format: {:?},", format).unwrap();
+                if let Some(key_id) = aws_access_key_id {
+                    writeln!(output, "    awsAccessKeyId: {:?},", key_id).unwrap();
+                }
+                if let Some(secret) = aws_secret_access_key {
+                    writeln!(output, "    awsSecretAccessKey: {:?},", secret).unwrap();
+                }
+                if let Some(comp) = compression {
+                    writeln!(output, "    compression: {:?},", comp).unwrap();
+                }
+                if let Some(ps) = partition_strategy {
+                    writeln!(output, "    partitionStrategy: {:?},", ps).unwrap();
+                }
+                if let Some(pc) = partition_columns_in_data_file {
+                    writeln!(output, "    partitionColumnsInDataFile: {:?},", pc).unwrap();
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::Buffer(BufferEngine {
+                target_database,
+                target_table,
+                num_layers,
+                min_time,
+                max_time,
+                min_rows,
+                max_rows,
+                min_bytes,
+                max_bytes,
+                flush_time,
+                flush_rows,
+                flush_bytes,
+            }) => {
+                writeln!(output, "    engine: ClickHouseEngines.Buffer,").unwrap();
+                writeln!(output, "    targetDatabase: {:?},", target_database).unwrap();
+                writeln!(output, "    targetTable: {:?},", target_table).unwrap();
+                writeln!(output, "    numLayers: {},", num_layers).unwrap();
+                writeln!(output, "    minTime: {},", min_time).unwrap();
+                writeln!(output, "    maxTime: {},", max_time).unwrap();
+                writeln!(output, "    minRows: {},", min_rows).unwrap();
+                writeln!(output, "    maxRows: {},", max_rows).unwrap();
+                writeln!(output, "    minBytes: {},", min_bytes).unwrap();
+                writeln!(output, "    maxBytes: {},", max_bytes).unwrap();
+                if let Some(ft) = flush_time {
+                    writeln!(output, "    flushTime: {},", ft).unwrap();
+                }
+                if let Some(fr) = flush_rows {
+                    writeln!(output, "    flushRows: {},", fr).unwrap();
+                }
+                if let Some(fb) = flush_bytes {
+                    writeln!(output, "    flushBytes: {},", fb).unwrap();
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::Distributed {
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            } => {
+                writeln!(output, "    engine: ClickHouseEngines.Distributed,").unwrap();
+                writeln!(output, "    cluster: {:?},", cluster).unwrap();
+                writeln!(output, "    targetDatabase: {:?},", target_database).unwrap();
+                writeln!(output, "    targetTable: {:?},", target_table).unwrap();
+                if let Some(key) = sharding_key {
+                    writeln!(output, "    shardingKey: {:?},", key).unwrap();
+                }
+                if let Some(policy) = policy_name {
+                    writeln!(output, "    policyName: {:?},", policy).unwrap();
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::IcebergS3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                compression,
+            } => {
+                writeln!(output, "    engine: ClickHouseEngines.IcebergS3,").unwrap();
+                writeln!(output, "    path: {:?},", path).unwrap();
+                writeln!(output, "    format: {:?},", format).unwrap();
+                if let Some(key_id) = aws_access_key_id {
+                    writeln!(output, "    awsAccessKeyId: {:?},", key_id).unwrap();
+                }
+                if let Some(secret) = aws_secret_access_key {
+                    writeln!(output, "    awsSecretAccessKey: {:?},", secret).unwrap();
+                }
+                if let Some(comp) = compression {
+                    writeln!(output, "    compression: {:?},", comp).unwrap();
+                }
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::Kafka {
+                broker_list,
+                topic_list,
+                group_name,
+                format,
+            } => {
+                writeln!(output, "    engine: ClickHouseEngines.Kafka,").unwrap();
+                writeln!(output, "    brokerList: {:?},", broker_list).unwrap();
+                writeln!(output, "    topicList: {:?},", topic_list).unwrap();
+                writeln!(output, "    groupName: {:?},", group_name).unwrap();
+                writeln!(output, "    format: {:?},", format).unwrap();
+            }
+            crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine::Merge {
+                source_database,
+                tables_regexp,
+            } => {
+                writeln!(output, "    engine: ClickHouseEngines.Merge,").unwrap();
+                writeln!(output, "    sourceDatabase: {:?},", source_database).unwrap();
+                writeln!(output, "    tablesRegexp: {:?},", tables_regexp).unwrap();
+            }
+        }
+        // Skip version for externally managed tables — the infra map appends
+        // `_{version}` to the table name, which would corrupt external table names
+        // that don't follow this tool's naming convention.
+        if life_cycle != Some(LifeCycle::ExternallyManaged) {
+            if let Some(version) = &table.version {
+                writeln!(output, "    version: {:?},", version).unwrap();
+            }
+        }
+        // Add table settings if present (works for all engines)
+        if let Some(settings) = &table.table_settings {
+            if !settings.is_empty() {
+                write!(output, "    settings: {{").unwrap();
+                for (i, (key, value)) in settings.iter().enumerate() {
+                    if i > 0 {
+                        write!(output, ",").unwrap();
+                    }
+                    write!(output, " {}: {:?}", key, value).unwrap();
+                }
+                writeln!(output, " }},").unwrap();
+            }
+        }
+        if let Some(life_cycle) = life_cycle {
+            writeln!(
+                output,
+                "    lifeCycle: LifeCycle.{},",
+                json!(life_cycle).as_str().unwrap() // reuse SCREAMING_SNAKE_CASE of serde
+            )
+            .unwrap();
+        };
+        if let Some(ttl_expr) = &table.table_ttl_setting {
+            writeln!(output, "    ttl: {:?},", ttl_expr).unwrap();
+        }
+        if !table.indexes.is_empty() {
+            writeln!(output, "    indexes: [").unwrap();
+            for idx in &table.indexes {
+                let args_list = if idx.arguments.is_empty() {
+                    String::from("[]")
+                } else {
+                    format!(
+                        "[{}]",
+                        idx.arguments
+                            .iter()
+                            .map(|a| format!("{:?}", a))
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    )
+                };
+                writeln!(
+                    output,
+                    "        {{ name: {:?}, expression: {:?}, type: {:?}, arguments: {}, granularity: {} }},",
+                    idx.name,
+                    idx.expression,
+                    idx.index_type,
+                    args_list,
+                    idx.granularity
+                )
+                .unwrap();
+            }
+            writeln!(output, "    ],").unwrap();
+        }
+        let sf = &table.seed_filter;
+        if sf.limit.is_some() || sf.where_clause.is_some() {
+            write!(output, "    seedFilter: {{").unwrap();
+            if let Some(limit) = sf.limit {
+                write!(output, " limit: {},", limit).unwrap();
+            }
+            if let Some(ref wc) = sf.where_clause {
+                write!(output, " where: {:?},", wc).unwrap();
+            }
+            writeln!(output, " }},").unwrap();
+        }
+        if !table.projections.is_empty() {
+            writeln!(output, "    projections: [").unwrap();
+            for proj in &table.projections {
+                writeln!(
+                    output,
+                    "        {{ name: {:?}, body: {:?} }},",
+                    proj.name, proj.body
+                )
+                .unwrap();
+            }
+            writeln!(output, "    ],").unwrap();
+        }
+        writeln!(output, "}});").unwrap();
+        writeln!(output).unwrap();
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framework::core::infrastructure::table::{
+        Column, ColumnType, EnumMember, Nested, OrderBy, TableProjection,
+    };
+    use crate::framework::core::infrastructure_map::{PrimitiveSignature, PrimitiveTypes};
+    use crate::framework::core::partial_infrastructure_map::LifeCycle;
+    use crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine;
+    use regex::Regex;
+
+    #[test]
+    fn test_nested_types() {
+        let address_nested = Nested {
+            name: "Address".to_string(),
+            columns: vec![
+                Column {
+                    name: "street".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "city".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "zip_code".to_string(),
+                    data_type: ColumnType::String,
+                    required: false,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            jwt: false,
+        };
+
+        let tables = vec![Table {
+            name: "User".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "address".to_string(),
+                    data_type: ColumnType::Nested(address_nested.clone()),
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "addresses".to_string(),
+                    data_type: ColumnType::Array {
+                        element_type: Box::new(ColumnType::Nested(address_nested)),
+                        element_nullable: false,
+                    },
+                    required: false,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "User".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+        println!("{result}");
+        assert!(result.contains(
+            r#"export interface Address {
+    street: string;
+    city: string;
+    zip_code: string | undefined;
+}
+
+export interface User {
+    id: Key<string>;
+    address: Address;
+    addresses: Address[] | undefined;
+}
+
+export const UserTable = new OlapTable<User>("User", {
+    orderByFields: ["id"],
+    engine: ClickHouseEngines.MergeTree,
+});"#
+        ));
+    }
+
+    #[test]
+    fn test_s3queue_engine() {
+        use crate::infrastructure::olap::clickhouse::queries::ClickhouseEngine;
+
+        let tables = vec![Table {
+            name: "Events".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "data".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            sample_by: None,
+            partition_by: None,
+            engine: ClickhouseEngine::S3Queue {
+                s3_path: "s3://bucket/path".to_string(),
+                format: "JSONEachRow".to_string(),
+                compression: Some("gzip".to_string()),
+                headers: None,
+                aws_access_key_id: None,
+                aws_secret_access_key: None,
+            },
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "Events".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: Some(
+                vec![("mode".to_string(), "unordered".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+
+        // The generated code should have S3Queue properties at the same level as orderByFields
+        assert!(result.contains("engine: ClickHouseEngines.S3Queue,"));
+        assert!(result.contains("s3Path: \"s3://bucket/path\""));
+        assert!(result.contains("format: \"JSONEachRow\""));
+        assert!(result.contains("compression: \"gzip\""));
+        assert!(result.contains("settings: { mode: \"unordered\" }"));
+    }
+
+    #[test]
+    fn test_table_settings_all_engines() {
+        let tables = vec![Table {
+            name: "UserData".to_string(),
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: ColumnType::String,
+                required: true,
+                unique: false,
+                primary_key: true,
+                default: None,
+                annotations: vec![],
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "UserData".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: Some(
+                vec![
+                    ("index_granularity".to_string(), "8192".to_string()),
+                    ("merge_with_ttl_timeout".to_string(), "3600".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+
+        // Settings should work for all engines, not just S3Queue
+        assert!(result.contains("engine: ClickHouseEngines.MergeTree,"));
+        assert!(result.contains("index_granularity"));
+        assert!(result.contains("merge_with_ttl_timeout"));
+    }
+
+    #[test]
+    fn test_replacing_merge_tree_with_parameters() {
+        use crate::framework::core::infrastructure::table::IntType;
+        let tables = vec![Table {
+            name: "UserData".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "version".to_string(),
+                    data_type: ColumnType::DateTime { precision: None },
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "is_deleted".to_string(),
+                    data_type: ColumnType::Int(IntType::UInt8),
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::ReplacingMergeTree {
+                ver: Some("version".to_string()),
+                is_deleted: Some("is_deleted".to_string()),
+            },
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "UserData".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+
+        // Check that ver and isDeleted parameters are correctly generated
+        assert!(result.contains("engine: ClickHouseEngines.ReplacingMergeTree,"));
+        assert!(result.contains("ver: \"version\","));
+        assert!(result.contains("isDeleted: \"is_deleted\","));
+    }
+
+    #[test]
+    fn test_replicated_merge_tree_flat_structure() {
+        let tables = vec![Table {
+            name: "UserData".to_string(),
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: ColumnType::String,
+                required: true,
+                unique: false,
+                primary_key: true,
+                default: None,
+                annotations: vec![],
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            sample_by: None,
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            engine: ClickhouseEngine::ReplicatedMergeTree {
+                keeper_path: Some("/clickhouse/tables/{shard}/user_data".to_string()),
+                replica_name: Some("{replica}".to_string()),
+            },
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "UserData".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+        println!("{result}");
+
+        // Ensure flat structure is generated (NOT nested engine: { engine: ... })
+        assert!(result.contains("engine: ClickHouseEngines.ReplicatedMergeTree,"));
+        assert!(result.contains("keeperPath: \"/clickhouse/tables/{shard}/user_data\","));
+        assert!(result.contains("replicaName: \"{replica}\","));
+
+        // Ensure it doesn't contain the incorrect nested structure
+        assert!(!result.contains("engine: {"));
+        assert!(!result.contains("engine: ClickHouseEngines.ReplicatedMergeTree,\n    }"));
+    }
+
+    #[test]
+    fn test_replicated_replacing_merge_tree_flat_structure() {
+        use crate::framework::core::infrastructure::table::IntType;
+        let tables = vec![Table {
+            name: "UserData".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "version".to_string(),
+                    data_type: ColumnType::DateTime { precision: None },
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "is_deleted".to_string(),
+                    data_type: ColumnType::Int(IntType::UInt8),
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            sample_by: None,
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            engine: ClickhouseEngine::ReplicatedReplacingMergeTree {
+                keeper_path: Some("/clickhouse/tables/{shard}/user_data".to_string()),
+                replica_name: Some("{replica}".to_string()),
+                ver: Some("version".to_string()),
+                is_deleted: Some("is_deleted".to_string()),
+            },
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "UserData".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+        println!("{result}");
+
+        // Ensure flat structure with all parameters
+        assert!(result.contains("engine: ClickHouseEngines.ReplicatedReplacingMergeTree,"));
+        assert!(result.contains("keeperPath: \"/clickhouse/tables/{shard}/user_data\","));
+        assert!(result.contains("replicaName: \"{replica}\","));
+        assert!(result.contains("ver: \"version\","));
+        assert!(result.contains("isDeleted: \"is_deleted\","));
+
+        // Ensure it doesn't contain the incorrect nested structure
+        assert!(!result.contains("engine: {"));
+    }
+
+    #[test]
+    fn test_indexes_emission() {
+        let tables = vec![Table {
+            name: "IndexTest".to_string(),
+            columns: vec![Column {
+                name: "u64".to_string(),
+                data_type: ColumnType::String,
+                required: true,
+                unique: false,
+                primary_key: true,
+                default: None,
+                annotations: vec![],
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec!["u64".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "IndexTest".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![
+                crate::framework::core::infrastructure::table::TableIndex {
+                    name: "idx1".to_string(),
+                    expression: "u64".to_string(),
+                    index_type: "bloom_filter".to_string(),
+                    arguments: vec![],
+                    granularity: 3,
+                },
+                crate::framework::core::infrastructure::table::TableIndex {
+                    name: "idx2".to_string(),
+                    expression: "u64 * length(u64)".to_string(),
+                    index_type: "set".to_string(),
+                    arguments: vec!["1000".to_string()],
+                    granularity: 4,
+                },
+            ],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+        assert!(result.contains("indexes: ["));
+        assert!(result.contains("name: \"idx1\""));
+        assert!(result.contains("type: \"bloom_filter\""));
+        assert!(result.contains("arguments: []"));
+        assert!(result.contains("granularity: 3"));
+        assert!(result.contains("name: \"idx2\""));
+        assert!(result.contains("arguments: [\"1000\"]"));
+    }
+
+    #[test]
+    fn test_enum_types() {
+        let status_enum = DataEnum {
+            name: "Status".to_string(),
+            values: vec![
+                EnumMember {
+                    name: "OK".to_string(),
+                    value: EnumValue::String("ok".to_string()),
+                },
+                EnumMember {
+                    name: "ERROR".to_string(),
+                    value: EnumValue::String("error".to_string()),
+                },
+            ],
+        };
+
+        let tables = vec![Table {
+            name: "Task".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "status".to_string(),
+                    data_type: ColumnType::Enum(status_enum),
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "Task".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+        println!("{result}");
+        assert!(result.contains(
+            r#"export enum Status {
+    OK = "ok",
+    ERROR = "error",
+}
+
+export interface Task {
+    id: Key<string>;
+    status: Status;
+}
+
+export const TaskTable = new OlapTable<Task>("Task", {
+    orderByFields: ["id"],
+    engine: ClickHouseEngines.MergeTree,
+});"#
+        ));
+    }
+
+    #[test]
+    fn test_ttl_generation_typescript() {
+        let tables = vec![Table {
+            name: "Events".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "timestamp".to_string(),
+                    data_type: ColumnType::DateTime { precision: None },
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "email".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: Some("timestamp + INTERVAL 30 DAY".to_string()),
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string(), "timestamp".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "Events".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: Some("timestamp + INTERVAL 90 DAY DELETE".to_string()),
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+
+        // Import should include ClickHouseTTL
+        assert!(result.contains("ClickHouseTTL"));
+        // Column-level TTL should be applied to the field type
+        assert!(result.contains("email: string & ClickHouseTTL<\"timestamp + INTERVAL 30 DAY\">;"));
+        // Table-level TTL should be present in table config
+        assert!(result.contains("ttl: \"timestamp + INTERVAL 90 DAY DELETE\","));
+    }
+
+    #[test]
+    fn test_json_with_typed_paths_typescript() {
+        use crate::framework::core::infrastructure::table::IntType;
+        let tables = vec![Table {
+            name: "JsonTest".to_string(),
+            database: Some("local".to_string()),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "payload".to_string(),
+                    data_type: ColumnType::Json(JsonOptions {
+                        max_dynamic_paths: Some(256),
+                        max_dynamic_types: Some(16),
+                        typed_paths: vec![
+                            ("name".to_string(), ColumnType::String),
+                            ("count".to_string(), ColumnType::Int(IntType::Int64)),
+                        ],
+                        skip_paths: vec!["skip.me".to_string()],
+                        skip_regexps: vec!["^tmp\\.".to_string()],
+                    }),
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "JsonTest".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+        println!("{}", result);
+
+        // Check for JSON inner interface generation
+        assert!(result.contains("export interface PayloadJson {"));
+        assert!(result.contains("name: string;"));
+        assert!(result.contains("count: number & ClickHouseInt<\"int64\">;"));
+
+        // Check that the main interface uses the JSON type correctly
+        assert!(result.contains(
+            "payload: PayloadJson & ClickHouseJson<256, 16, [\"skip.me\"], [\"^tmp\\\\.\"]>;"
+        ));
+    }
+
+    #[test]
+    fn test_database_field_emission() {
+        let tables = vec![Table {
+            name: "ExternalData".to_string(),
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: ColumnType::String,
+                required: true,
+                unique: false,
+                primary_key: true,
+                default: None,
+                annotations: vec![],
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "ExternalData".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: Some("analytics_db".to_string()),
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+        assert!(result.contains("database: \"analytics_db\""));
+    }
+
+    #[test]
+    fn test_tsdoc_comment_output() {
+        let tables = vec![Table {
+            name: "UserData".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: Some("Unique identifier for the user".to_string()),
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "email".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: Some("User's email address (must be valid)".to_string()),
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "status".to_string(),
+                    data_type: ColumnType::String,
+                    required: false,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None, // No comment for this field
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "UserData".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+
+        // Verify TSDoc comments are output for fields with comments
+        assert!(
+            result.contains("/** Unique identifier for the user */"),
+            "Expected TSDoc comment for id field. Result: {}",
+            result
+        );
+        assert!(
+            result.contains("/** User's email address (must be valid) */"),
+            "Expected TSDoc comment for email field. Result: {}",
+            result
+        );
+
+        // Verify no spurious TSDoc for field without comment
+        // Count occurrences of "/**" - should be exactly 2 for the two commented fields
+        let tsdoc_count = result.matches("/**").count();
+        assert_eq!(
+            tsdoc_count, 2,
+            "Expected exactly 2 TSDoc comments. Got {}. Result: {}",
+            tsdoc_count, result
+        );
+    }
+
+    #[test]
+    fn test_externally_managed_table_omits_version() {
+        use crate::framework::versions::Version;
+
+        let tables = vec![Table {
+            name: "ExternalEvents".to_string(),
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: ColumnType::String,
+                required: true,
+                unique: false,
+                primary_key: true,
+                default: None,
+                annotations: vec![],
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: Some(Version::from_string("1.0".to_string())),
+            source_primitive: PrimitiveSignature {
+                name: "ExternalEvents".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::ExternallyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, Some(LifeCycle::ExternallyManaged));
+
+        assert!(
+            !result.contains("version:"),
+            "ExternallyManaged tables should not have a version field. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("lifeCycle: LifeCycle.EXTERNALLY_MANAGED,"),
+            "Expected ExternallyManaged lifecycle. Got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_projection_emission() {
+        let tables = vec![Table {
+            name: "Events".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "user_id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "Events".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![TableProjection {
+                name: "proj_by_user".to_string(),
+                body: "SELECT * ORDER BY user_id".to_string(),
+            }],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+        assert!(
+            result.contains("projections: ["),
+            "Output should contain projections array. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("proj_by_user"),
+            "Output should contain projection name. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("SELECT * ORDER BY user_id"),
+            "Output should contain projection body. Got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_low_cardinality_emission() {
+        let tables = vec![Table {
+            name: "LcTest".to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: true,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "status".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![("LowCardinality".to_string(), serde_json::json!(true))],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                Column {
+                    name: "plain".to_string(),
+                    data_type: ColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    annotations: vec![],
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            version: None,
+            source_primitive: PrimitiveSignature {
+                name: "LcTest".to_string(),
+                primitive_type: PrimitiveTypes::DataModel,
+            },
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            engine_params_hash: None,
+            table_settings_hash: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            database: None,
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+            seed_filter: Default::default(),
+        }];
+
+        let result = tables_to_typescript(&tables, None);
+
+        assert!(
+            result.contains("LowCardinality"),
+            "Import should include LowCardinality. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("status: string & LowCardinality;"),
+            "LowCardinality column should have & LowCardinality. Got: {}",
+            result
+        );
+        assert!(
+            result.contains("plain: string;"),
+            "Plain column should remain unmodified. Got: {}",
+            result
+        );
+    }
+
+    /// Parses the named symbols an `export { ... }` / `export type { ... }`
+    /// block from a TypeScript source file makes available to importers.
+    /// Handles `type X` prefixes and `X as Y` aliases within a block. Does
+    /// NOT resolve `export * from "./other"` re-exports -- as of writing,
+    /// serverless.ts names every symbol relevant to BASE_IMPORTS /
+    /// SIMPLE_AGGREGATED_IMPORT / LOW_CARDINALITY_IMPORT explicitly, so this is sufficient for that file
+    /// without needing a real TypeScript parser.
+    fn ts_named_export_surface(source: &str) -> std::collections::HashSet<String> {
+        // Strip line comments so e.g. `// Registry functions` inside a brace
+        // block doesn't get parsed as part of an item.
+        let without_comments: String = source
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(idx) => &line[..idx],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let block_re = Regex::new(r"export\s+(?:type\s+)?\{([^}]*)\}").unwrap();
+        let mut names = std::collections::HashSet::new();
+        for caps in block_re.captures_iter(&without_comments) {
+            for item in caps[1].split(',') {
+                let item = item.trim();
+                if item.is_empty() {
+                    continue;
+                }
+                let item = item.strip_prefix("type ").unwrap_or(item).trim();
+                let name = match item.split_once(" as ") {
+                    Some((_, alias)) => alias.trim(),
+                    None => item,
+                };
+                if !name.is_empty() {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        names
+    }
+
+    /// Regression test for the "IngestPipeline" defect: `typed-clickhouse db pull`
+    /// writes `import { ...BASE_IMPORTS } from "@typed-clickhouse/core"`
+    /// (and a second `import { ...GEO_IMPORTS } from "..."` line -- see
+    /// `tables_to_typescript`) into every generated file. If any entry in
+    /// BASE_IMPORTS, SIMPLE_AGGREGATED_IMPORT, LOW_CARDINALITY_IMPORT, or
+    /// GEO_IMPORTS is not actually exported by the library, the
+    /// generated code fails to typecheck (TS2305) and breaks every
+    /// subsequent `check`/`plan`/`migrate` on the pulled project -- which is
+    /// exactly how "IngestPipeline" shipped after it was removed from the
+    /// library but not from this list. This test must cover every symbol
+    /// `tables_to_typescript` can emit in an import from
+    /// `@typed-clickhouse/core` -- if a future import line is added,
+    /// it must be folded into `all_imports` below or this test provides no
+    /// protection against exactly the class of bug it exists to catch.
+    ///
+    /// `golden/exports.json` only captures the RUNTIME export surface
+    /// (`Object.keys(require(dist/index.js))`); most of BASE_IMPORTS are
+    /// TypeScript types (Key, ClickHouseInt, ClickHouseTTL, ...) that are
+    /// fully erased at compile time and so never appear there even when
+    /// correctly exported. Checking BASE_IMPORTS against exports.json alone
+    /// would therefore fail on legitimate type-only imports. So this test
+    /// unions exports.json (the runtime surface) with the symbols explicitly
+    /// named in packages/lib/src/serverless.ts's `export { ... }` /
+    /// `export type { ... }` blocks (the full value+type surface of the
+    /// entry point @typed-clickhouse/core re-exports) and checks against that
+    /// union. Both paths are relative to this crate (CARGO_MANIFEST_DIR) and
+    /// resolved at test time, so no build-time reachability issue applies.
+    #[test]
+    fn base_imports_are_actually_exported_by_the_library() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+        let exports_json_path = std::path::Path::new(manifest_dir)
+            .join("../../packages/core/tests/golden/exports.json");
+        let exports_json = std::fs::read_to_string(&exports_json_path).unwrap_or_else(|e| {
+            panic!(
+                "could not read {}: {e}. This test asserts BASE_IMPORTS and the conditional imports \
+                 against the library's actual export surface -- if this path moved, update \
+                 it rather than deleting the assertion.",
+                exports_json_path.display()
+            )
+        });
+        let runtime_exports: Vec<String> = serde_json::from_str(&exports_json)
+            .expect("golden/exports.json should be a JSON array of strings");
+
+        let serverless_ts_path =
+            std::path::Path::new(manifest_dir).join("../../packages/lib/src/serverless.ts");
+        let serverless_ts = std::fs::read_to_string(&serverless_ts_path).unwrap_or_else(|e| {
+            panic!(
+                "could not read {}: {e}. This is the source @typed-clickhouse/core re-exports; \
+                 it's the only place that names the type-only entries in BASE_IMPORTS (which \
+                 golden/exports.json can't capture, since types are erased at runtime).",
+                serverless_ts_path.display()
+            )
+        });
+        let declared_surface = ts_named_export_surface(&serverless_ts);
+
+        let conditional_imports = [SIMPLE_AGGREGATED_IMPORT, LOW_CARDINALITY_IMPORT];
+        let all_imports = BASE_IMPORTS
+            .iter()
+            .chain(conditional_imports.iter())
+            .chain(GEO_IMPORTS.iter());
+
+        let missing: Vec<&str> = all_imports
+            .filter(|import| {
+                !runtime_exports.iter().any(|e| e == *import)
+                    && !declared_surface.contains(**import)
+            })
+            .copied()
+            .collect();
+
+        assert!(
+            missing.is_empty(),
+            "generate.rs imports symbols the library does not export: {:?}. `typed-clickhouse db pull` \
+             would emit an import of these into every generated file, which fails to \
+             typecheck. Checked against golden/exports.json (runtime exports) and \
+             packages/lib/src/serverless.ts (full export surface, including types).",
+            missing
+        );
+    }
+}

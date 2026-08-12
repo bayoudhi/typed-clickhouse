@@ -1,0 +1,719 @@
+//! # Logger Module
+//!
+//! This module provides logging functionality using `tracing-subscriber` with support for
+//! dynamic log filtering via `RUST_LOG` and multiple output destinations.
+//!
+//! ## Architecture
+//!
+//! The logging system is built using `tracing-subscriber` layers:
+//! - **EnvFilter Layer**: Provides `RUST_LOG` support for module-level filtering
+//! - **Format Layer**: Uses tracing-subscriber's compact text formatting
+//! - **OTLP Export**: Optional OpenTelemetry Protocol export with span field injection
+//!
+//! ## Components
+//!
+//! - `LoggerLevel`: An enumeration representing the different levels of logging: DEBUG, INFO, WARN, and ERROR.
+//! - `LoggerSettings`: A struct that holds the settings for the logger, including level and output options.
+//! - `setup_logging`: A function used to set up the logging system with the provided settings.
+//!
+//! ## Features
+//!
+//! ### RUST_LOG Support
+//! Use the standard Rust `RUST_LOG` environment variable for dynamic filtering:
+//! ```bash
+//! RUST_LOG=typed_clickhouse::infrastructure=debug cargo run
+//! RUST_LOG=debug cargo run  # Enable debug for all modules
+//! ```
+//!
+//! ### Output Options
+//! - **File output** (default): Daily log files in `~/.tch/YYYY-MM-DD-cli.log`
+//! - **Stdout output**: Set `TCH_LOGGER__STDOUT=true`
+//! - **OTLP export**: Set `TCH_LOGGER__OTLP_ENDPOINT=http://localhost:4317`
+//!
+//! ### Additional Features
+//! - **Date-based file rotation**: Daily log files in `~/.tch/YYYY-MM-DD-cli.log`
+//! - **Automatic cleanup**: Deletes logs older than 7 days
+//! - **Configurable outputs**: File and/or stdout
+//!
+//! ## Environment Variables
+//!
+//! - `RUST_LOG`: Standard Rust log filtering (e.g., `RUST_LOG=typed_clickhouse::infrastructure=debug`)
+//! - `TCH_LOGGER__LEVEL`: Log level (DEBUG, INFO, WARN, ERROR)
+//! - `TCH_LOGGER__STDOUT`: Output to stdout vs file (default: `false`)
+//! - `TCH_LOGGER__OTLP_ENDPOINT`: OTLP gRPC endpoint for log export (optional)
+//!
+//! ## Usage
+//!
+//! The logger is configured by creating a `LoggerSettings` instance and passing it to the `setup_logging` function.
+//! Default values are provided for all settings. Use the `tracing::` macros to write logs.
+//!
+//! ### Log Levels
+//!
+//! - `DEBUG`: Use this level for detailed information typically of use only when diagnosing problems. You would usually only expect to see these logs in a development environment. For example, you might log method entry/exit points, variable values, query results, etc.
+//! - `INFO`: Use this level to confirm that things are working as expected. This is the default log level and will give you general operational insights into the application behavior. For example, you might log start/stop of a process, configuration details, successful completion of significant transactions, etc.
+//! - `WARN`: Use this level when something unexpected happened in the system, or there might be a problem in the near future (like 'disk space low'). The software is still working as expected, so it's not an error. For example, you might log deprecated API usage, poor performance issues, retrying an operation, etc.
+//! - `ERROR`: Use this level when the system is in distress, customers are probably being affected but the program is not terminated. An operator should definitely look into it. For example, you might log exceptions, potential data inconsistency, or system overloads.
+//!
+//! ## Example
+//!
+//! ```rust
+//! use tracing::{debug, info, warn, error};
+//!
+//! debug!("This is a DEBUG message. Typically used for detailed information useful in a development environment.");
+//! info!("This is an INFO message. Used to confirm that things are working as expected.");
+//! warn!("This is a WARN message. Indicates something unexpected happened or there might be a problem in the near future.");
+//! error!("This is an ERROR message. Used when the system is in distress, customers are probably being affected but the program is not terminated.");
+//! ```
+
+use serde::Deserialize;
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
+use tracing::warn;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
+
+use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::logs::{BatchLogProcessor, SdkLoggerProvider};
+
+use crate::utilities::constants::NO_ANSI;
+use std::sync::atomic::Ordering;
+
+use super::settings::user_directory;
+
+/// Static storage for the OTLP log provider, used for shutdown.
+static LOG_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
+
+// # STRUCTURED LOGGING INSTRUMENTATION GUIDE
+//
+// This section explains how to instrument code with structured logging using span fields.
+// When enabled via `TCH_LOGGER__STRUCTURED_LOGS=true`, the logging system captures
+// three key dimensions for filtering and analysis in the UI:
+//
+// - **context**: The phase of execution (runtime, boot, system)
+// - **resource_type**: The type of resource being operated on (ingest_api, olap_table, etc.)
+// - **resource_name**: The specific resource identifier (e.g., "UserEvents", "pageviews_v001")
+//
+// ## CONTEXTS
+//
+// ### `runtime` - User Data Processing
+// Use for operations that process user data during normal application execution:
+// - Processing ingest API requests
+// - Running streaming functions/transforms
+// - Executing consumption API queries
+// - Running workflow tasks
+//
+// ### `boot` - Infrastructure Changes
+// Use for operations that modify infrastructure state during deployment:
+// - Creating/altering OLAP tables
+// - Creating/updating views and materialized views
+// - Applying schema migrations
+// - Deploying new resources
+//
+// ### `system` - Health & Monitoring
+// Use for operations that monitor system health and don't involve specific resources:
+// - Health checks
+// - Metrics collection
+// - System diagnostics
+// - Note: System context logs typically don't have resource_type or resource_name
+//
+// ## INSTRUMENTATION PATTERNS
+//
+// ### Pattern 1: Runtime Operations (with resource_type and resource_name)
+//
+// ```rust
+// use tracing::instrument;
+// use crate::cli::logger::{context, resource_type};
+//
+// #[instrument(
+//     name = "ingest_request",
+//     skip_all,
+//     fields(
+//         context = context::RUNTIME,
+//         resource_type = resource_type::INGEST_API,
+//         resource_name = %table_name,
+//     )
+// )]
+// async fn handle_ingest_request(table_name: &str, body: Bytes) -> Result<Response, Error> {
+//     // Function implementation
+//     info!("Processing ingest request");
+//     // All logs within this span inherit the fields
+// }
+// ```
+//
+// ### Pattern 2: Boot Operations (infrastructure changes)
+//
+// ```rust
+// #[instrument(
+//     name = "create_table",
+//     skip_all,
+//     fields(
+//         context = context::BOOT,
+//         resource_type = resource_type::OLAP_TABLE,
+//         resource_name = %format!("{}_{}", database, table_name),
+//     )
+// )]
+// async fn create_table(database: &str, table_name: &str) -> Result<(), Error> {
+//     info!("Creating OLAP table");
+//     // Implementation
+// }
+// ```
+//
+// ### Pattern 3: System Operations (no resource fields)
+//
+// ```rust
+// #[instrument(
+//     name = "health_check",
+//     skip_all,
+//     fields(
+//         context = context::SYSTEM,
+//     )
+// )]
+// async fn handle_health_check() -> Response {
+//     debug!("Performing health check");
+//     // System context doesn't use resource_type or resource_name
+// }
+// ```
+//
+// ## RESOURCE NAMING CONVENTIONS
+//
+// Resource names should be consistent and filterable:
+//
+// - **Tables**: `{database}_{table_name}` (e.g., "local_UserEvents_000")
+// - **Views**: `{database}_{view_name}` (e.g., "local_active_users")
+// - **Streams**: `{topic_name}` (e.g., "UserEvents")
+// - **APIs**: `{model_name}` (e.g., "UserEvents", "/api/users")
+// - **Workflows**: `{workflow_name}` (e.g., "daily_aggregation")
+//
+// Use the `%` format specifier for Display-formatted fields, or `?` for Debug formatting.
+//
+// ## ASYNC AND BLOCKING CODE
+//
+// ### Async Functions
+// The `#[instrument]` macro works automatically with async functions:
+//
+// ```rust
+// #[instrument(skip_all, fields(context = context::RUNTIME))]
+// async fn process_data() -> Result<(), Error> {
+//     // Span is automatically propagated through .await points
+//     let result = async_operation().await?;
+//     Ok(())
+// }
+// ```
+//
+// ### Blocking Code in Async Context
+// For blocking operations spawned via `tokio::task::spawn_blocking`, manually propagate the span:
+//
+// ```rust
+// async fn handler() {
+//     let span = tracing::Span::current();
+//     tokio::task::spawn_blocking(move || {
+//         let _guard = span.enter();
+//         // Blocking work here - logs will have correct span fields
+//         info!("Processing in blocking thread");
+//     }).await
+// }
+// ```
+//
+// ## FIELD REFERENCE
+//
+// ### Required for Runtime/Boot Contexts:
+// - `context`: Always required (use constants from `context` module)
+// - `resource_type`: Required for runtime/boot (use constants from `resource_type` module)
+// - `resource_name`: Required for runtime/boot (use `%` formatter for the resource identifier)
+//
+// ### Optional for System Context:
+// - `context`: Required (use `context::SYSTEM`)
+// - `resource_type`: Not used
+// - `resource_name`: Not used
+//
+// ## SKIP PARAMETERS
+//
+// Use `skip_all` to avoid logging function parameters (prevents PII leaks and reduces noise):
+//
+// ```rust
+// #[instrument(skip_all, fields(...))]  // Skip all parameters
+// #[instrument(skip(body, headers), fields(...))]  // Skip specific parameters
+// ```
+//
+// ## TESTING
+//
+// See `apps/cli-e2e/test/structured-logging.test.ts` for E2E tests that verify
+// instrumentation coverage and correctness of span fields.
+//
+// ## CONSTANTS
+//
+// The constants below are organized into modules for easy import and type safety.
+// Use these in your `#[instrument]` attributes to ensure consistency.
+
+/// Structured logging context constants.
+/// Used in #[instrument(fields(context = ...))]
+pub mod context {
+    pub const BOOT: &str = "boot";
+}
+
+/// Structured logging resource type constants.
+/// Used in #[instrument(fields(resource_type = ...))]
+pub mod resource_type {
+    pub(crate) const OLAP_TABLE: &str = "olap_table";
+    pub(crate) const VIEW: &str = "view";
+    pub(crate) const MATERIALIZED_VIEW: &str = "materialized_view";
+}
+
+/// Default date format for log file names: YYYY-MM-DD-cli.log
+pub const DEFAULT_LOG_FILE_FORMAT: &str = "%Y-%m-%d-cli.log";
+#[derive(Deserialize, Debug, Clone)]
+pub enum LoggerLevel {
+    #[serde(alias = "DEBUG", alias = "debug")]
+    Debug,
+    #[serde(alias = "INFO", alias = "info")]
+    Info,
+    #[serde(alias = "WARN", alias = "warn")]
+    Warn,
+    #[serde(alias = "ERROR", alias = "error")]
+    Error,
+}
+
+impl LoggerLevel {
+    pub fn to_tracing_level(&self) -> LevelFilter {
+        match self {
+            LoggerLevel::Debug => LevelFilter::DEBUG,
+            LoggerLevel::Info => LevelFilter::INFO,
+            LoggerLevel::Warn => LevelFilter::WARN,
+            LoggerLevel::Error => LevelFilter::ERROR,
+        }
+    }
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct LoggerSettings {
+    #[serde(default = "default_log_file")]
+    pub log_file_date_format: String,
+    #[serde(default = "default_log_level")]
+    pub level: LoggerLevel,
+    #[serde(default = "default_log_stdout")]
+    pub stdout: bool,
+    #[serde(default = "default_no_ansi")]
+    pub no_ansi: bool,
+    /// OTLP gRPC endpoint for structured logs (e.g., "http://localhost:4317")
+    /// When set, exports spans/logs to OTLP collector via gRPC with local logging
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+}
+
+fn default_log_file() -> String {
+    DEFAULT_LOG_FILE_FORMAT.to_string()
+}
+
+fn default_log_level() -> LoggerLevel {
+    LoggerLevel::Info
+}
+
+fn default_log_stdout() -> bool {
+    false
+}
+
+fn default_no_ansi() -> bool {
+    false // ANSI colors enabled by default
+}
+
+impl Default for LoggerSettings {
+    fn default() -> Self {
+        LoggerSettings {
+            log_file_date_format: default_log_file(),
+            level: default_log_level(),
+            stdout: default_log_stdout(),
+            no_ansi: default_no_ansi(),
+            otlp_endpoint: None,
+        }
+    }
+}
+
+// House-keeping: delete log files older than 7 days.
+//
+// Rationale for WARN vs INFO
+// --------------------------------
+// 1.  Any failure here (e.g. cannot read directory or metadata) prevents log-rotation
+//     which can silently fill disks.
+// 2.  According to our logging guidelines INFO is "things working as expected", while
+//     WARN is for unexpected situations that *might* become a problem.
+// 3.  Therefore we upgraded the two failure branches (`warn!`) below to highlight
+//     these issues in production without terminating execution.
+//
+// Errors are still swallowed so that logging setup never aborts the CLI, but we emit
+// WARN to make operators aware of the problem.
+fn clean_old_logs() {
+    let cut_off = SystemTime::now() - Duration::from_secs(7 * 24 * 60 * 60);
+
+    let dir_path = match user_directory() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if let Ok(dir) = dir_path.read_dir() {
+        for entry in dir.flatten() {
+            if entry.path().extension().is_some_and(|ext| ext == "log") {
+                match entry.metadata().and_then(|md| md.modified()) {
+                    // Smaller time means older than the cut_off
+                    Ok(t) if t < cut_off => {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                    Ok(_) => {}
+                    // Escalated to WARN to surface unexpected FS errors encountered
+                    // during housekeeping.
+                    Err(e) => {
+                        // Escalated to warn! — inability to read file metadata may indicate FS issues
+                        warn!(
+                            "Failed to read modification time for {:?}. {}",
+                            entry.path(),
+                            e
+                        )
+                    }
+                }
+            }
+        }
+    } else {
+        // Directory unreadable: surface as warn instead of info so users notice
+        // Emitting WARN instead of INFO: inability to read the log directory means
+        // housekeeping could not run at all, which can later cause disk-space issues.
+        warn!("failed to read directory")
+    }
+}
+
+/// Custom MakeWriter that creates log files with user-specified date format
+///
+/// This maintains backward compatibility with fern's DateBased rotation by allowing
+/// custom date format strings like "%Y-%m-%d-cli.log" to produce "2025-11-25-cli.log"
+struct DateBasedWriter {
+    date_format: String,
+}
+
+impl DateBasedWriter {
+    fn new(date_format: String) -> Self {
+        Self { date_format }
+    }
+}
+
+impl<'a> MakeWriter<'a> for DateBasedWriter {
+    type Writer = std::fs::File;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        let formatted_name = chrono::Local::now().format(&self.date_format).to_string();
+        // HOME was already validated during CLI startup in setup_user_directory()
+        let file_path = user_directory()
+            .expect("HOME was validated at startup")
+            .join(&formatted_name);
+
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file_path)
+            .expect("Failed to open log file")
+    }
+}
+
+/// Creates a rolling file appender with custom date format
+///
+/// This function creates a file appender that respects the configured date format
+/// for log file naming, maintaining backward compatibility with fern's DateBased rotation.
+fn create_rolling_file_appender(date_format: &str) -> DateBasedWriter {
+    DateBasedWriter::new(date_format.to_string())
+}
+
+pub fn setup_logging(settings: &LoggerSettings) {
+    clean_old_logs();
+
+    // Set global NO_ANSI flag for terminal display functions
+    NO_ANSI.store(settings.no_ansi, Ordering::Relaxed);
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(settings.level.to_tracing_level().to_string()));
+
+    // When OTLP is enabled, set up both OTLP export AND local logging
+    if let Some(endpoint) = &settings.otlp_endpoint {
+        setup_otlp_with_local_logging(settings, endpoint, env_filter);
+        return;
+    }
+
+    // Default: use fmt layer for file/stdout output
+    setup_fmt_logging(settings, env_filter);
+}
+
+/// Sets up OTLP export with local logging (stdout or file).
+///
+/// Creates both an OTLP bridge layer for remote export and a fmt layer for local output.
+fn setup_otlp_with_local_logging(settings: &LoggerSettings, endpoint: &str, env_filter: EnvFilter) {
+    // Create OTLP exporter
+    let log_exporter = opentelemetry_otlp::LogExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .expect("Failed to create OTLP log exporter");
+
+    let batch_processor = BatchLogProcessor::builder(log_exporter).build();
+
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name("typed-clickhouse")
+        .with_attributes([opentelemetry::KeyValue::new(
+            "service.version",
+            env!("CARGO_PKG_VERSION"),
+        )])
+        .build();
+
+    let log_provider = SdkLoggerProvider::builder()
+        .with_resource(resource)
+        .with_log_processor(batch_processor)
+        .build();
+
+    // Store for shutdown
+    if LOG_PROVIDER.set(log_provider.clone()).is_err() {
+        tracing::error!("OTLP log provider already initialized");
+        return;
+    }
+
+    let otel_bridge = OpenTelemetryTracingBridge::new(&log_provider);
+
+    // Create local layer based on stdout setting
+    if settings.stdout {
+        let local_layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stdout)
+            .with_target(true)
+            .with_level(true)
+            .with_ansi(!settings.no_ansi)
+            .compact();
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(otel_bridge)
+            .with(local_layer)
+            .init();
+    } else {
+        let file_appender = create_rolling_file_appender(&settings.log_file_date_format);
+        let local_layer = tracing_subscriber::fmt::layer()
+            .with_writer(file_appender)
+            .with_target(true)
+            .with_level(true)
+            .with_ansi(false)
+            .compact();
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(otel_bridge)
+            .with(local_layer)
+            .init();
+    }
+
+    tracing::info!(target: "typed_clickhouse::otlp", "OTLP logging initialized with endpoint: {}", endpoint);
+}
+
+/// Sets up standard fmt logging (file or stdout).
+fn setup_fmt_logging(settings: &LoggerSettings, env_filter: EnvFilter) {
+    if settings.stdout {
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stdout)
+            .with_target(true)
+            .with_level(true)
+            .with_ansi(!settings.no_ansi)
+            .compact();
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(layer)
+            .init();
+    } else {
+        // For file output, explicitly disable ANSI codes regardless of no_ansi setting.
+        // Files are not terminals and don't render colors. tracing-subscriber defaults
+        // to ANSI=true, so we must explicitly set it to false for file writers.
+        let file_appender = create_rolling_file_appender(&settings.log_file_date_format);
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(file_appender)
+            .with_target(true)
+            .with_level(true)
+            .with_ansi(false)
+            .compact();
+
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(layer)
+            .init();
+    }
+}
+
+/// Shuts down the OTLP log provider, flushing any remaining logs.
+///
+/// This should be called before the application exits to ensure all logs are exported.
+pub fn shutdown_otlp() {
+    if let Some(provider) = LOG_PROVIDER.get() {
+        if let Err(e) = provider.shutdown() {
+            eprintln!("Failed to shutdown OTLP log provider: {:?}", e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::instrument;
+
+    /// Mock writer that captures output to a shared buffer
+    #[derive(Clone)]
+    struct MockWriter {
+        buffer: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl MockWriter {
+        fn new() -> Self {
+            Self {
+                buffer: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn get_output(&self) -> String {
+            let buffer = self.buffer.lock().unwrap();
+            String::from_utf8(buffer.clone()).expect("Invalid UTF-8 in log output")
+        }
+    }
+
+    impl std::io::Write for MockWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut buffer = self.buffer.lock().unwrap();
+            buffer.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for MockWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn test_span_fields_in_json_output() {
+        // Setup mock writer to capture output
+        let mock_writer = MockWriter::new();
+
+        // Create JSON layer with span support (matching setup_structured_logs)
+        let json_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(true)
+            .with_span_list(false)
+            .with_target(true)
+            .with_file(false)
+            .with_line_number(false)
+            .with_writer(mock_writer.clone());
+
+        // Initialize subscriber
+        let subscriber = tracing_subscriber::registry().with(json_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            test_function_with_span("UserEvent");
+        });
+
+        // Get captured output
+        let output = mock_writer.get_output();
+
+        // Parse JSON output
+        let log_entry: serde_json::Value =
+            serde_json::from_str(&output).expect("Failed to parse JSON log output");
+
+        // Assert span fields are present
+        assert_eq!(
+            log_entry["span"]["context"].as_str(),
+            Some("runtime"),
+            "Expected context field in span"
+        );
+        assert_eq!(
+            log_entry["span"]["resource_type"].as_str(),
+            Some("stream"),
+            "Expected resource_type field in span"
+        );
+        assert_eq!(
+            log_entry["span"]["resource_name"].as_str(),
+            Some("UserEvent"),
+            "Expected resource_name field in span"
+        );
+        assert_eq!(
+            log_entry["fields"]["message"].as_str(),
+            Some("Processing request"),
+            "Expected message in fields"
+        );
+    }
+
+    #[instrument(
+        name = "test_ingest",
+        skip_all,
+        fields(
+            context = "runtime",
+            resource_type = "stream",
+            resource_name = %topic_name,
+        )
+    )]
+    fn test_function_with_span(topic_name: &str) {
+        tracing::info!("Processing request");
+    }
+
+    #[test]
+    fn test_logs_without_spans_are_valid() {
+        // Setup mock writer to capture output
+        let mock_writer = MockWriter::new();
+
+        // Create JSON layer with span support
+        let json_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(true)
+            .with_span_list(false)
+            .with_target(true)
+            .with_file(false)
+            .with_line_number(false)
+            .with_writer(mock_writer.clone());
+
+        // Initialize subscriber
+        let subscriber = tracing_subscriber::registry().with(json_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Emit log without any span
+            tracing::info!("Log without span");
+        });
+
+        // Get captured output
+        let output = mock_writer.get_output();
+
+        // Parse JSON output - should still be valid even without span
+        let log_entry: serde_json::Value =
+            serde_json::from_str(&output).expect("Failed to parse JSON log output");
+
+        // Assert basic fields are present
+        assert_eq!(
+            log_entry["fields"]["message"].as_str(),
+            Some("Log without span"),
+            "Expected message in fields"
+        );
+
+        // Span field may be null or absent when no span is active
+        assert!(
+            log_entry["span"].is_null() || log_entry.get("span").is_none(),
+            "Expected no span field or null span when logging without span context"
+        );
+    }
+
+    #[test]
+    fn test_p0_constants_exported() {
+        // Verify context constants are accessible
+        assert_eq!(context::BOOT, "boot");
+
+        // Verify resource_type constants are accessible
+        assert_eq!(resource_type::OLAP_TABLE, "olap_table");
+        assert_eq!(resource_type::VIEW, "view");
+        assert_eq!(resource_type::MATERIALIZED_VIEW, "materialized_view");
+    }
+}

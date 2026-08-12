@@ -1,0 +1,100 @@
+{
+  "name": "@typed-clickhouse/lib",
+  "private": true,
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=20 <25"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bayoudhi/moosestack"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./browserCompatible": {
+      "types": "./dist/browserCompatible.d.ts",
+      "import": "./dist/browserCompatible.mjs",
+      "require": "./dist/browserCompatible.js"
+    },
+    "./serverless": {
+      "types": "./dist/serverless.d.ts",
+      "import": "./dist/serverless.mjs",
+      "require": "./dist/serverless.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.mjs",
+      "require": "./dist/testing/index.js"
+    },
+    "./dist/compilerPlugin": "./dist/compilerPlugin.js",
+    "./dist/tch-tspc": "./dist/tch-tspc.js",
+    "./dist/tch-runner": "./dist/tch-runner.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist"
+  ],
+  "bin": {
+    "tch-runner": "./dist/tch-runner.js",
+    "tch-tspc": "./dist/tch-tspc.js"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "build": "tsup",
+    "test": "tsup --no-dts && mocha --timeout 15000 -r './ts-node-patch-for-mocha.mjs' 'tests/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@clickhouse/client": "1.8.1",
+    "@clickhouse/client-web": "1.5.0",
+    "commander": "^13.1.0",
+    "csv-parse": "^5.5.5",
+    "fastq": "1.17.1",
+    "jose": "5.9.2",
+    "toml": "3.0.0",
+    "typescript": "~5.9.2",
+    "zod": "^3.0.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@repo/ts-config": "workspace:*",
+    "@types/chai": "^4.3.5",
+    "@types/mocha": "^10.0.1",
+    "@types/node": "20.12.13",
+    "@typescript-eslint/eslint-plugin": "^8.28.0",
+    "@typescript-eslint/parser": "^8.28.0",
+    "chai": "^4.3.7",
+    "eslint": "^9.39.0",
+    "mocha": "^10.2.0",
+    "ts-node": "^10.9.1",
+    "tsup": "^8.4.0"
+  },
+  "peerDependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ts-patch": "^3.3.0",
+    "tsconfig-paths": "^4.2.0",
+    "typia": "^9.6.1"
+  },
+  "peerDependenciesMeta": {
+    "ts-patch": {
+      "optional": false
+    },
+    "tsconfig-paths": {
+      "optional": false
+    },
+    "typia": {
+      "optional": false
+    },
+    "@modelcontextprotocol/sdk": {
+      "optional": true
+    }
+  }
+}

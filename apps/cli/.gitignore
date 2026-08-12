@@ -1,0 +1,6 @@
+!Cargo.lock
+
+*.tmp
+
+# Build-generated files
+src/proto/

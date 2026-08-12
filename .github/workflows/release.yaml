@@ -1,0 +1,327 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        type: boolean
+        description: "Build everything but do not publish"
+        required: true
+        default: true
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - name: Derive version from tag
+        id: version
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # Must be valid SemVer *and* valid PEP 440: this string is written into
+            # Cargo.toml, and maturin converts the Cargo version to a Python version
+            # before it will build. A SemVer prerelease tag such as "0.0.0-dryrun"
+            # parses fine for Cargo but makes maturin abort with
+            # "Failed to parse Cargo.toml into python metadata", so the dry run dies
+            # before compiling anything and tests nothing.
+            VERSION="0.0.0"
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${VERSION}"
+
+  release-guard:
+    name: Release guard (state-compatibility test)
+    runs-on: ubuntu-latest
+    needs: version
+    env:
+      # The version this release will build under. state_storage.rs's
+      # compatibility guard now keys on InfrastructureMap::data_model_version
+      # (see CURRENT_DATA_MODEL_VERSION), not on this CLI version, so this
+      # job no longer needs MOOSE_CLI_VERSION to make the guard's tests
+      # exercise a particular code path -- they run the same way at any
+      # version. It is kept set to the tag-derived version anyway so this
+      # job builds under the same version every other publishing job uses.
+      MOOSE_CLI_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+          cache-shared-key: ${{ runner.os }}-${{ runner.arch }}-rust
+          cache-on-failure: true
+          cache-all-crates: true
+
+      # Gates the release on the state-compatibility guard in
+      # state_storage.rs: stored infrastructure maps carry their own
+      # data_model_version, independent of this CLI's release version, and
+      # this tool refuses to diff against a map from an older or newer data
+      # model rather than silently planning the deletion of resources it
+      # cannot represent. Runs before any binary is built or published, so a
+      # regression in that logic stops the release instead of shipping.
+      - run: cargo test --package typed-clickhouse state_storage
+
+  build-and-publish-binaries:
+    name: Build CLI binary (${{ matrix.build.NAME }})
+    runs-on: ${{ matrix.build.OS }}
+    needs: [version, release-guard]
+    permissions:
+      contents: "read"
+      id-token: "write"
+    env:
+      TAG_LATEST: "true"
+      NPM_CONFIG_PROVENANCE: "true"
+    strategy:
+      fail-fast: false
+      matrix:
+        build:
+          - { NAME: linux-x64, OS: ubuntu-22.04, TARGET: x86_64-unknown-linux-gnu }
+          - { NAME: linux-arm64, OS: ubuntu-22.04, TARGET: aarch64-unknown-linux-gnu }
+          - { NAME: darwin-arm64, OS: macos-14, TARGET: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.build.TARGET }}
+
+      # No sccache. maturin compiles inside its own manylinux container, so the
+      # wrapper never saw a single compile request on any leg ("compile_requests":0,
+      # "0% - 0 hits"), while its post-job step failed on macOS with
+      # "failed to get stats from server" and marked the whole job failed. On a
+      # tagged run that lands after `Publish platform package`, so the platform
+      # package reaches npm, `publish-wrapper` is skipped for a failed dependency,
+      # and the version is burned with no wrapper published.
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "24.4"
+
+      - name: Verify Protoc
+        run: |
+          which protoc
+          protoc --version
+          echo "PROTOC=$(which protoc)" >> $GITHUB_ENV
+
+      - name: Set version
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          if [[ "$OSTYPE" == "darwin"* ]]; then
+            sed -i '' "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+            sed -i '' '/name = "typed-clickhouse"/,/version = ".*"/ s/version = ".*"/version = "'"${VERSION}"'"/' ../../Cargo.lock
+          else
+            sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+            sed -i '/name = "typed-clickhouse"/,/version = ".*"/ s/version = ".*"/version = "'"${VERSION}"'"/' ../../Cargo.lock
+          fi
+          echo "MOOSE_CLI_VERSION=${VERSION}" >> $GITHUB_ENV
+          grep '^version = ' Cargo.toml
+        working-directory: ./apps/cli
+
+      - name: Build release binary
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.build.TARGET }}
+          args: --release --locked --features rdkafka/cmake-build --target ${{ matrix.build.TARGET }} --out dist
+          working-directory: ./apps/cli
+          # Let maturin-action pick the manylinux image for each target. Pinning
+          # x86_64 to the rust-cross *-cross* image broke the build: that image
+          # provides target-prefixed cross toolchains, so a native x86_64 build
+          # looked for a linker named `x86_64-unknown-linux-gnu-gcc` that is not
+          # there, and every build script failed to compile. aarch64 already built
+          # cleanly on the default image; x86_64 uses the same path now.
+          manylinux: ${{ (matrix.build.TARGET == 'aarch64-unknown-linux-gnu' || matrix.build.TARGET == 'x86_64-unknown-linux-gnu') && '2_28' || '' }}
+          before-script-linux: |
+            if [ -f /.dockerenv ]; then
+              echo "Running in Docker container, installing required dependencies..."
+              PROTOC_VERSION=24.4
+              PROTOC_ZIP=protoc-$PROTOC_VERSION-linux-x86_64.zip
+              export MOOSE_CLI_VERSION=${{ needs.version.outputs.version }}
+              echo "MOOSE_CLI_VERSION set to: $MOOSE_CLI_VERSION"
+
+              # maturin-action picks a different image family per target: cross
+              # targets (aarch64) run in the Debian-based rust-cross image, while
+              # native x86_64 runs in quay.io/pypa/manylinux_2_28_x86_64, which is
+              # RHEL-based and has no apt. Install only what is missing, using
+              # whichever package manager the image actually ships.
+              for tool in curl unzip; do
+                command -v "$tool" >/dev/null 2>&1 && continue
+                if command -v apt-get >/dev/null 2>&1; then
+                  apt-get update && apt-get install -y "$tool"
+                elif command -v dnf >/dev/null 2>&1; then
+                  dnf install -y "$tool"
+                elif command -v yum >/dev/null 2>&1; then
+                  yum install -y "$tool"
+                else
+                  echo "no supported package manager found to install $tool" >&2
+                  exit 1
+                fi
+              done
+
+              # openssl is built from vendored source (see the `vendored` feature
+              # in apps/cli/Cargo.toml), and OpenSSL's ./Configure is a
+              # Perl script needing modules the RHEL-based manylinux image ships
+              # only a minimal Perl for:
+              #   Can't locate IPC/Cmd.pm in @INC
+              # The Debian cross image has a full Perl, which is why aarch64 never
+              # hit this. perl-core is the RHEL metapackage carrying IPC::Cmd,
+              # FindBin, File::Compare and Pod::Html, all of which Configure wants.
+              if ! perl -MIPC::Cmd -e1 >/dev/null 2>&1; then
+                if command -v dnf >/dev/null 2>&1; then
+                  dnf install -y perl-core || dnf install -y perl-IPC-Cmd
+                elif command -v yum >/dev/null 2>&1; then
+                  yum install -y perl-core || yum install -y perl-IPC-Cmd
+                elif command -v apt-get >/dev/null 2>&1; then
+                  apt-get update && apt-get install -y perl
+                fi
+              fi
+
+              # Fail here with a clear message rather than deep inside the
+              # openssl-sys build script ten minutes into a compile.
+              perl -MIPC::Cmd -e1 || {
+                echo "Perl IPC::Cmd still missing; OpenSSL's Configure cannot run" >&2
+                exit 1
+              }
+
+              mkdir -p /usr/local/bin
+              mkdir -p /usr/local/include
+
+              curl -OL https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/$PROTOC_ZIP
+              unzip -o $PROTOC_ZIP -d /usr/local bin/protoc
+              unzip -o $PROTOC_ZIP -d /usr/local 'include/*'
+              rm -f $PROTOC_ZIP
+
+              protoc --version
+            fi
+
+      - name: Publish platform package
+        if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
+        run: |
+          ./scripts/release-bin.sh \
+            "${{ needs.version.outputs.version }}" \
+            "${{ matrix.build.TARGET }}" \
+            "${{ matrix.build.OS }}" \
+            "${{ matrix.build.NAME }}"
+        working-directory: ./apps/cli-npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-wrapper:
+    name: Publish @typed-clickhouse/cli
+    runs-on: ubuntu-latest
+    needs:
+      - version
+      - build-and-publish-binaries
+    if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
+    permissions:
+      contents: "read"
+      id-token: "write"
+    env:
+      NPM_CONFIG_PROVENANCE: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - uses: pnpm/action-setup@v4
+
+      - name: Wait for platform packages to appear on the registry
+        run: |
+          for pkg in linux-x64 linux-arm64 darwin-arm64; do
+            bash scripts/wait-for-npm-package.sh \
+              "@typed-clickhouse/cli-${pkg}" \
+              "${{ needs.version.outputs.version }}"
+          done
+
+      - name: Publish wrapper
+        run: ./apps/cli-npm/scripts/release-cli.sh "${{ needs.version.outputs.version }}"
+        env:
+          TAG_LATEST: "true"
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-library:
+    name: Publish @typed-clickhouse/core
+    runs-on: ubuntu-latest
+    # Consumes the same tag-derived version as the CLI jobs. bin.rs compares
+    # the CLI version to `tch-runner print-version` with strict equality, so
+    # the two packages must ship the same number by construction.
+    needs: [version, release-guard]
+    if: ${{ github.ref_type == 'tag' && !inputs.dry-run }}
+    permissions:
+      contents: "read"
+      id-token: "write"
+    env:
+      NPM_CONFIG_PROVENANCE: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+      - uses: pnpm/action-setup@v4
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Set version
+        run: npm version "${{ needs.version.outputs.version }}" --no-git-tag-version --allow-same-version
+        working-directory: ./packages/core
+
+      # The library's declarations are bundled from @typed-clickhouse/lib's SOURCE, so
+      # its dist/ .d.ts files are not required -- but its JavaScript is still
+      # inlined via noExternal, so it must be built first. --no-dts skips the
+      # declaration emit, which nothing here reads and which OOMs the runner.
+      - name: Build
+        run: |
+          pnpm --filter @typed-clickhouse/lib exec tsup --no-dts
+          pnpm --filter @typed-clickhouse/core build
+
+      - name: Verify no @514labs/moose-lib reference survived into dist
+        run: |
+          if grep -rq '@514labs/moose-lib' dist/; then
+            echo "dist still references @514labs/moose-lib"
+            exit 1
+          fi
+        working-directory: ./packages/core
+
+      # A dangling chunk re-export makes every exported type resolve to `any`
+      # in a consumer, which silently disables the compiler plugin. The bundle
+      # must be self-contained.
+      - name: Verify the declarations are self-contained
+        run: |
+          # Only declaration lines, which start at column 0. JSDoc examples in
+          # the bundled comments legitimately contain `from './bar.js'` and
+          # would otherwise trip this.
+          dangling=$(grep -E "^(export|import|declare)" dist/index.d.ts \
+            | grep -oE "from '\./[^']+'" | sort -u || true)
+          if [ -n "$dangling" ]; then
+            echo "dist/index.d.ts re-exports chunks that are not shipped:"
+            echo "$dangling"
+            exit 1
+          fi
+        working-directory: ./packages/core
+
+      - name: Publish
+        run: pnpm publish --access public --no-git-checks
+        working-directory: ./packages/core
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

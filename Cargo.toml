@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/cli",
+]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

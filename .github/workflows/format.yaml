@@ -1,0 +1,33 @@
+name: Format
+on:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches:
+      - "**"
+      - "!main"
+
+# Add explicit permissions with read-only access
+permissions:
+  contents: read
+
+jobs:
+  format-typescript:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+      - name: Install prettier
+        run: pnpm install --frozen-lockfile
+      - name: Check prettier compliance
+        run: pnpm exec prettier --check './apps/**/*.{ts,tsx}'
+
+  # format-python and notify-slack-on-failure were removed in Phase B. The
+  # black job linted packages/py-moose-lib, which the prune deleted -- no Python
+  # source remains in this repository. The notifier used 514-labs/slack-notification-action
+  # with SLACK_BOT_TOKEN/SLACK_GITHUB_ACTIONS_WEBHOOK_URL secrets belonging to
+  # upstream's organisation; it could only ever fail here.

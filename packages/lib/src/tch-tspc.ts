@@ -1,0 +1,347 @@
+#!/usr/bin/env node
+/**
+ * Pre-compiles TypeScript app code with tch compiler plugins and typia transforms.
+ *
+ * Usage: tch-tspc [outDir] [--watch]
+ *   outDir: Output directory for compiled files (optional, overrides tsconfig)
+ *   --watch: Enable watch mode for incremental compilation (outputs JSON events)
+ *
+ * Output directory is determined by (in priority order):
+ * 1. CLI argument (if provided) - used by Docker builds
+ * 2. User's tsconfig.json outDir setting (if specified)
+ * 3. Default: .tch/compiled
+ *
+ * This script creates a temporary tsconfig that extends the user's config and adds
+ * the required tch compiler plugins, then runs tspc to compile with transforms.
+ *
+ * In watch mode, outputs JSON events to stdout for the Rust CLI to parse:
+ *   {"event": "compile_start"}
+ *   {"event": "compile_complete", "errors": 0, "warnings": 2}
+ *   {"event": "compile_error", "errors": 3, "diagnostics": [...]}
+ */
+import { execFileSync, spawn } from "child_process";
+import { existsSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
+import path from "path";
+import {
+  TCH_COMPILER_PLUGINS,
+  TCH_COMPILER_OPTIONS,
+  detectModuleSystem,
+  getModuleOptions,
+  getSourceDir,
+  readUserOutDir,
+  DEFAULT_OUT_DIR,
+  type ModuleSystem,
+} from "./compiler-config";
+import { rewriteImportExtensions } from "./commons";
+
+// Parse command line arguments
+const args = process.argv.slice(2);
+const watchMode = args.includes("--watch");
+// CLI argument takes priority (for Docker builds), then tsconfig, then default
+const cliOutDir = args.find((arg) => !arg.startsWith("--"));
+
+const projectRoot = process.cwd();
+const tsconfigPath = path.join(projectRoot, "tsconfig.json");
+const tempTsconfigPath = path.join(projectRoot, "tsconfig.tch-build.json");
+
+// Determine outDir - CLI arg > tsconfig > default
+const userOutDir = readUserOutDir(projectRoot);
+const outDir = cliOutDir || userOutDir || DEFAULT_OUT_DIR;
+// add --outDir flag if user hasn't specified in tsconfig
+// (if CLI arg is provided, we always pass it explicitly)
+const shouldAddOutDir = cliOutDir !== undefined || !userOutDir;
+
+/**
+ * JSON event protocol for watch mode communication with Rust CLI.
+ */
+interface CompileEvent {
+  event: "compile_start" | "compile_complete" | "compile_error";
+  errors?: number;
+  warnings?: number;
+  diagnostics?: string[];
+}
+
+/**
+ * Emit a JSON event to stdout for the Rust CLI to parse.
+ */
+function emitEvent(event: CompileEvent): void {
+  console.log(JSON.stringify(event));
+}
+
+/**
+ * Create the build tsconfig with tch plugins.
+ */
+function createBuildTsconfig(
+  moduleOptions: ReturnType<typeof getModuleOptions>,
+) {
+  return {
+    extends: "./tsconfig.json",
+    compilerOptions: {
+      ...TCH_COMPILER_OPTIONS,
+      ...moduleOptions,
+      plugins: [...TCH_COMPILER_PLUGINS],
+      // Skip type checking of declaration files to avoid dual-package conflicts
+      skipLibCheck: true,
+      skipDefaultLibCheck: true,
+      // Additional settings to handle module resolution conflicts
+      allowSyntheticDefaultImports: true,
+      // Block emission on errors so build and dev behave consistently
+      noEmitOnError: true,
+      // Enable incremental compilation for faster rebuilds
+      incremental: true,
+      tsBuildInfoFile: path.join(outDir, ".tsbuildinfo"),
+    },
+  };
+}
+
+/**
+ * Run a single compilation (non-watch mode).
+ */
+function runSingleCompilation(moduleSystem: ModuleSystem): void {
+  const moduleOptions = getModuleOptions(moduleSystem);
+  const buildTsconfig = createBuildTsconfig(moduleOptions);
+
+  writeFileSync(tempTsconfigPath, JSON.stringify(buildTsconfig, null, 2));
+  console.log("Created temporary tsconfig with tch plugins...");
+
+  // Build tspc arguments - only add --outDir if user hasn't specified one in tsconfig
+  const tspcArgs = [
+    require.resolve("ts-patch/bin/tspc.js"),
+    "-p",
+    tempTsconfigPath,
+    "--rootDir",
+    ".",
+  ];
+  if (shouldAddOutDir) {
+    tspcArgs.push("--outDir", outDir);
+  }
+
+  execFileSync(process.execPath, tspcArgs, {
+    stdio: "inherit",
+    cwd: projectRoot,
+  });
+  console.log("TypeScript compilation complete.");
+
+  // Post-process ESM output to add .js extensions to relative imports
+  if (moduleSystem === "esm") {
+    console.log("Post-processing ESM imports to add .js extensions...");
+    const fullOutDir = path.join(projectRoot, outDir);
+    rewriteImportExtensions(fullOutDir);
+    console.log("ESM import rewriting complete.");
+  }
+}
+
+/**
+ * Run watch mode compilation with JSON event output.
+ * Uses tspc --watch and parses its output to emit structured events.
+ */
+function runWatchCompilation(moduleSystem: ModuleSystem): void {
+  const moduleOptions = getModuleOptions(moduleSystem);
+  const buildTsconfig = createBuildTsconfig(moduleOptions);
+
+  // Write the tsconfig (it stays for the duration of watch mode)
+  writeFileSync(tempTsconfigPath, JSON.stringify(buildTsconfig, null, 2));
+
+  // Ensure output directory exists for incremental build info
+  const fullOutDir = path.join(projectRoot, outDir);
+  if (!existsSync(fullOutDir)) {
+    mkdirSync(fullOutDir, { recursive: true });
+  }
+
+  // Track diagnostics between compilation cycles
+  let currentDiagnostics: string[] = [];
+  let errorCount = 0;
+  let warningCount = 0;
+
+  // Build tspc arguments - only add --outDir if user hasn't specified one in tsconfig
+  const tspcArgs = [
+    require.resolve("ts-patch/bin/tspc.js"),
+    "-p",
+    tempTsconfigPath,
+    "--rootDir",
+    ".",
+    "--watch",
+    "--preserveWatchOutput",
+  ];
+  if (shouldAddOutDir) {
+    // Insert --outDir after --rootDir and "." so rootDir is not clobbered
+    tspcArgs.splice(5, 0, "--outDir", outDir);
+  }
+
+  // Spawn tspc in watch mode
+  const tspcProcess = spawn(process.execPath, tspcArgs, {
+    cwd: projectRoot,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  // Handle process termination
+  const cleanup = () => {
+    if (existsSync(tempTsconfigPath)) {
+      unlinkSync(tempTsconfigPath);
+    }
+    tspcProcess.kill();
+  };
+
+  process.on("SIGINT", () => {
+    cleanup();
+    process.exit(0);
+  });
+
+  process.on("SIGTERM", () => {
+    cleanup();
+    process.exit(0);
+  });
+
+  // Parse tspc output line by line
+  // Pattern matching approach inspired by tsc-watch (github.com/gilamran/tsc-watch)
+  // which also parses tsc stdout to detect compilation events
+  let buffer = "";
+
+  // Strip ANSI escape codes for reliable pattern matching (standard regex pattern)
+  const stripAnsi = (str: string) =>
+    str.replace(
+      /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]*)*)?[\u0007])|(?:(?:\d{1,4}(?:;\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g,
+      "",
+    );
+
+  // tsc watch mode patterns (with timestamp prefix like "12:00:00 AM - ")
+  const compilationStartedRegex =
+    /Starting compilation in watch mode|Starting incremental compilation/;
+  const compilationCompleteRegex =
+    /Found\s+(\d+)\s+error(?:s)?\..*Watching for file changes/;
+  const diagnosticRegex = /\(\d+,\d+\):\s*(error|warning)\s+TS\d+:/;
+
+  const processLine = (line: string) => {
+    const cleanLine = stripAnsi(line);
+
+    if (compilationStartedRegex.test(cleanLine)) {
+      // New compilation cycle starting
+      currentDiagnostics = [];
+      errorCount = 0;
+      warningCount = 0;
+      emitEvent({ event: "compile_start" });
+    } else if (compilationCompleteRegex.test(cleanLine)) {
+      // Compilation complete - parse error count from tsc summary line
+      // Format: "12:00:00 AM - Found 0 errors. Watching for file changes."
+      const match = cleanLine.match(/Found\s+(\d+)\s+error(?:s)?\./);
+      if (match) {
+        errorCount = parseInt(match[1], 10);
+      }
+
+      // Post-process ESM if successful
+      if (errorCount === 0 && moduleSystem === "esm") {
+        try {
+          rewriteImportExtensions(fullOutDir);
+        } catch (e) {
+          // Log but don't fail - import rewriting is best-effort
+          console.error("Warning: ESM import rewriting failed:", e);
+        }
+      }
+
+      if (errorCount > 0) {
+        emitEvent({
+          event: "compile_error",
+          errors: errorCount,
+          warnings: warningCount,
+          diagnostics: currentDiagnostics,
+        });
+      } else {
+        emitEvent({
+          event: "compile_complete",
+          errors: 0,
+          warnings: warningCount,
+          diagnostics: warningCount > 0 ? currentDiagnostics : undefined,
+        });
+      }
+    } else if (diagnosticRegex.test(cleanLine)) {
+      // This is a diagnostic line (error or warning)
+      currentDiagnostics.push(cleanLine.trim());
+      if (cleanLine.includes(": error ")) {
+        errorCount++;
+      } else if (cleanLine.includes(": warning ")) {
+        warningCount++;
+      }
+    }
+  };
+
+  tspcProcess.stdout.on("data", (data: Buffer) => {
+    buffer += data.toString();
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || ""; // Keep incomplete line in buffer
+    for (const line of lines) {
+      if (line.trim()) {
+        processLine(line);
+      }
+    }
+  });
+
+  tspcProcess.stderr.on("data", (data: Buffer) => {
+    // Forward stderr for debugging but don't parse it
+    process.stderr.write(data.toString());
+  });
+
+  tspcProcess.on("error", (err) => {
+    console.error("Failed to start tspc:", err);
+    cleanup();
+    process.exit(1);
+  });
+
+  tspcProcess.on("exit", (code) => {
+    cleanup();
+    if (code !== 0) {
+      process.exit(code || 1);
+    }
+  });
+}
+
+/**
+ * Write compile metadata to .tch/.compile-config.json
+ * This allows Rust CLI to know where compiled output is without duplicating logic
+ */
+function writeCompileConfig() {
+  const internalDir = path.join(projectRoot, ".tch");
+  if (!existsSync(internalDir)) {
+    mkdirSync(internalDir, { recursive: true });
+  }
+  const configPath = path.join(internalDir, ".compile-config.json");
+  writeFileSync(configPath, JSON.stringify({ outDir }, null, 2));
+}
+
+// Main execution
+if (!existsSync(tsconfigPath)) {
+  console.error("Error: tsconfig.json not found in", projectRoot);
+  process.exit(1);
+}
+
+try {
+  // Write compile config so Rust CLI knows where output is
+  writeCompileConfig();
+
+  // Auto-detect module system from package.json
+  const moduleSystem = detectModuleSystem(projectRoot);
+
+  if (watchMode) {
+    // Watch mode - run indefinitely with JSON event output
+    runWatchCompilation(moduleSystem);
+  } else {
+    // Single compilation mode
+    console.log(`Compiling TypeScript to ${outDir}...`);
+    console.log(
+      `Using ${moduleSystem.toUpperCase()} module output (detected from package.json)...`,
+    );
+    runSingleCompilation(moduleSystem);
+    console.log("Compilation complete.");
+
+    // Clean up the temporary tsconfig
+    if (existsSync(tempTsconfigPath)) {
+      unlinkSync(tempTsconfigPath);
+    }
+  }
+} catch (error) {
+  console.error("Build process failed:", error);
+  // Clean up the temporary tsconfig
+  if (existsSync(tempTsconfigPath)) {
+    unlinkSync(tempTsconfigPath);
+  }
+  process.exit(1);
+}

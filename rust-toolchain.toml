@@ -1,0 +1,13 @@
+# This pin is authoritative for local dev, CI, and release builds alike.
+#
+# Do not pass `toolchain:` to actions-rust-lang/setup-rust-toolchain in any
+# workflow. That input makes the action run `rustup override set`, which shadows
+# this file — CI then lints and tests on a different compiler than the one that
+# builds the released binaries, and `cargo clippy` locally stops reproducing CI.
+# Left empty, the action reads this file (see its action.yml, the branch guarded
+# by `-z "$_srt_toolchain" && -f "rust-toolchain.toml"`) and sets no override.
+#
+# To move Rust versions, change the channel here and fix whatever new lints the
+# newer clippy reports, in one commit.
+[toolchain]
+channel = "1.94"

@@ -1,0 +1,90 @@
+{
+  "name": "@typed-clickhouse/core",
+  "version": "0.1.0",
+  "description": "Serverless-compatible ClickHouse SDK for AWS Lambda and edge runtimes. Provides OlapTable, View, MaterializedView and the other ClickHouse SDK classes, with no native dependencies. Includes a patched compiler plugin for type-driven schema injection.",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    },
+    "./compilerPlugin": {
+      "require": "./dist/compilerPlugin.js"
+    },
+    "./dist/compilerPlugin.js": "./dist/compilerPlugin.js"
+  },
+  "bin": {
+    "tch-tspc": "./dist/tch-tspc.js",
+    "tch-runner": "./dist/tch-runner.js"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "scripts": {
+    "build": "tsup",
+    "test": "mocha -r ts-node/register 'tests/**/*.test.ts'"
+  },
+  "keywords": [
+    "tch",
+    "serverless",
+    "lambda",
+    "aws",
+    "clickhouse",
+    "olap",
+    "data-engineering",
+    "compiler-plugin"
+  ],
+  "dependencies": {
+    "@clickhouse/client": "1.8.1",
+    "commander": "^13.1.0",
+    "csv-parse": "^5.5.5",
+    "jose": "5.9.2",
+    "toml": "3.0.0",
+    "ts-node": "^10.9.1",
+    "tsconfig-paths": "^4.2.0"
+  },
+  "devDependencies": {
+    "@typed-clickhouse/lib": "workspace:*",
+    "@types/mocha": "^10.0.1",
+    "@types/node": "20.12.13",
+    "mocha": "^10.2.0",
+    "ts-node": "^10.9.1",
+    "ts-patch": "^3.3.0",
+    "tsup": "^8.4.0",
+    "typescript": "~5.9.2",
+    "zod": "^3.0.0"
+  },
+  "peerDependencies": {
+    "ts-patch": "^3.3.0",
+    "typescript": ">=5.6 <5.10",
+    "typia": "^9.6.1"
+  },
+  "peerDependenciesMeta": {
+    "typia": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bayoudhi/moosestack",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/bayoudhi/moosestack/tree/main/packages/core#readme"
+}

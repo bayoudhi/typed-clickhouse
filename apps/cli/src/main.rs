@@ -1,0 +1,130 @@
+#[macro_use]
+mod cli;
+pub mod framework;
+pub mod infrastructure;
+pub mod project;
+pub mod utilities;
+
+pub mod proto;
+
+use std::process::ExitCode;
+
+use clap::Parser;
+use cli::display::{Message, MessageType};
+
+/// Ensures terminal is properly reset on exit using crossterm
+fn ensure_terminal_cleanup() {
+    use crossterm::terminal::disable_raw_mode;
+    use std::io::{stdout, Write};
+
+    let mut stdout = stdout();
+
+    // Perform the standard ratatui cleanup sequence:
+    // 1. Disable raw mode (if it was enabled)
+    // 2. Reset any terminal state
+
+    let _ = disable_raw_mode();
+    let _ = stdout.flush();
+
+    tracing::info!("Terminal cleanup complete via crossterm");
+}
+
+// Entry point for the CLI application
+fn main() -> ExitCode {
+    // Handle all CLI setup that doesn't require async functionality
+    let user_directory = cli::settings::setup_user_directory();
+    if let Err(e) = user_directory {
+        show_message!(
+            MessageType::Error,
+            Message {
+                action: "Init".to_string(),
+                details: format!(
+                    "Failed to initialize ~/.tch, please check your permissions: {e:?}"
+                ),
+            }
+        );
+        std::process::exit(1);
+    }
+
+    if let Err(e) = cli::settings::init_config_file() {
+        show_message!(
+            MessageType::Error,
+            Message {
+                action: "Init".to_string(),
+                details: format!("Failed to initialize config file (~/.tch/config.toml): {e:?}"),
+            }
+        );
+        ensure_terminal_cleanup();
+        return ExitCode::from(1);
+    }
+
+    let config = match cli::settings::read_settings() {
+        Ok(config) => config,
+        Err(e) => {
+            show_message!(
+                MessageType::Error,
+                Message {
+                    action: "Init".to_string(),
+                    details: format!("Failed to read settings: {e:?}"),
+                }
+            );
+            ensure_terminal_cleanup();
+            return ExitCode::from(1);
+        }
+    };
+
+    // Parse CLI arguments
+    let cli_result = match cli::Cli::try_parse() {
+        Ok(cli_result) => cli_result,
+        // Use Clap's default error format; this includes the --version and --help string
+        Err(e) => e.exit(),
+    };
+
+    if cli_result.backtrace {
+        // Safe: no other threads have started and no errors have been created yet.
+        std::env::set_var("RUST_LIB_BACKTRACE", "1");
+    }
+
+    // Clone logger settings before moving config into async block
+    let logger_settings = config.logger.clone();
+
+    // Create a runtime with a single thread to avoid issues with dropping runtimes
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to create Tokio runtime");
+
+    // Run inside runtime context so OTLP batch exporter can initialize properly
+    let result = runtime.block_on(async {
+        // Setup logging (inside runtime context for OTLP batch exporter)
+        cli::logger::setup_logging(&logger_settings);
+
+        // Run the async command handler
+        cli::top_command_handler(config, &cli_result.command).await
+    });
+
+    // Process the result using the original display formatting
+    let exit_code = match result {
+        Ok(s) => {
+            // Skip displaying empty messages (used for --json output where JSON is already printed)
+            if !s.message.action.is_empty() || !s.message.details.is_empty() {
+                show_message!(s.message_type, s.message);
+            }
+            ensure_terminal_cleanup();
+            ExitCode::from(0)
+        }
+        Err(e) => {
+            show_message!(e.message_type, e.message);
+            if let Some(err) = e.error {
+                eprintln!("{err:?}");
+            }
+            ensure_terminal_cleanup();
+            ExitCode::from(1)
+        }
+    };
+
+    // Flush OTLP batches before exit
+    cli::logger::shutdown_otlp();
+
+    exit_code
+}

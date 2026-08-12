@@ -1,0 +1,168 @@
+use lazy_static::lazy_static;
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use uuid::Uuid;
+
+pub const CLI_VERSION: &str = env!("MOOSE_CLI_VERSION");
+
+pub const ENVIRONMENT_VARIABLE_PREFIX: &str = "TCH";
+
+pub const PACKAGE_JSON: &str = "package.json";
+pub const PACKAGE_LOCK_JSON: &str = "package-lock.json";
+pub const PNPM_LOCK: &str = "pnpm-lock.yaml";
+pub const YARN_LOCK: &str = "yarn.lock";
+pub const TSCONFIG_JSON: &str = "tsconfig.json";
+pub const SETUP_PY: &str = "setup.py";
+pub const LIB_DIR: &str = "lib";
+pub const PYTHON_MINIMUM_VERSION: &str = "3.12";
+pub const REQUIREMENTS_TXT: &str = "requirements.txt";
+pub const OLD_PROJECT_CONFIG_FILE: &str = "moose.config.toml";
+pub const PROJECT_CONFIG_FILE: &str = "tch.config.toml";
+pub const OPENAPI_FILE: &str = "openapi.yaml";
+pub const WORKFLOW_CONFIGS: &str = "workflow_configs.json";
+pub const PROJECT_NAME_ALLOW_PATTERN: &str = r"^[a-zA-Z0-9_-]+$";
+
+pub const CLI_CONFIG_FILE: &str = "config.toml";
+pub const CLI_USER_DIRECTORY: &str = ".tch";
+pub const CLI_PROJECT_INTERNAL_DIR: &str = ".tch";
+pub const CLI_INTERNAL_VERSIONS_DIR: &str = "versions";
+pub const CLI_DEV_REDPANDA_VOLUME_DIR: &str = "redpanda";
+pub const CLI_DEV_CLICKHOUSE_VOLUME_DIR_LOGS: &str = "clickhouse/logs";
+pub const CLI_DEV_CLICKHOUSE_VOLUME_DIR_DATA: &str = "clickhouse/data";
+pub const CLI_DEV_CLICKHOUSE_VOLUME_DIR_CONFIG_SCRIPTS: &str = "clickhouse/configs/scripts";
+pub const CLI_DEV_CLICKHOUSE_VOLUME_DIR_CONFIG_USERS: &str = "clickhouse/configs/users";
+pub const CLI_DEV_TEMPORAL_DYNAMIC_CONFIG_DIR: &str = "temporal/dynamicconfig";
+
+pub const SCHEMAS_DIR: &str = "datamodels";
+pub const VSCODE_DIR: &str = ".vscode";
+pub const SAMPLE_STREAMING_FUNCTION_SOURCE: &str = "Foo";
+pub const SAMPLE_STREAMING_FUNCTION_DEST: &str = "Bar";
+
+pub const CLICKHOUSE_CONTAINER_NAME: &str = "clickhousedb";
+pub const REDPANDA_CONTAINER_NAME: &str = "redpanda";
+pub const TEMPORAL_CONTAINER_NAME: &str = "temporal";
+
+pub const REDPANDA_HOSTS: [&str; 2] = ["redpanda", "localhost"];
+
+pub const APP_DIR: &str = "app";
+
+pub const TS_API_FILE: &str = "bar.ts";
+pub const PY_API_FILE: &str = "bar.py";
+
+pub const VSCODE_EXT_FILE: &str = "extensions.json";
+pub const VSCODE_SETTINGS_FILE: &str = "settings.json";
+
+pub const CTX_SESSION_ID: &str = "session_id";
+
+pub const PYTHON_FILE_EXTENSION: &str = "py";
+pub const TYPESCRIPT_FILE_EXTENSION: &str = "ts";
+pub const SQL_FILE_EXTENSION: &str = "sql";
+
+pub const PYTHON_CACHE_EXTENSION: &str = "pyc";
+pub const PYTHON_INIT_FILE: &str = "__init__.py";
+
+lazy_static! {
+    pub static ref CONTEXT: HashMap<String, String> = {
+        let mut map = HashMap::new();
+        map.insert(CTX_SESSION_ID.to_string(), Uuid::new_v4().to_string());
+        map
+    };
+}
+
+/// Global flag to disable ANSI colors in terminal output
+/// When true, ANSI escape codes are disabled in terminal display functions
+/// This is set once at startup based on logger configuration
+pub static NO_ANSI: AtomicBool = AtomicBool::new(false);
+
+/// Global flag to enable timestamp display on every output line
+/// When true, prepends HH:MM:SS.mmm (hours:minutes:seconds.milliseconds) to each line
+/// This is set once at startup based on CLI flags
+pub static SHOW_TIMESTAMPS: AtomicBool = AtomicBool::new(false);
+
+/// Global flag to redirect display messages to stderr instead of stdout
+/// When true, all show_message! output goes to stderr, keeping stdout clean for
+/// structured/JSON output that can be parsed programmatically
+/// This is set when commands use --json or similar flags
+pub static QUIET_STDOUT: AtomicBool = AtomicBool::new(false);
+
+/// Global flag to enable timing information for operations
+/// When true, shows elapsed time like "completed in 234ms" or "completed in 2.3s" for tracked operations
+/// This is set once at startup based on CLI flags
+pub static SHOW_TIMING: AtomicBool = AtomicBool::new(false);
+
+/// Global flag indicating we're running in dev mode (`typed-clickhouse dev`).
+/// When true, `tspc --watch` is handling TypeScript compilation, so we don't need
+/// to run `ensure_typescript_compiled` ourselves.
+/// This is set once at the start of `start_development_mode`.
+pub static IS_DEV_MODE: AtomicBool = AtomicBool::new(false);
+
+pub const PYTHON_WORKER_WRAPPER_PACKAGE_NAME: &str = "python_worker_wrapper";
+pub const CONSUMPTION_WRAPPER_PACKAGE_NAME: &str = "consumption_wrapper";
+pub const UTILS_WRAPPER_PACKAGE_NAME: &str = "utils";
+
+pub const PYTHON_MAIN_FILE: &str = "main.py";
+pub const TYPESCRIPT_MAIN_FILE: &str = "index.ts";
+pub const PYTHON_EXTERNAL_FILE: &str = "external_models.py";
+pub const TYPESCRIPT_EXTERNAL_FILE: &str = "externalModels.ts";
+
+pub const WORKFLOW_TYPE: &str = "ScriptWorkflow";
+pub const PYTHON_TASK_QUEUE: &str = "python-script-queue";
+pub const TYPESCRIPT_TASK_QUEUE: &str = "typescript-script-queue";
+pub const CLI_NAME: &str = "typed-clickhouse";
+pub const KEY_REMOTE_CLICKHOUSE_URL: &str = "remote_clickhouse_url";
+pub const KEY_REMOTE_ADMIN_URL: &str = "remote_admin_url";
+pub const KEY_REMOTE_ADMIN_TOKEN: &str = "remote_admin_token";
+
+// Keychain keys for remote ClickHouse credentials (separate from URL)
+pub(crate) const KEY_REMOTE_CLICKHOUSE_USER: &str = "remote_clickhouse_user";
+pub(crate) const KEY_REMOTE_CLICKHOUSE_PASSWORD: &str = "remote_clickhouse_password";
+
+pub const ENV_CLICKHOUSE_URL: &str = "TCH_CLICKHOUSE_CONFIG__URL";
+
+/// Default row limit when `typed-clickhouse seed clickhouse` is invoked without `--limit` or `--all`
+/// and no per-table `seedFilter.limit` is configured.
+pub const DEFAULT_SEED_LIMIT: usize = 1000;
+
+pub const MIGRATION_FILE: &str = "./migrations/plan.yaml";
+pub const MIGRATION_BEFORE_STATE_FILE: &str = "./migrations/remote_state.json";
+pub const MIGRATION_AFTER_STATE_FILE: &str = "./migrations/local_infra_map.json";
+
+pub const STORE_CRED_PROMPT: &str = r#"You have externally managed tables in your code base.
+Ensure your code is up to date with `typed-clickhouse db pull`.
+
+To enable automatic schema drift detection, add to tch.config.toml:
+
+  [dev.remote_clickhouse]
+  protocol = "http"
+  host = "your-instance.clickhouse.cloud"
+  port = 8443
+  database = "production"
+  use_ssl = true
+
+Credentials are NOT stored in config files.
+You'll be prompted for username and password once, and they will be stored securely in your OS keychain.
+
+This config is safe to commit to git.
+
+Interactive setup:"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_facing_names_use_the_typed_clickhouse_vocabulary() {
+        assert_eq!(ENVIRONMENT_VARIABLE_PREFIX, "TCH");
+        assert_eq!(PROJECT_CONFIG_FILE, "tch.config.toml");
+        assert_eq!(CLI_USER_DIRECTORY, ".tch");
+        assert_eq!(CLI_PROJECT_INTERNAL_DIR, ".tch");
+        assert_eq!(CLI_NAME, "typed-clickhouse");
+    }
+
+    #[test]
+    fn the_previous_config_filename_is_still_recognised() {
+        // Projects created by the pre-rename CLI have moose.config.toml.
+        // Reading it keeps them working; only the name this tool WRITES changes.
+        assert_eq!(OLD_PROJECT_CONFIG_FILE, "moose.config.toml");
+    }
+}

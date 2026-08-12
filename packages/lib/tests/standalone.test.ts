@@ -1,0 +1,479 @@
+import { expect } from "chai";
+import {
+  getResourceClients,
+  getHandlerUtils,
+} from "../src/consumption-apis/standalone";
+import { expressMiddleware } from "../src/consumption-apis/webAppHelpers";
+import { sql } from "../src/sqlHelpers";
+import { OlapTable, SelectRowPolicy } from "../src/dmv2";
+import { getSelectRowPolicies } from "../src/dmv2/registry";
+
+/**
+ * Temporarily replaces console.warn, runs a callback, and restores the original.
+ * Returns captured warning messages and a convenience boolean for pattern matching.
+ */
+async function captureWarnings<T>(
+  callback: () => T | Promise<T>,
+  pattern?: RegExp,
+): Promise<{ result: T; warnings: string[]; matched: boolean }> {
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+
+  console.warn = (msg: string) => {
+    warnings.push(msg);
+  };
+
+  try {
+    const result = await callback();
+    return {
+      result,
+      warnings,
+      matched: pattern ? warnings.some((w) => pattern.test(w)) : false,
+    };
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
+describe("BYOF Standalone Functionality", function () {
+  this.timeout(10000);
+
+  describe("getResourceClients", () => {
+    it("should create a client with default configuration", async () => {
+      const { client } = await getResourceClients();
+
+      expect(client).to.exist;
+      expect(client.query).to.exist;
+    });
+
+    it("should create a client with custom host override", async () => {
+      const { client } = await getResourceClients({
+        host: "custom-host.example.com",
+      });
+
+      expect(client).to.exist;
+      expect(client.query).to.exist;
+    });
+
+    it("should create a client with partial config override", async () => {
+      const { client } = await getResourceClients({
+        database: "custom_db",
+        port: "9000",
+      });
+
+      expect(client).to.exist;
+      expect(client.query).to.exist;
+    });
+
+    it("should create a client with full config override", async () => {
+      const { client } = await getResourceClients({
+        host: "test-host",
+        port: "8123",
+        username: "test_user",
+        password: "test_pass",
+        database: "test_db",
+        useSSL: true,
+      });
+
+      expect(client).to.exist;
+      expect(client.query).to.exist;
+    });
+
+    it("should respect environment variables for config", async () => {
+      const originalHost = process.env.TCH_CLICKHOUSE_CONFIG__HOST;
+      process.env.TCH_CLICKHOUSE_CONFIG__HOST = "env-host";
+
+      try {
+        const { client } = await getResourceClients();
+        expect(client).to.exist;
+      } finally {
+        if (originalHost !== undefined) {
+          process.env.TCH_CLICKHOUSE_CONFIG__HOST = originalHost;
+        } else {
+          delete process.env.TCH_CLICKHOUSE_CONFIG__HOST;
+        }
+      }
+    });
+
+    it("should prioritize override params over environment variables", async () => {
+      const originalHost = process.env.TCH_CLICKHOUSE_CONFIG__HOST;
+      process.env.TCH_CLICKHOUSE_CONFIG__HOST = "env-host";
+
+      try {
+        const { client } = await getResourceClients({
+          host: "override-host",
+        });
+        expect(client).to.exist;
+      } finally {
+        if (originalHost !== undefined) {
+          process.env.TCH_CLICKHOUSE_CONFIG__HOST = originalHost;
+        } else {
+          delete process.env.TCH_CLICKHOUSE_CONFIG__HOST;
+        }
+      }
+    });
+
+    it("should log deprecation warning", async () => {
+      const { warnings } = await captureWarnings(() => getResourceClients());
+      expect(
+        warnings.some(
+          (w) => w.includes("[DEPRECATED]") && w.includes("getResourceClients"),
+        ),
+      ).to.be.true;
+    });
+  });
+
+  describe("getHandlerUtils", () => {
+    it("should return client and sql utilities", async () => {
+      const utils = await getHandlerUtils();
+
+      expect(utils).to.exist;
+      expect(utils.client).to.exist;
+      expect(utils.client.query).to.exist;
+      expect(utils.sql).to.exist;
+      expect(utils.sql).to.be.a("function");
+    });
+
+    it("should cache client on subsequent calls", async () => {
+      const utils1 = await getHandlerUtils();
+      const utils2 = await getHandlerUtils();
+
+      expect(utils1.client).to.equal(utils2.client);
+    });
+
+    it("should handle concurrent initialization without race conditions", async () => {
+      // Call getHandlerUtils multiple times concurrently
+      const [utils1, utils2, utils3] = await Promise.all([
+        getHandlerUtils(),
+        getHandlerUtils(),
+        getHandlerUtils(),
+      ]);
+
+      // All calls should return the same cached instance
+      expect(utils1.client).to.equal(utils2.client);
+      expect(utils2.client).to.equal(utils3.client);
+    });
+
+    it("should work with sql template tag from returned utils", async () => {
+      const { sql: sqlUtil } = await getHandlerUtils();
+      const query = sqlUtil`SELECT 1 as test`;
+
+      expect(query).to.exist;
+      expect(query.strings).to.have.lengthOf(1);
+    });
+
+    it("should log deprecation warning when req parameter is passed", async () => {
+      const fakeReq = { method: "GET", url: "/test", headers: {} };
+      const { matched } = await captureWarnings(
+        () => getHandlerUtils(fakeReq),
+        /\[DEPRECATED\].*getHandlerUtils/,
+      );
+      expect(matched).to.be.true;
+    });
+
+    it("should still return valid utils when req parameter is passed (backwards compat)", async () => {
+      const fakeReq = { method: "GET", url: "/test", headers: {} };
+      const { result: utils } = await captureWarnings(() =>
+        getHandlerUtils(fakeReq),
+      );
+
+      expect(utils).to.exist;
+      expect(utils.client).to.exist;
+      expect(utils.sql).to.exist;
+    });
+
+    it("should return undefined jwt in standalone mode", async () => {
+      const utils = await getHandlerUtils();
+      expect(utils.jwt).to.be.undefined;
+    });
+
+    it("should return runtime context when available", async () => {
+      const mockClient = { query: { execute: () => {} }, workflow: {} };
+      const mockJwt = { sign: () => "token", verify: () => ({}) };
+
+      (globalThis as any)._tchRuntimeContext = {
+        client: mockClient,
+        jwt: mockJwt,
+      };
+
+      try {
+        const utils = await getHandlerUtils();
+        expect(utils.client).to.equal(mockClient);
+        expect(utils.jwt).to.equal(mockJwt);
+        expect(utils.sql).to.exist;
+      } finally {
+        delete (globalThis as any)._tchRuntimeContext;
+      }
+    });
+
+    it("should prefer runtime context over standalone cache", async () => {
+      // First call to populate standalone cache
+      const standaloneUtils = await getHandlerUtils();
+      expect(standaloneUtils.jwt).to.be.undefined;
+
+      // Now set runtime context
+      const mockClient = { query: { execute: () => {} }, workflow: {} };
+      const mockJwt = { sign: () => "token" };
+
+      (globalThis as any)._tchRuntimeContext = {
+        client: mockClient,
+        jwt: mockJwt,
+      };
+
+      try {
+        const runtimeUtils = await getHandlerUtils();
+        // Should use runtime context, not standalone cache
+        expect(runtimeUtils.client).to.equal(mockClient);
+        expect(runtimeUtils.jwt).to.equal(mockJwt);
+      } finally {
+        delete (globalThis as any)._tchRuntimeContext;
+      }
+    });
+  });
+
+  describe("sql template tag", () => {
+    it("should create a sql query object with values", () => {
+      const query = sql`SELECT * FROM test WHERE id = ${123}`;
+
+      expect(query).to.exist;
+      expect(query.strings).to.have.lengthOf(2);
+      expect(query.values).to.have.lengthOf(1);
+      expect(query.values[0]).to.equal(123);
+    });
+
+    it("should handle multiple interpolated values", () => {
+      const query = sql`SELECT * FROM test WHERE id = ${123} AND name = ${"test"}`;
+
+      expect(query.values).to.have.lengthOf(2);
+      expect(query.values[0]).to.equal(123);
+      expect(query.values[1]).to.equal("test");
+    });
+
+    it("should handle nested sql queries", () => {
+      const subQuery = sql`SELECT id FROM users WHERE active = ${true}`;
+      const mainQuery = sql`SELECT * FROM orders WHERE user_id IN (${subQuery})`;
+
+      expect(mainQuery).to.exist;
+      expect(mainQuery.values).to.include(true);
+    });
+
+    it("should handle arrays of values", () => {
+      const ids = [1, 2, 3];
+      const query = sql`SELECT * FROM test WHERE id = ${ids[0]}`;
+
+      expect(query.values[0]).to.equal(1);
+    });
+
+    it("should handle boolean values", () => {
+      const query = sql`SELECT * FROM test WHERE active = ${true}`;
+
+      expect(query.values[0]).to.equal(true);
+    });
+
+    it("should handle string values with special characters", () => {
+      const query = sql`SELECT * FROM test WHERE name = ${"O'Reilly"}`;
+
+      expect(query.values[0]).to.equal("O'Reilly");
+    });
+  });
+
+  describe("sql template tag with database-qualified tables", () => {
+    it("should handle table without database config", () => {
+      interface TestModel1 {
+        id: number;
+        name: string;
+      }
+
+      const table = new OlapTable<TestModel1>("table_no_db");
+      const query = sql`SELECT * FROM ${table}`;
+
+      // Table without database should be rendered inline as `table_no_db`
+      // The sql template tag concatenates the table directly into strings
+      expect(query.strings.join("")).to.include("`table_no_db`");
+      expect(query.values).to.have.lengthOf(0);
+    });
+
+    it("should handle table with database config", () => {
+      interface TestModel2 {
+        id: number;
+        name: string;
+      }
+
+      const table = new OlapTable<TestModel2>("table_with_db", {
+        database: "my_database",
+      });
+      const query = sql`SELECT * FROM ${table}`;
+
+      // Table with database should be rendered as `my_database`.`table_with_db`
+      const fullQuery = query.strings.join("");
+      expect(fullQuery).to.include("`my_database`.`table_with_db`");
+      expect(query.values).to.have.lengthOf(0);
+    });
+
+    it("should handle multiple tables with different database configs", () => {
+      interface TestModel3 {
+        id: number;
+        name: string;
+      }
+
+      const table1 = new OlapTable<TestModel3>("multi_table1", {
+        database: "db1",
+      });
+      const table2 = new OlapTable<TestModel3>("multi_table2"); // no database
+      const query = sql`SELECT * FROM ${table1} JOIN ${table2}`;
+
+      // Should properly interpolate both tables
+      const fullQuery = query.strings.join("");
+      expect(fullQuery).to.include("`db1`.`multi_table1`");
+      expect(fullQuery).to.include("`multi_table2`");
+      expect(query.values).to.have.lengthOf(0);
+    });
+
+    it("should handle table in WHERE clause with database config", () => {
+      interface TestModel4 {
+        id: number;
+        name: string;
+      }
+
+      const table = new OlapTable<TestModel4>("events_table", {
+        database: "analytics",
+      });
+      const userId = 123;
+      const query = sql`SELECT * FROM ${table} WHERE user_id = ${userId}`;
+
+      const fullQuery = query.strings.join("");
+      expect(fullQuery).to.include("`analytics`.`events_table`");
+      expect(query.values).to.have.lengthOf(1);
+      expect(query.values[0]).to.equal(123);
+    });
+  });
+
+  describe("Integration: getResourceClients + sql", () => {
+    it("should work together to create queries", async () => {
+      const { client } = await getResourceClients();
+      const query = sql`SELECT 1 as test`;
+
+      expect(client).to.exist;
+      expect(query).to.exist;
+      expect(client.query).to.exist;
+    });
+
+    it("should create client and sql query with custom config", async () => {
+      const { client } = await getResourceClients({
+        host: "localhost",
+        database: "test_db",
+      });
+
+      const testId = 42;
+      const query = sql`SELECT * FROM test_table WHERE id = ${testId}`;
+
+      expect(client).to.exist;
+      expect(query.values[0]).to.equal(42);
+    });
+  });
+
+  describe("getHandlerUtils with rlsContext (standalone)", () => {
+    interface TestEvent {
+      id: string;
+      org_id: string;
+    }
+
+    let testTable: OlapTable<TestEvent>;
+
+    before(() => {
+      testTable = new OlapTable<TestEvent>("RlsTestTable");
+    });
+
+    afterEach(() => {
+      getSelectRowPolicies().clear();
+    });
+
+    it("should throw when rlsContext provided but no policies registered", async () => {
+      try {
+        await getHandlerUtils({ rlsContext: { org_id: "acme" } });
+        expect.fail("Expected error for missing policies");
+      } catch (e: any) {
+        expect(e.message).to.include("no SelectRowPolicy primitives");
+      }
+    });
+
+    it("should use a different ClickHouse client than the base for RLS queries", async () => {
+      new SelectRowPolicy("test_rls_policy", {
+        tables: [testTable],
+        column: "org_id",
+        claim: "org_id",
+      });
+
+      const baseUtils = await getHandlerUtils();
+      const rlsUtils = await getHandlerUtils({
+        rlsContext: { org_id: "acme" },
+      });
+
+      const baseClient = baseUtils.client.query.client;
+      const rlsClient = rlsUtils.client.query.client;
+      expect(rlsClient).to.not.equal(baseClient);
+    });
+
+    it("should cache the RLS client across rlsContext calls", async () => {
+      new SelectRowPolicy("test_rls_cached", {
+        tables: [testTable],
+        column: "org_id",
+        claim: "org_id",
+      });
+
+      const rlsUtils1 = await getHandlerUtils({
+        rlsContext: { org_id: "acme" },
+      });
+      const rlsUtils2 = await getHandlerUtils({
+        rlsContext: { org_id: "other" },
+      });
+
+      expect(rlsUtils1.client.query.client).to.equal(
+        rlsUtils2.client.query.client,
+      );
+    });
+
+    it("should return the base client when no rlsContext even with policies registered", async () => {
+      new SelectRowPolicy("test_rls_nocontext", {
+        tables: [testTable],
+        column: "org_id",
+        claim: "org_id",
+      });
+
+      const utils1 = await getHandlerUtils();
+      const utils2 = await getHandlerUtils();
+      expect(utils1.client).to.equal(utils2.client);
+    });
+  });
+
+  describe("webAppHelpers deprecation", () => {
+    describe("expressMiddleware", () => {
+      it("should log deprecation warning when called", async () => {
+        const { matched } = await captureWarnings(
+          () => expressMiddleware(),
+          /\[DEPRECATED\].*expressMiddleware/,
+        );
+        expect(matched).to.be.true;
+      });
+
+      it("should still return a working middleware function", async () => {
+        const { result: middleware } = await captureWarnings(() =>
+          expressMiddleware(),
+        );
+        expect(middleware).to.be.a("function");
+
+        // Test middleware behavior
+        const req: any = { raw: { tch: { client: "test" } } };
+        const res: any = {};
+        let nextCalled = false;
+        const next = () => {
+          nextCalled = true;
+        };
+
+        middleware(req, res, next);
+        expect(nextCalled).to.be.true;
+        expect(req.tch).to.deep.equal({ client: "test" });
+      });
+    });
+  });
+});

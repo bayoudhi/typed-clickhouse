@@ -1,0 +1,330 @@
+import { Pattern, TagBase } from "typia/lib/tags";
+import { tags } from "typia";
+
+export type ClickHousePrecision<P extends number> = {
+  _clickhouse_precision?: P;
+};
+
+export const DecimalRegex: "^-?\\d+(\\.\\d+)?$" = "^-?\\d+(\\.\\d+)?$";
+
+export type ClickHouseDecimal<P extends number, S extends number> = {
+  _clickhouse_precision?: P;
+  _clickhouse_scale?: S;
+} & Pattern<typeof DecimalRegex>;
+
+export type ClickHouseFixedStringSize<N extends number> = {
+  _clickhouse_fixed_string_size?: N;
+};
+
+/**
+ * FixedString(N) - Fixed-length string of exactly N bytes.
+ *
+ * ClickHouse stores exactly N bytes, padding shorter values with null bytes.
+ * Values exceeding N bytes will throw an exception.
+ *
+ * Use for binary data: hashes, IP addresses, UUIDs, MAC addresses.
+ *
+ * @example
+ * interface BinaryData {
+ *   md5_hash: string & FixedString<16>;    // 16-byte MD5
+ *   sha256_hash: string & FixedString<32>; // 32-byte SHA256
+ * }
+ */
+export type FixedString<N extends number> = string &
+  ClickHouseFixedStringSize<N>;
+
+export type ClickHouseByteSize<N extends number> = {
+  _clickhouse_byte_size?: N;
+};
+
+export type LowCardinality = {
+  _LowCardinality?: true;
+};
+
+// ClickHouse-friendly helper aliases for clarity in user schemas
+// These are erased at compile time but guide the ClickHouse mapping logic.
+export type DateTime = Date;
+export type DateTime64<P extends number> = Date & ClickHousePrecision<P>;
+
+export type DateTimeString = string & tags.Format<"date-time">;
+/**
+ * JS Date objects cannot hold microsecond precision.
+ * Use string as the runtime type to avoid losing information.
+ */
+export type DateTime64String<P extends number> = string &
+  tags.Format<"date-time"> &
+  ClickHousePrecision<P>;
+
+// Numeric convenience tags mirroring ClickHouse integer and float families
+export type Float32 = number & ClickHouseFloat<"float32">;
+export type Float64 = number & ClickHouseFloat<"float64">;
+
+export type Int8 = number & ClickHouseInt<"int8">;
+export type Int16 = number & ClickHouseInt<"int16">;
+export type Int32 = number & ClickHouseInt<"int32">;
+export type Int64 = number & ClickHouseInt<"int64">;
+
+export type UInt8 = number & ClickHouseInt<"uint8">;
+export type UInt16 = number & ClickHouseInt<"uint16">;
+export type UInt32 = number & ClickHouseInt<"uint32">;
+export type UInt64 = number & ClickHouseInt<"uint64">;
+
+// Decimal(P, S) annotation
+export type Decimal<P extends number, S extends number> = string &
+  ClickHouseDecimal<P, S>;
+
+/**
+ * Attach compression codec to a column type.
+ *
+ * Any valid ClickHouse codec expression is allowed. ClickHouse validates the codec at runtime.
+ *
+ * @template T The base data type
+ * @template CodecExpr The codec expression (single codec or chain)
+ *
+ * @example
+ * interface Metrics {
+ *   // Single codec
+ *   log_blob: string & ClickHouseCodec<"ZSTD(3)">;
+ *
+ *   // Codec chain (processed left-to-right)
+ *   timestamp: Date & ClickHouseCodec<"Delta, LZ4">;
+ *   temperature: number & ClickHouseCodec<"Gorilla, ZSTD">;
+ *
+ *   // Specialized codecs
+ *   counter: number & ClickHouseCodec<"DoubleDelta">;
+ *
+ *   // Can combine with other annotations
+ *   count: UInt64 & ClickHouseCodec<"DoubleDelta, LZ4">;
+ * }
+ */
+export type ClickHouseCodec<CodecExpr extends string> = {
+  _clickhouse_codec?: CodecExpr;
+};
+
+export type ClickHouseFloat<Value extends "float32" | "float64"> = tags.Type<
+  Value extends "float32" ? "float" : "double"
+>;
+
+export type ClickHouseInt<
+  Value extends
+    | "int8"
+    | "int16"
+    | "int32"
+    | "int64"
+    // | "int128"
+    // | "int256"
+    | "uint8"
+    | "uint16"
+    | "uint32"
+    | "uint64",
+  // | "uint128"
+  // | "uint256",
+> =
+  Value extends "int32" | "int64" | "uint32" | "uint64" ? tags.Type<Value>
+  : TagBase<{
+      target: "number";
+      kind: "type";
+      value: Value;
+      validate: Value extends "int8" ? "-128 <= $input && $input <= 127"
+      : Value extends "int16" ? "-32768 <= $input && $input <= 32767"
+      : Value extends "uint8" ? "0 <= $input && $input <= 255"
+      : Value extends "uint16" ? "0 <= $input && $input <= 65535"
+      : never;
+      exclusive: true;
+      schema: {
+        type: "integer";
+      };
+    }>;
+
+/**
+ * By default, nested objects map to the `Nested` type in clickhouse.
+ * Write `nestedObject: AnotherInterfaceType & ClickHouseNamedTuple`
+ * to map AnotherInterfaceType to the named tuple type.
+ */
+export type ClickHouseNamedTuple = {
+  _clickhouse_mapped_type?: "namedTuple";
+};
+
+export type ClickHouseJson<
+  maxDynamicPaths extends number | undefined = undefined,
+  maxDynamicTypes extends number | undefined = undefined,
+  skipPaths extends string[] = [],
+  skipRegexes extends string[] = [],
+> = {
+  _clickhouse_mapped_type?: "JSON";
+  _clickhouse_json_settings?: {
+    maxDynamicPaths?: maxDynamicPaths;
+    maxDynamicTypes?: maxDynamicTypes;
+    skipPaths?: skipPaths;
+    skipRegexes?: skipRegexes;
+  };
+};
+
+// Geometry helper types
+export type ClickHousePoint = [number, number] & {
+  _clickhouse_mapped_type?: "Point";
+};
+export type ClickHouseRing = ClickHousePoint[] & {
+  _clickhouse_mapped_type?: "Ring";
+};
+export type ClickHouseLineString = ClickHousePoint[] & {
+  _clickhouse_mapped_type?: "LineString";
+};
+export type ClickHouseMultiLineString = ClickHouseLineString[] & {
+  _clickhouse_mapped_type?: "MultiLineString";
+};
+export type ClickHousePolygon = ClickHouseRing[] & {
+  _clickhouse_mapped_type?: "Polygon";
+};
+export type ClickHouseMultiPolygon = ClickHousePolygon[] & {
+  _clickhouse_mapped_type?: "MultiPolygon";
+};
+
+/**
+ * typia may have trouble handling this type.
+ * In which case, use {@link WithDefault} as a workaround
+ *
+ * @example
+ * { field: number & ClickHouseDefault<"0"> }
+ */
+export type ClickHouseDefault<SqlExpression extends string> = {
+  _clickhouse_default?: SqlExpression;
+};
+
+/**
+ * @example
+ * {
+ *   ...
+ *   timestamp: Date;
+ *   debugMessage: string & ClickHouseTTL<"timestamp + INTERVAL 1 WEEK">;
+ * }
+ */
+export type ClickHouseTTL<SqlExpression extends string> = {
+  _clickhouse_ttl?: SqlExpression;
+};
+
+/**
+ * ClickHouse MATERIALIZED column annotation.
+ * The column value is computed at INSERT time and physically stored.
+ * Cannot be explicitly inserted by users.
+ *
+ * @example
+ * interface Events {
+ *   eventTime: DateTime;
+ *   // Extract date component - computed and stored at insert time
+ *   eventDate: Date & ClickHouseMaterialized<"toDate(event_time)">;
+ *
+ *   userId: string;
+ *   // Precompute hash for fast lookups
+ *   userHash: UInt64 & ClickHouseMaterialized<"cityHash64(userId)">;
+ * }
+ *
+ * @remarks
+ * - MATERIALIZED and DEFAULT are mutually exclusive
+ * - Can be combined with ClickHouseCodec for compression
+ * - Changing the expression modifies the column in-place (existing values preserved)
+ */
+export type ClickHouseMaterialized<SqlExpression extends string> = {
+  _clickhouse_materialized?: SqlExpression;
+};
+
+/**
+ * ClickHouse ALIAS column annotation.
+ * The column value is computed on-the-fly at SELECT time and NOT physically stored.
+ * Cannot be explicitly inserted by users.
+ *
+ * @example
+ * interface Events {
+ *   eventTime: DateTime;
+ *   // Computed at query time, not stored on disk
+ *   eventDate: Date & ClickHouseAlias<"toDate(event_time)">;
+ *
+ *   firstName: string;
+ *   lastName: string;
+ *   // Virtual computed column
+ *   fullName: string & ClickHouseAlias<"concat(first_name, ' ', last_name)">;
+ * }
+ *
+ * @remarks
+ * - ALIAS, MATERIALIZED, and DEFAULT are mutually exclusive
+ * - ALIAS columns are NOT stored on disk (saves storage, costs CPU at query time)
+ * - Cannot be used in ORDER BY, PRIMARY KEY, or PARTITION BY
+ * - Can be combined with ClickHouseCodec (though rarely useful since not stored)
+ */
+export type ClickHouseAlias<SqlExpression extends string> = {
+  _clickhouse_alias?: SqlExpression;
+};
+
+/**
+ * See also {@link ClickHouseDefault}
+ *
+ * @example{ updated_at: WithDefault<Date, "now()"> }
+ */
+export type WithDefault<T, _SqlExpression extends string> = T;
+
+type IsComputed<T> =
+  "_clickhouse_alias" extends keyof T ? true
+  : "_clickhouse_materialized" extends keyof T ? true
+  : false;
+
+type HasDefault<T> = "_clickhouse_default" extends keyof T ? true : false;
+
+/** Keys whose columns are ALIAS or MATERIALIZED — excluded from inserts entirely. */
+type ComputedKeys<T> = {
+  [K in keyof T]: IsComputed<T[K]> extends true ? K : never;
+}[keyof T];
+
+/** Keys whose columns carry a ClickHouseDefault expression — optional during inserts. */
+type DefaultKeys<T> = {
+  [K in keyof T]: HasDefault<T[K]> extends true ? K : never;
+}[keyof T];
+
+/**
+ * Derive the insert-safe shape of a model:
+ * - ALIAS / MATERIALIZED columns are **omitted** (ClickHouse computes them).
+ * - DEFAULT columns become **optional** (ClickHouse fills them when absent).
+ * - All other columns remain **required**.
+ *
+ * @example
+ * interface Events {
+ *   id: Key<string>;
+ *   timestamp: Date;
+ *   eventDate: Date & ClickHouseAlias<"toDate(timestamp)">;
+ *   createdAt: Date & ClickHouseDefault<"now()">;
+ * }
+ *
+ * // Insertable<Events> ≡ { id: string; timestamp: Date; createdAt?: Date }
+ * const table = new OlapTable<Events>("events");
+ * await table.insert([{ id: "1", timestamp: new Date() }]);
+ */
+export type Insertable<T> = {
+  [K in Exclude<keyof T, ComputedKeys<T> | DefaultKeys<T>>]: T[K];
+} & {
+  [K in Exclude<DefaultKeys<T>, ComputedKeys<T>>]?: T[K];
+};
+
+/**
+ * ClickHouse table engine types supported by the library.
+ */
+export enum ClickHouseEngines {
+  MergeTree = "MergeTree",
+  ReplacingMergeTree = "ReplacingMergeTree",
+  SummingMergeTree = "SummingMergeTree",
+  AggregatingMergeTree = "AggregatingMergeTree",
+  CollapsingMergeTree = "CollapsingMergeTree",
+  VersionedCollapsingMergeTree = "VersionedCollapsingMergeTree",
+  GraphiteMergeTree = "GraphiteMergeTree",
+  S3Queue = "S3Queue",
+  S3 = "S3",
+  Buffer = "Buffer",
+  Distributed = "Distributed",
+  IcebergS3 = "IcebergS3",
+  Kafka = "Kafka",
+  Merge = "Merge",
+  ReplicatedMergeTree = "ReplicatedMergeTree",
+  ReplicatedReplacingMergeTree = "ReplicatedReplacingMergeTree",
+  ReplicatedAggregatingMergeTree = "ReplicatedAggregatingMergeTree",
+  ReplicatedSummingMergeTree = "ReplicatedSummingMergeTree",
+  ReplicatedCollapsingMergeTree = "ReplicatedCollapsingMergeTree",
+  ReplicatedVersionedCollapsingMergeTree = "ReplicatedVersionedCollapsingMergeTree",
+}

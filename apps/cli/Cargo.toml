@@ -1,0 +1,97 @@
+[package]
+name = "typed-clickhouse"
+# "0.0.1" is a sentinel (see bin.rs) that disables the library version check for dev builds.
+# The release workflow overrides this at build time; do not bump it here.
+version = "0.0.1"
+edition = "2021"
+description = "typed-clickhouse: a type-safe, code-first migration and query tool for ClickHouse"
+license = "MIT"
+readme = "../../README.md"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# FORK: Using patched sqlparser with ToSql trait for dialect-aware serialization.
+# ClickHouse requires PascalCase types (Int64, String) but Display uppercases them.
+# Upstream issue: https://github.com/apache/datafusion-sqlparser-rs/issues/2153
+# Remove this fork once upstream adds dialect-aware serialization.
+sqlparser = { git = "https://github.com/bayoudhi/datafusion-sqlparser-rs", rev = "f84bd06", features = ["visitor"] }
+itertools = "0.13.0"
+openssl = { version = "0.10", features = ["vendored"] }
+clap = { version = "4.3.17", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+thiserror = "1.0.59"
+hyper = { version = "1", features = ["full"] }
+hyper-tls = "0.6.0"
+toml = "0.5.8"
+serde = { version = "1.0", features = ["derive"] }
+config = { version = "0.13.1", features = ["toml"] }
+home = "0.5.5"
+clickhouse = { version = "0.14.0", features = ["uuid", "native-tls"] }
+handlebars = "5.1"
+# Kept for src/infrastructure/olap/clickhouse/inserter.rs's KafkaError-typed
+# OffsetCommitCallback, even though nothing constructs it anymore.
+rdkafka = { version = "0.38", features = ["ssl"] }
+convert_case = "0.6.0"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+serde_json = { version = "1.0.133", features = ["preserve_order"] }
+serde_urlencoded = "0.7"
+semver = "1.0"
+base64 = "0.22.0"
+async-recursion = "1.1.0"
+hyper-util = { version = "0.1.17", features = ["full"] }
+http-body-util = "0.1"
+lazy_static = "1.4.0"
+anyhow = "1.0"
+regex = "1.10.3"
+reqwest = { version = "0.13.1", default-features = false, features = ["stream", "json", "blocking", "query", "native-tls"] }
+chrono = { version = "0.4", features = ["serde"] }
+bytes = "1"
+futures = "0.3"
+toml_edit = "0.22.9"
+comfy-table = "7.1.1"
+crossterm = { version = "0.27.0", features = ["event-stream"] }
+csv = "1.3.0"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+sha2 = "0.10.8"
+hex = "0.4.2"
+
+tokio-stream = "0.1.16"
+jsonwebtoken = "9.3.0"
+num-traits = "0.2.19"
+async-trait = "0.1.83"
+protobuf = "3.7"
+petgraph = "0.8.1"
+logos = "0.15.0"
+
+# Monitoring
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+opentelemetry = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "81b459a102e16e644cb27ebebb0976c5234d65bb" }
+opentelemetry_sdk = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "81b459a102e16e644cb27ebebb0976c5234d65bb", features = ["rt-tokio", "logs"] }
+opentelemetry-otlp = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "81b459a102e16e644cb27ebebb0976c5234d65bb", features = ["logs", "grpc-tonic"] }
+opentelemetry-appender-tracing = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "81b459a102e16e644cb27ebebb0976c5234d65bb", features = ["experimental_span_attributes"] }
+serde_yaml = "0.9.34"
+tempfile = "3.15.0"
+
+keyring = { version = "3.6", features = ["apple-native", "linux-native"] }
+percent-encoding = "2.3.2"
+dotenvy = "0.15"
+urlencoding = "2"
+
+[dev-dependencies]
+clickhouse = { version = "0.14.0", features = ["uuid", "test-util"] }
+reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "json", "query", "native-tls"] }
+
+[build-dependencies]
+protobuf-codegen = "3.7"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+regex = "1.10"
+walkdir = "2"
+
+[features]
+used_linker = []
+
+[package.metadata.cargo-machete]
+ignored = []

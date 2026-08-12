@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "declaration": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "outDir": "dist",
+    // No `rootDir`: the dts build pulls in ../lib/src, which sits
+    // outside this package. tsup controls the output layout, so constraining
+    // tsc's emit root buys nothing and only rejects the sibling source.
+    "paths": {
+      // The dts build bundles declarations from the library's SOURCE, not its
+      // built dist/. Bundling from dist/ inlines only the entry file and leaves
+      // its relative chunk re-exports (./view-*.js) pointing at files that live
+      // in packages/lib/dist and are never shipped here — the published .d.ts
+      // then resolves to `any` for every export. Source has no chunks to dangle.
+      "@typed-clickhouse/lib": ["../lib/src/index.ts"],
+      // src/index.ts re-exports the `/serverless` subpath (the ClickHouse-only
+      // surface), not the full package, so it needs its own path mapping --
+      // "paths" entries match exact specifiers only, not subpaths of another
+      // entry.
+      "@typed-clickhouse/lib/serverless": ["../lib/src/serverless.ts"]
+    }
+  },
+  "include": ["src"]
+}

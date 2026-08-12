@@ -1,0 +1,7564 @@
+use handlebars::{no_escape, Handlebars};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use tracing::info;
+
+use super::errors::ClickhouseError;
+use super::model::ClickHouseColumn;
+use crate::framework::core::infrastructure::table::{EnumValue, OrderBy};
+use crate::infrastructure::olap::clickhouse::build_column_property_clauses;
+use crate::infrastructure::olap::clickhouse::model::{
+    wrap_and_join_column_names, AggregationFunction, ClickHouseColumnType, ClickHouseFloat,
+    ClickHouseInt, ClickHouseTable,
+};
+
+/// Format a ClickHouse setting value with proper quoting.
+/// - Numeric values (integers, floats) are not quoted
+/// - Boolean values (true, false) are not quoted
+/// - String values are quoted with single quotes
+/// - Already quoted values are preserved as-is
+pub fn format_clickhouse_setting_value(value: &str) -> String {
+    // If already quoted, use as-is
+    if value.starts_with('\'') && value.ends_with('\'') {
+        value.to_string()
+    } else if value.parse::<i64>().is_ok()
+        || value.parse::<f64>().is_ok()
+        || value == "true"
+        || value == "false"
+    {
+        // Numeric or boolean literal - no quotes
+        value.to_string()
+    } else {
+        // String value - needs quoting
+        format!("'{}'", value)
+    }
+}
+
+// Unclear if we need to add flatten_nested to the views setting as well
+static CREATE_ALIAS_TEMPLATE: &str = r#"
+CREATE VIEW IF NOT EXISTS `{{db_name}}`.`{{alias_name}}` AS SELECT * FROM `{{db_name}}`.`{{source_table_name}}`;
+"#;
+
+fn create_alias_query(
+    db_name: &str,
+    alias_name: &str,
+    source_table_name: &str,
+) -> Result<String, ClickhouseError> {
+    let mut reg = Handlebars::new();
+    reg.register_escape_fn(no_escape);
+
+    let context = json!({
+        "db_name": db_name,
+        "alias_name": alias_name,
+        "source_table_name": source_table_name,
+    });
+
+    Ok(reg.render_template(CREATE_ALIAS_TEMPLATE, &context)?)
+}
+
+static CREATE_VIEW_TEMPLATE: &str = r#"
+CREATE VIEW IF NOT EXISTS `{{db_name}}`.`{{view_name}}` AS {{view_query}};
+"#;
+
+pub fn create_view_query(
+    db_name: &str,
+    view_name: &str,
+    view_query: &str,
+) -> Result<String, ClickhouseError> {
+    let reg = Handlebars::new();
+
+    let context = json!({
+        "db_name": db_name,
+        "view_name": view_name,
+        "view_query": view_query,
+    });
+
+    Ok(reg.render_template(CREATE_VIEW_TEMPLATE, &context)?)
+}
+
+static DROP_VIEW_TEMPLATE: &str = r#"
+DROP VIEW `{{db_name}}`.`{{view_name}}`;
+"#;
+
+pub fn drop_view_query(db_name: &str, view_name: &str) -> Result<String, ClickhouseError> {
+    let reg = Handlebars::new();
+
+    let context = json!({
+        "db_name": db_name,
+        "view_name": view_name,
+    });
+
+    Ok(reg.render_template(DROP_VIEW_TEMPLATE, &context)?)
+}
+
+static UPDATE_VIEW_TEMPLATE: &str = r#"
+CREATE OR REPLACE VIEW `{{db_name}}`.`{{view_name}}` AS {{view_query}};
+"#;
+
+pub fn update_view_query(
+    db_name: &str,
+    view_name: &str,
+    view_query: &str,
+) -> Result<String, ClickhouseError> {
+    let mut reg = Handlebars::new();
+    reg.register_escape_fn(no_escape);
+
+    let context = json!({
+        "db_name": db_name,
+        "view_name": view_name,
+        "view_query": view_query,
+    });
+
+    Ok(reg.render_template(UPDATE_VIEW_TEMPLATE, &context)?)
+}
+
+pub fn create_alias_for_table(
+    db_name: &str,
+    alias_name: &str,
+    latest_table: &ClickHouseTable,
+) -> Result<String, ClickhouseError> {
+    create_alias_query(db_name, alias_name, &latest_table.name)
+}
+
+static CREATE_TABLE_TEMPLATE: &str = r#"
+CREATE TABLE IF NOT EXISTS `{{db_name}}`.`{{table_name}}`{{#if cluster_name}}
+ON CLUSTER `{{cluster_name}}`{{/if}}
+(
+{{#each fields}} `{{field_name}}` {{{field_type}}} {{field_nullable}}{{{field_properties}}}{{#unless @last}},
+{{/unless}}{{/each}}{{#if has_indexes}}, {{#each indexes}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}{{/if}}{{#if has_projections}}, {{#each projections}}{{this}}{{#unless @last}}, {{/unless}}{{/each}}{{/if}}
+)
+ENGINE = {{engine}}{{#if primary_key_string}}
+PRIMARY KEY ({{primary_key_string}}){{/if}}{{#if partition_by}}
+PARTITION BY {{partition_by}}{{/if}}{{#if sample_by}}
+SAMPLE BY {{sample_by}}{{/if}}{{#if order_by_string}}
+ORDER BY ({{order_by_string}}){{/if}}{{#if ttl_clause}}
+TTL {{ttl_clause}}{{/if}}{{#if settings}}
+SETTINGS {{settings}}{{/if}}"#;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct BufferEngine {
+    // Target database name
+    pub target_database: String,
+    // Target table name
+    pub target_table: String,
+    // Number of buffer layers (typically 16)
+    pub num_layers: u32,
+    // Minimum time in seconds before flushing
+    pub min_time: u32,
+    // Maximum time in seconds before flushing
+    pub max_time: u32,
+    // Minimum number of rows before flushing
+    pub min_rows: u64,
+    // Maximum number of rows before flushing
+    pub max_rows: u64,
+    // Minimum bytes before flushing
+    pub min_bytes: u64,
+    // Maximum bytes before flushing
+    pub max_bytes: u64,
+    // Optional flush time
+    pub flush_time: Option<u32>,
+    // Optional flush rows
+    pub flush_rows: Option<u64>,
+    // Optional flush bytes
+    pub flush_bytes: Option<u64>,
+}
+
+impl BufferEngine {
+    /// Helper function to append nested optional flush parameters for Buffer engine
+    /// Returns comma-separated string of flush parameters that are present
+    /// Validates nested optional constraint: flush_rows requires flush_time, flush_bytes requires both
+    fn append_buffer_flush_params(
+        flush_time: &Option<u32>,
+        flush_rows: &Option<u64>,
+        flush_bytes: &Option<u64>,
+    ) -> String {
+        // Warn about invalid combinations (but serialize what we can)
+        if flush_rows.is_some() && flush_time.is_none() {
+            tracing::warn!(
+                "Buffer engine has flush_rows but no flush_time - flush_rows will be ignored. \
+                 This violates ClickHouse nested optional constraint."
+            );
+        }
+        if flush_bytes.is_some() && (flush_time.is_none() || flush_rows.is_none()) {
+            tracing::warn!(
+                "Buffer engine has flush_bytes but missing flush_time or flush_rows - flush_bytes will be ignored. \
+                 This violates ClickHouse nested optional constraint."
+            );
+        }
+
+        let mut params = String::new();
+        if let Some(ft) = flush_time {
+            params.push_str(&format!(", {}", ft));
+
+            if let Some(fr) = flush_rows {
+                params.push_str(&format!(", {}", fr));
+
+                if let Some(fb) = flush_bytes {
+                    params.push_str(&format!(", {}", fb));
+                }
+            }
+        }
+        params
+    }
+
+    /// Serialize Buffer engine to string format for proto storage
+    /// Format: Buffer('database', 'table', num_layers, min_time, max_time, min_rows, max_rows, min_bytes, max_bytes[, flush_time[, flush_rows[, flush_bytes]]])
+    /// Note: flush parameters are nested optionals - you cannot skip earlier parameters
+    fn build_string(&self) -> String {
+        let mut result = format!(
+            "Buffer('{}', '{}', {}, {}, {}, {}, {}, {}, {}",
+            self.target_database,
+            self.target_table,
+            self.num_layers,
+            self.min_time,
+            self.max_time,
+            self.min_rows,
+            self.max_rows,
+            self.min_bytes,
+            self.max_bytes
+        );
+
+        result.push_str(&Self::append_buffer_flush_params(
+            &self.flush_time,
+            &self.flush_rows,
+            &self.flush_bytes,
+        ));
+        result.push(')');
+        result
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)] // S3Queue has many fields, but this is acceptable for our use case
+#[derive(Default)]
+pub enum ClickhouseEngine {
+    #[default]
+    MergeTree,
+    ReplacingMergeTree {
+        // Optional version column for deduplication
+        ver: Option<String>,
+        // Optional is_deleted column for soft deletes (requires ver)
+        is_deleted: Option<String>,
+    },
+    AggregatingMergeTree,
+    SummingMergeTree {
+        // Optional list of columns to sum
+        columns: Option<Vec<String>>,
+    },
+    CollapsingMergeTree {
+        // Sign column name indicating row type (1 = state, -1 = cancel)
+        sign: String,
+    },
+    VersionedCollapsingMergeTree {
+        // Sign column name indicating row type (1 = state, -1 = cancel)
+        sign: String,
+        // Version column name for object state versioning
+        version: String,
+    },
+    ReplicatedMergeTree {
+        // Keeper path for replication (ZooKeeper or ClickHouse Keeper)
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        keeper_path: Option<String>,
+        // Replica name
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        replica_name: Option<String>,
+    },
+    ReplicatedReplacingMergeTree {
+        // Keeper path for replication (ZooKeeper or ClickHouse Keeper)
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        keeper_path: Option<String>,
+        // Replica name
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        replica_name: Option<String>,
+        // Optional version column for deduplication
+        ver: Option<String>,
+        // Optional is_deleted column for soft deletes (requires ver)
+        is_deleted: Option<String>,
+    },
+    ReplicatedAggregatingMergeTree {
+        // Keeper path for replication (ZooKeeper or ClickHouse Keeper)
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        keeper_path: Option<String>,
+        // Replica name
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        replica_name: Option<String>,
+    },
+    ReplicatedSummingMergeTree {
+        // Keeper path for replication (ZooKeeper or ClickHouse Keeper)
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        keeper_path: Option<String>,
+        // Replica name
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        replica_name: Option<String>,
+        // Optional list of columns to sum
+        columns: Option<Vec<String>>,
+    },
+    ReplicatedCollapsingMergeTree {
+        // Keeper path for replication (ZooKeeper or ClickHouse Keeper)
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        keeper_path: Option<String>,
+        // Replica name
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        replica_name: Option<String>,
+        // Sign column name indicating row type (1 = state, -1 = cancel)
+        sign: String,
+    },
+    ReplicatedVersionedCollapsingMergeTree {
+        // Keeper path for replication (ZooKeeper or ClickHouse Keeper)
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        keeper_path: Option<String>,
+        // Replica name
+        // Optional: omit for ClickHouse Cloud which manages replication automatically
+        replica_name: Option<String>,
+        // Sign column name indicating row type (1 = state, -1 = cancel)
+        sign: String,
+        // Version column name for object state versioning
+        version: String,
+    },
+    S3Queue {
+        // Non-alterable constructor parameters - required for table creation
+        s3_path: String,
+        format: String,
+        compression: Option<String>,
+        headers: Option<std::collections::HashMap<String, String>>,
+        // Credentials for DDL generation - may be None when loaded from protocol buffer
+        aws_access_key_id: Option<String>,
+        aws_secret_access_key: Option<String>,
+    },
+    S3 {
+        // S3 path to the data file(s)
+        path: String,
+        // Data format (e.g., JSONEachRow, CSV, Parquet)
+        format: String,
+        // AWS access key ID (optional, omit for public buckets)
+        aws_access_key_id: Option<String>,
+        // AWS secret access key (optional, omit for public buckets)
+        aws_secret_access_key: Option<String>,
+        // Compression type (e.g., gzip, zstd, auto)
+        compression: Option<String>,
+        // Partition strategy
+        partition_strategy: Option<String>,
+        // Partition columns in data file
+        partition_columns_in_data_file: Option<String>,
+    },
+    Buffer(BufferEngine),
+    Distributed {
+        // Cluster name from ClickHouse configuration
+        cluster: String,
+        // Database name on the cluster
+        target_database: String,
+        // Table name on the cluster
+        target_table: String,
+        // Optional sharding key expression
+        sharding_key: Option<String>,
+        // Optional policy name
+        policy_name: Option<String>,
+    },
+    IcebergS3 {
+        // S3 path to Iceberg table root
+        path: String,
+        // Data format (Parquet or ORC)
+        format: String,
+        // AWS access key ID (optional, None for NOSIGN)
+        aws_access_key_id: Option<String>,
+        // AWS secret access key (optional)
+        aws_secret_access_key: Option<String>,
+        // Compression type (optional: gzip, zstd, etc.)
+        compression: Option<String>,
+    },
+    Kafka {
+        // Constructor parameters: Kafka('broker', 'topic', 'group', 'format')
+        broker_list: String,
+        topic_list: String,
+        group_name: String,
+        format: String,
+    },
+    Merge {
+        // Database to scan for source tables (literal name, currentDatabase(), or REGEXP(...))
+        source_database: String,
+        // Regex pattern to match table names in the source database
+        tables_regexp: String,
+    },
+}
+
+// The implementation is not symetric between TryFrom and Into so we
+// need to allow this clippy warning
+#[allow(clippy::from_over_into)]
+impl Into<String> for ClickhouseEngine {
+    fn into(self) -> String {
+        match self {
+            ClickhouseEngine::MergeTree => "MergeTree".to_string(),
+            ClickhouseEngine::ReplacingMergeTree { ver, is_deleted } => {
+                Self::serialize_replacing_merge_tree(&ver, &is_deleted)
+            }
+            ClickhouseEngine::AggregatingMergeTree => "AggregatingMergeTree".to_string(),
+            ClickhouseEngine::SummingMergeTree { columns } => {
+                Self::serialize_summing_merge_tree(&columns)
+            }
+            ClickhouseEngine::CollapsingMergeTree { sign } => {
+                Self::serialize_collapsing_merge_tree(&sign)
+            }
+            ClickhouseEngine::VersionedCollapsingMergeTree { sign, version } => {
+                Self::serialize_versioned_collapsing_merge_tree(&sign, &version)
+            }
+            ClickhouseEngine::ReplicatedMergeTree {
+                keeper_path,
+                replica_name,
+            } => Self::serialize_replicated_merge_tree(&keeper_path, &replica_name),
+            ClickhouseEngine::ReplicatedReplacingMergeTree {
+                keeper_path,
+                replica_name,
+                ver,
+                is_deleted,
+            } => Self::serialize_replicated_replacing_merge_tree(
+                &keeper_path,
+                &replica_name,
+                &ver,
+                &is_deleted,
+            ),
+            ClickhouseEngine::ReplicatedAggregatingMergeTree {
+                keeper_path,
+                replica_name,
+            } => Self::serialize_replicated_aggregating_merge_tree(&keeper_path, &replica_name),
+            ClickhouseEngine::ReplicatedSummingMergeTree {
+                keeper_path,
+                replica_name,
+                columns,
+            } => {
+                Self::serialize_replicated_summing_merge_tree(&keeper_path, &replica_name, &columns)
+            }
+            ClickhouseEngine::ReplicatedCollapsingMergeTree {
+                keeper_path,
+                replica_name,
+                sign,
+            } => {
+                Self::serialize_replicated_collapsing_merge_tree(&keeper_path, &replica_name, &sign)
+            }
+            ClickhouseEngine::ReplicatedVersionedCollapsingMergeTree {
+                keeper_path,
+                replica_name,
+                sign,
+                version,
+            } => Self::serialize_replicated_versioned_collapsing_merge_tree(
+                &keeper_path,
+                &replica_name,
+                &sign,
+                &version,
+            ),
+            ClickhouseEngine::S3Queue {
+                s3_path,
+                format,
+                compression,
+                headers,
+                aws_access_key_id,
+                aws_secret_access_key,
+                ..
+            } => Self::serialize_s3queue_for_display(
+                &s3_path,
+                &format,
+                &compression,
+                &headers,
+                &aws_access_key_id,
+                &aws_secret_access_key,
+            ),
+            ClickhouseEngine::S3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                compression,
+                partition_strategy,
+                partition_columns_in_data_file,
+            } => Self::serialize_s3_for_display(
+                &path,
+                &format,
+                &aws_access_key_id,
+                &aws_secret_access_key,
+                &compression,
+                &partition_strategy,
+                &partition_columns_in_data_file,
+            ),
+            ClickhouseEngine::Buffer(buffer_engine) => buffer_engine.build_string(),
+            ClickhouseEngine::Distributed {
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            } => Self::serialize_distributed(
+                &cluster,
+                &target_database,
+                &target_table,
+                &sharding_key,
+                &policy_name,
+            ),
+            ClickhouseEngine::IcebergS3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                compression,
+            } => Self::serialize_icebergs3_for_display(
+                &path,
+                &format,
+                &aws_access_key_id,
+                &aws_secret_access_key,
+                &compression,
+            ),
+            ClickhouseEngine::Kafka {
+                broker_list,
+                topic_list,
+                group_name,
+                format,
+            } => Self::serialize_kafka_for_display(&broker_list, &topic_list, &group_name, &format),
+            ClickhouseEngine::Merge {
+                source_database,
+                tables_regexp,
+            } => Self::serialize_merge(&source_database, &tables_regexp),
+            // this might sound obvious, but when you edit this function
+            // please check if you have changed the parsing side (try_from) as well
+            // especially if you're an LLM
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a str> for ClickhouseEngine {
+    type Error = &'a str;
+
+    fn try_from(value: &'a str) -> Result<Self, &'a str> {
+        // Try to parse distributed variants first (SharedMergeTree, ReplicatedMergeTree)
+        if let Some(engine) = Self::try_parse_distributed_engine(value) {
+            return engine;
+        }
+
+        // Try to parse regular engines (with or without Shared/Replicated prefix)
+        Self::parse_regular_engine(value)
+    }
+}
+
+impl ClickhouseEngine {
+    /// Try to parse distributed engine variants (Shared/Replicated)
+    /// Returns Some(Result) if it matches a distributed pattern, None otherwise
+    fn try_parse_distributed_engine(value: &str) -> Option<Result<Self, &str>> {
+        // Handle SharedReplacingMergeTree and ReplicatedReplacingMergeTree
+        if value.starts_with("SharedReplacingMergeTree(")
+            || value.starts_with("ReplicatedReplacingMergeTree(")
+        {
+            return Some(Self::parse_distributed_replacing_merge_tree(value));
+        }
+
+        // Handle SharedMergeTree and ReplicatedMergeTree
+        if value.starts_with("SharedMergeTree(") || value.starts_with("ReplicatedMergeTree(") {
+            return Some(Self::parse_distributed_merge_tree(value));
+        }
+
+        // Handle SharedAggregatingMergeTree and ReplicatedAggregatingMergeTree
+        if value.starts_with("SharedAggregatingMergeTree(")
+            || value.starts_with("ReplicatedAggregatingMergeTree(")
+        {
+            return Some(Self::parse_distributed_aggregating_merge_tree(value));
+        }
+
+        // Handle SharedSummingMergeTree and ReplicatedSummingMergeTree
+        if value.starts_with("SharedSummingMergeTree(")
+            || value.starts_with("ReplicatedSummingMergeTree(")
+        {
+            return Some(Self::parse_distributed_summing_merge_tree(value));
+        }
+
+        // Handle SharedCollapsingMergeTree and ReplicatedCollapsingMergeTree
+        if value.starts_with("SharedCollapsingMergeTree(")
+            || value.starts_with("ReplicatedCollapsingMergeTree(")
+        {
+            return Some(Self::parse_distributed_collapsing_merge_tree(value));
+        }
+
+        // Handle SharedVersionedCollapsingMergeTree and ReplicatedVersionedCollapsingMergeTree
+        if value.starts_with("SharedVersionedCollapsingMergeTree(")
+            || value.starts_with("ReplicatedVersionedCollapsingMergeTree(")
+        {
+            return Some(Self::parse_distributed_versioned_collapsing_merge_tree(
+                value,
+            ));
+        }
+
+        None
+    }
+
+    /// Parse SharedReplacingMergeTree or ReplicatedReplacingMergeTree
+    /// Format: (path, replica [, ver [, is_deleted]]) or () for automatic configuration
+    fn parse_distributed_replacing_merge_tree(value: &str) -> Result<Self, &str> {
+        let content = Self::extract_engine_content(
+            value,
+            &["SharedReplacingMergeTree(", "ReplicatedReplacingMergeTree("],
+        )?;
+
+        let params = parse_quoted_csv(content);
+
+        // Check if this is a Replicated variant (not Shared)
+        let is_replicated = value.starts_with("ReplicatedReplacingMergeTree(");
+
+        if is_replicated {
+            // Handle empty parameters (automatic configuration)
+            if params.is_empty() {
+                return Ok(ClickhouseEngine::ReplicatedReplacingMergeTree {
+                    keeper_path: None,
+                    replica_name: None,
+                    ver: None,
+                    is_deleted: None,
+                });
+            }
+
+            // Require at least 2 params if any are provided, and at most 4
+            // (keeper_path, replica_name, ver, is_deleted)
+            if params.len() < 2 || params.len() > 4 {
+                return Err(value);
+            }
+
+            // First two params are keeper_path and replica_name
+            let (keeper_path, replica_name) = Self::extract_replication_params(&params);
+
+            // Optional 3rd param is ver, optional 4th is is_deleted
+            let ver = params.get(2).cloned();
+            let is_deleted = params.get(3).cloned();
+
+            Ok(ClickhouseEngine::ReplicatedReplacingMergeTree {
+                keeper_path,
+                replica_name,
+                ver,
+                is_deleted,
+            })
+        } else {
+            // For SharedReplacingMergeTree with parentheses, keeper_path and replica_name are required
+            // The 3rd and 4th params (if present) are ver and is_deleted.
+            // Require 2-4 params (can't be empty with parentheses, and max 4)
+            if params.len() < 2 || params.len() > 4 {
+                return Err(value);
+            }
+
+            // Skip the first two params (keeper_path and replica_name) for Shared engines
+            // Optional 3rd param is ver, optional 4th is is_deleted
+            let ver = params.get(2).cloned();
+            let is_deleted = params.get(3).cloned();
+
+            // SharedReplacingMergeTree normalizes to ReplacingMergeTree
+            Ok(ClickhouseEngine::ReplacingMergeTree { ver, is_deleted })
+        }
+    }
+
+    /// Normalize replication parameters - convert defaults back to None
+    /// This ensures that user code without explicit paths matches tables created with defaults
+    fn normalize_replication_params(
+        keeper_path: Option<String>,
+        replica_name: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        const DEFAULT_KEEPER_PATH: &str = "/clickhouse/tables/{uuid}/{shard}";
+        const DEFAULT_REPLICA_NAME: &str = "{replica}";
+
+        match (keeper_path, replica_name) {
+            (Some(path), Some(name))
+                if path == DEFAULT_KEEPER_PATH && name == DEFAULT_REPLICA_NAME =>
+            {
+                (None, None)
+            }
+            (path, name) => (path, name),
+        }
+    }
+
+    /// Extract and normalize replication params from parsed CSV parameters
+    /// Returns normalized (keeper_path, replica_name) tuple
+    fn extract_replication_params(params: &[String]) -> (Option<String>, Option<String>) {
+        let keeper_path = params.first().cloned();
+        let replica_name = params.get(1).cloned();
+        Self::normalize_replication_params(keeper_path, replica_name)
+    }
+
+    /// Parse SharedMergeTree or ReplicatedMergeTree
+    /// Format: (path, replica) or () for automatic configuration
+    fn parse_distributed_merge_tree(value: &str) -> Result<Self, &str> {
+        let content =
+            Self::extract_engine_content(value, &["SharedMergeTree(", "ReplicatedMergeTree("])?;
+
+        let params = parse_quoted_csv(content);
+
+        // Check if this is a Replicated variant (not Shared)
+        let is_replicated = value.starts_with("ReplicatedMergeTree(");
+
+        if is_replicated {
+            // Handle empty parameters (automatic configuration)
+            if params.is_empty() {
+                return Ok(ClickhouseEngine::ReplicatedMergeTree {
+                    keeper_path: None,
+                    replica_name: None,
+                });
+            }
+
+            // Require exactly 2 params if any are provided
+            if params.len() < 2 {
+                return Err(value);
+            }
+
+            // First two params are keeper_path and replica_name
+            let (keeper_path, replica_name) = Self::extract_replication_params(&params);
+
+            Ok(ClickhouseEngine::ReplicatedMergeTree {
+                keeper_path,
+                replica_name,
+            })
+        } else {
+            // SharedMergeTree with parentheses requires exactly 2 params (keeper_path and replica_name)
+            if params.len() < 2 {
+                return Err(value);
+            }
+
+            // SharedMergeTree normalizes to MergeTree
+            Ok(ClickhouseEngine::MergeTree)
+        }
+    }
+
+    /// Parse SharedAggregatingMergeTree or ReplicatedAggregatingMergeTree
+    /// Format: (path, replica) or () for automatic configuration
+    fn parse_distributed_aggregating_merge_tree(value: &str) -> Result<Self, &str> {
+        let content = Self::extract_engine_content(
+            value,
+            &[
+                "SharedAggregatingMergeTree(",
+                "ReplicatedAggregatingMergeTree(",
+            ],
+        )?;
+
+        let params = parse_quoted_csv(content);
+
+        // Check if this is a Replicated variant (not Shared)
+        let is_replicated = value.starts_with("ReplicatedAggregatingMergeTree(");
+
+        if is_replicated {
+            // Handle empty parameters (automatic configuration)
+            if params.is_empty() {
+                return Ok(ClickhouseEngine::ReplicatedAggregatingMergeTree {
+                    keeper_path: None,
+                    replica_name: None,
+                });
+            }
+
+            // Require exactly 2 params if any are provided
+            if params.len() < 2 {
+                return Err(value);
+            }
+
+            // First two params are keeper_path and replica_name
+            let (keeper_path, replica_name) = Self::extract_replication_params(&params);
+
+            Ok(ClickhouseEngine::ReplicatedAggregatingMergeTree {
+                keeper_path,
+                replica_name,
+            })
+        } else {
+            // SharedAggregatingMergeTree with parentheses requires exactly 2 params (keeper_path and replica_name)
+            if params.len() < 2 {
+                return Err(value);
+            }
+
+            // SharedAggregatingMergeTree normalizes to AggregatingMergeTree
+            Ok(ClickhouseEngine::AggregatingMergeTree)
+        }
+    }
+
+    /// Parse SharedSummingMergeTree or ReplicatedSummingMergeTree
+    /// Format: (path, replica [, columns...]) or () for automatic configuration
+    fn parse_distributed_summing_merge_tree(value: &str) -> Result<Self, &str> {
+        let content = Self::extract_engine_content(
+            value,
+            &["SharedSummingMergeTree(", "ReplicatedSummingMergeTree("],
+        )?;
+
+        let params = parse_quoted_csv(content);
+
+        // Check if this is a Replicated variant (not Shared)
+        let is_replicated = value.starts_with("ReplicatedSummingMergeTree(");
+
+        if is_replicated {
+            // Handle empty parameters (automatic configuration)
+            if params.is_empty() {
+                return Ok(ClickhouseEngine::ReplicatedSummingMergeTree {
+                    keeper_path: None,
+                    replica_name: None,
+                    columns: None,
+                });
+            }
+
+            // Require at least 2 params if any are provided
+            if params.len() < 2 {
+                return Err(value);
+            }
+
+            // First two params are keeper_path and replica_name
+            let (keeper_path, replica_name) = Self::extract_replication_params(&params);
+
+            // Additional params are column names (if any)
+            let columns = if params.len() > 2 {
+                Some(params[2..].to_vec())
+            } else {
+                None
+            };
+
+            Ok(ClickhouseEngine::ReplicatedSummingMergeTree {
+                keeper_path,
+                replica_name,
+                columns,
+            })
+        } else {
+            // For SharedSummingMergeTree with parentheses, keeper_path and replica_name are required
+            // Additional params (if any) are column names.
+            // Require at least 2 params (can't be empty with parentheses)
+            if params.len() < 2 {
+                return Err(value);
+            }
+
+            // Skip the first two params (keeper_path and replica_name) for Shared engines
+            // Additional params are column names (if any)
+            let columns = if params.len() > 2 {
+                Some(params[2..].to_vec())
+            } else {
+                None
+            };
+
+            // SharedSummingMergeTree normalizes to SummingMergeTree
+            Ok(ClickhouseEngine::SummingMergeTree { columns })
+        }
+    }
+
+    /// Parse SharedCollapsingMergeTree or ReplicatedCollapsingMergeTree
+    /// Format: (path, replica, sign) or (sign) for automatic configuration
+    fn parse_distributed_collapsing_merge_tree(value: &str) -> Result<Self, &str> {
+        let content = Self::extract_engine_content(
+            value,
+            &[
+                "SharedCollapsingMergeTree(",
+                "ReplicatedCollapsingMergeTree(",
+            ],
+        )?;
+
+        let params = parse_quoted_csv(content);
+
+        // Check if this is a Replicated variant (not Shared)
+        let is_replicated = value.starts_with("ReplicatedCollapsingMergeTree(");
+
+        if is_replicated {
+            // For Replicated variant, we need either:
+            // - 1 param: sign (cloud mode)
+            // - 3 params: keeper_path, replica_name, sign
+            if params.is_empty() {
+                return Err(value);
+            }
+
+            if params.len() == 1 {
+                // Cloud mode: only sign parameter
+                return Ok(ClickhouseEngine::ReplicatedCollapsingMergeTree {
+                    keeper_path: None,
+                    replica_name: None,
+                    sign: params[0].clone(),
+                });
+            }
+
+            if params.len() != 3 {
+                return Err(value);
+            }
+
+            // Full parameters: keeper_path, replica_name, sign
+            let (keeper_path, replica_name) = Self::extract_replication_params(&params);
+            let sign = params[2].clone();
+
+            Ok(ClickhouseEngine::ReplicatedCollapsingMergeTree {
+                keeper_path,
+                replica_name,
+                sign,
+            })
+        } else {
+            // For SharedCollapsingMergeTree, we need 3 params: keeper_path, replica_name, sign
+            if params.len() != 3 {
+                return Err(value);
+            }
+
+            // SharedCollapsingMergeTree normalizes to CollapsingMergeTree
+            // Skip the first two params (keeper_path and replica_name)
+            Ok(ClickhouseEngine::CollapsingMergeTree {
+                sign: params[2].clone(),
+            })
+        }
+    }
+
+    /// Parse SharedVersionedCollapsingMergeTree or ReplicatedVersionedCollapsingMergeTree
+    /// Format: (path, replica, sign, version) or (sign, version) for automatic configuration
+    fn parse_distributed_versioned_collapsing_merge_tree(value: &str) -> Result<Self, &str> {
+        let content = Self::extract_engine_content(
+            value,
+            &[
+                "SharedVersionedCollapsingMergeTree(",
+                "ReplicatedVersionedCollapsingMergeTree(",
+            ],
+        )?;
+
+        let params = parse_quoted_csv(content);
+
+        // Check if this is a Replicated variant (not Shared)
+        let is_replicated = value.starts_with("ReplicatedVersionedCollapsingMergeTree(");
+
+        if is_replicated {
+            // For Replicated variant, we need either:
+            // - 2 params: sign, version (cloud mode)
+            // - 4 params: keeper_path, replica_name, sign, version
+            if params.is_empty() {
+                return Err(value);
+            }
+
+            if params.len() == 2 {
+                // Cloud mode: only sign and version parameters
+                return Ok(ClickhouseEngine::ReplicatedVersionedCollapsingMergeTree {
+                    keeper_path: None,
+                    replica_name: None,
+                    sign: params[0].clone(),
+                    version: params[1].clone(),
+                });
+            }
+
+            if params.len() != 4 {
+                return Err(value);
+            }
+
+            // Full parameters: keeper_path, replica_name, sign, version
+            let (keeper_path, replica_name) = Self::extract_replication_params(&params);
+            let sign = params[2].clone();
+            let version = params[3].clone();
+
+            Ok(ClickhouseEngine::ReplicatedVersionedCollapsingMergeTree {
+                keeper_path,
+                replica_name,
+                sign,
+                version,
+            })
+        } else {
+            // For SharedVersionedCollapsingMergeTree, we need 4 params: keeper_path, replica_name, sign, version
+            if params.len() != 4 {
+                return Err(value);
+            }
+
+            // SharedVersionedCollapsingMergeTree normalizes to VersionedCollapsingMergeTree
+            // Skip the first two params (keeper_path and replica_name)
+            Ok(ClickhouseEngine::VersionedCollapsingMergeTree {
+                sign: params[2].clone(),
+                version: params[3].clone(),
+            })
+        }
+    }
+
+    /// Extract content from engine string with given prefixes
+    /// Returns the content within parentheses
+    fn extract_engine_content<'a>(value: &'a str, prefixes: &[&str]) -> Result<&'a str, &'a str> {
+        for prefix in prefixes {
+            if value.starts_with(prefix) {
+                if let Some(content) = value.strip_prefix(prefix).and_then(|s| s.strip_suffix(")"))
+                {
+                    return Ok(content);
+                }
+            }
+        }
+        Err(value)
+    }
+
+    /// Parse replicated engine without parameters (ClickHouse Cloud mode)
+    fn parse_replicated_engine_no_params(value: &str) -> Option<Self> {
+        match value {
+            "ReplicatedMergeTree" => Some(ClickhouseEngine::ReplicatedMergeTree {
+                keeper_path: None,
+                replica_name: None,
+            }),
+            "ReplicatedReplacingMergeTree" => {
+                Some(ClickhouseEngine::ReplicatedReplacingMergeTree {
+                    keeper_path: None,
+                    replica_name: None,
+                    ver: None,
+                    is_deleted: None,
+                })
+            }
+            "ReplicatedAggregatingMergeTree" => {
+                Some(ClickhouseEngine::ReplicatedAggregatingMergeTree {
+                    keeper_path: None,
+                    replica_name: None,
+                })
+            }
+            "ReplicatedSummingMergeTree" => Some(ClickhouseEngine::ReplicatedSummingMergeTree {
+                keeper_path: None,
+                replica_name: None,
+                columns: None,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Parse regular engines (including those with Shared/Replicated prefix but no parameters)
+    fn parse_regular_engine(value: &str) -> Result<Self, &str> {
+        // Check for Replicated engines without parameters first
+        if let Some(engine) = Self::parse_replicated_engine_no_params(value) {
+            return Ok(engine);
+        }
+
+        // Strip Shared prefix if present (for engines without parameters)
+        // Shared engines normalize to their base engine
+        let engine_name = value.strip_prefix("Shared").unwrap_or(value);
+
+        match engine_name {
+            "MergeTree" => Ok(ClickhouseEngine::MergeTree),
+            "ReplacingMergeTree" => Ok(ClickhouseEngine::ReplacingMergeTree {
+                ver: None,
+                is_deleted: None,
+            }),
+            s if s.starts_with("ReplacingMergeTree(") => {
+                Self::parse_regular_replacing_merge_tree(s, value)
+            }
+            "AggregatingMergeTree" => Ok(ClickhouseEngine::AggregatingMergeTree),
+            "SummingMergeTree" => Ok(ClickhouseEngine::SummingMergeTree { columns: None }),
+            s if s.starts_with("SummingMergeTree(") => {
+                Self::parse_regular_summing_merge_tree(s, value)
+            }
+            s if s.starts_with("CollapsingMergeTree(") => {
+                Self::parse_regular_collapsing_merge_tree(s, value)
+            }
+            s if s.starts_with("VersionedCollapsingMergeTree(") => {
+                Self::parse_regular_versioned_collapsing_merge_tree(s, value)
+            }
+            s if s.starts_with("S3Queue(") => Self::parse_regular_s3queue(s, value),
+            s if s.starts_with("S3(") => Self::parse_regular_s3(s, value),
+            s if s.starts_with("Buffer(") => Self::parse_regular_buffer(s, value),
+            s if s.starts_with("Distributed(") => Self::parse_regular_distributed(s, value),
+            s if s.starts_with("Iceberg(") => Self::parse_regular_icebergs3(s, value),
+            s if s.starts_with("Kafka(") => Self::parse_regular_kafka(s, value),
+            s if s.starts_with("Merge(") => Self::parse_regular_merge(s, value),
+            _ => Err(value),
+        }
+    }
+
+    /// Parse regular ReplacingMergeTree with parameters
+    fn parse_regular_replacing_merge_tree<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        if let Some(content) = engine_name
+            .strip_prefix("ReplacingMergeTree(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
+            Self::parse_replacing_merge_tree(content).map_err(|_| original_value)
+        } else {
+            Err(original_value)
+        }
+    }
+
+    /// Parse regular S3Queue with parameters
+    fn parse_regular_s3queue<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        if let Some(content) = engine_name
+            .strip_prefix("S3Queue(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
+            Self::parse_s3queue(content).map_err(|_| original_value)
+        } else {
+            Err(original_value)
+        }
+    }
+
+    /// Parse regular S3 with parameters
+    fn parse_regular_s3<'a>(engine_name: &str, original_value: &'a str) -> Result<Self, &'a str> {
+        if let Some(content) = engine_name
+            .strip_prefix("S3(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
+            Self::parse_s3(content).map_err(|_| original_value)
+        } else {
+            Err(original_value)
+        }
+    }
+
+    /// Parse regular Kafka with parameters
+    fn parse_regular_kafka<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        if let Some(content) = engine_name
+            .strip_prefix("Kafka(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
+            Self::parse_kafka(content).map_err(|_| original_value)
+        } else {
+            Err(original_value)
+        }
+    }
+
+    /// Parse Merge engine from ClickHouse's `create_table_query` format.
+    ///
+    /// Uses a custom parser instead of `parse_quoted_csv` because `source_database`
+    /// can be an unquoted expression with nested parens/quotes (e.g., `REGEXP('...')`).
+    fn parse_regular_merge<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        let content = engine_name
+            .strip_prefix("Merge(")
+            .and_then(|s| s.strip_suffix(")"))
+            .ok_or(original_value)?;
+
+        // tables_regexp is always the last single-quoted string.
+        // Search from the end so REGEXP('...') in source_database doesn't confuse us.
+        let last_quote = content.rfind('\'').ok_or(original_value)?;
+        let open_quote = content[..last_quote].rfind('\'').ok_or(original_value)?;
+        let tables_regexp = &content[open_quote + 1..last_quote];
+
+        // Everything before the tables_regexp quoted string is source_database
+        let source_database = content[..open_quote].trim().trim_end_matches(',').trim();
+
+        // Strip surrounding quotes from literal database names ('my_db' → my_db)
+        // but keep expressions like REGEXP('...') intact
+        let source_database = if source_database.len() >= 2
+            && source_database.starts_with('\'')
+            && source_database.ends_with('\'')
+        {
+            &source_database[1..source_database.len() - 1]
+        } else {
+            source_database
+        };
+
+        if source_database.is_empty() || tables_regexp.is_empty() {
+            return Err(original_value);
+        }
+
+        // ClickHouse stores backslashes double-escaped (\d → \\d). Unescape to match user intent.
+        Ok(ClickhouseEngine::Merge {
+            source_database: source_database.replace("\\\\", "\\"),
+            tables_regexp: tables_regexp.replace("\\\\", "\\"),
+        })
+    }
+
+    /// Parse regular Iceberg with parameters
+    fn parse_regular_icebergs3<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        if let Some(content) = engine_name
+            .strip_prefix("Iceberg(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
+            Self::parse_icebergs3(content).map_err(|_| original_value)
+        } else {
+            Err(original_value)
+        }
+    }
+
+    /// Parse Iceberg engine content
+    /// Format: Iceberg('path', [NOSIGN | 'key', 'secret'], 'format'[, 'compression'])
+    /// or simplified: Iceberg('path', 'format'[, 'compression'])
+    fn parse_icebergs3(content: &str) -> Result<Self, String> {
+        let parts = parse_quoted_csv(content);
+
+        if parts.len() < 2 {
+            return Err("Iceberg requires at least path and format".to_string());
+        }
+
+        let path = parts[0].clone();
+
+        // Parse authentication and format based on ClickHouse IcebergS3 syntax:
+        // ENGINE = IcebergS3(url, [, NOSIGN | access_key_id, secret_access_key, [session_token]], format, [,compression])
+        //
+        // Possible patterns:
+        // 1. Iceberg('path', 'format') - no auth
+        // 2. Iceberg('path', 'format', 'compression') - no auth with compression
+        // 3. Iceberg('path', NOSIGN, 'format') - explicit NOSIGN
+        // 4. Iceberg('path', 'access_key_id', 'secret_access_key', 'format') - with credentials
+        // 5. Iceberg('path', 'access_key_id', 'secret_access_key', 'format', 'compression') - with credentials and compression
+        let (format, aws_access_key_id, aws_secret_access_key, extra_params_start) = if parts.len()
+            >= 2
+            && parts[1].to_uppercase() == "NOSIGN"
+        {
+            // NOSIGN keyword (no authentication) - format is at position 2
+            if parts.len() < 3 {
+                return Err("Iceberg with NOSIGN requires format parameter".to_string());
+            }
+            (parts[2].clone(), None, None, 3)
+        } else if parts.len() >= 2 {
+            let format_at_pos1 = parts[1].to_uppercase();
+            let is_pos1_format = format_at_pos1 == "PARQUET" || format_at_pos1 == "ORC";
+
+            if is_pos1_format {
+                // Format is at position 1, no credentials
+                (parts[1].clone(), None, None, 2)
+            } else if parts.len() >= 4 && !parts[1].is_empty() && !parts[2].is_empty() {
+                // Check if parts[3] is a format (credentials case)
+                let format_at_pos3 = parts[3].to_uppercase();
+                if format_at_pos3 == "PARQUET" || format_at_pos3 == "ORC" {
+                    // parts[1] and parts[2] are credentials, format at position 3
+                    (
+                        parts[3].clone(),
+                        Some(parts[1].clone()),
+                        Some(parts[2].clone()),
+                        4,
+                    )
+                } else {
+                    // Ambiguous case - neither pos1 nor pos3 is a valid format
+                    return Err(format!(
+                            "Invalid Iceberg format. Expected 'Parquet' or 'ORC' at position 2 or 4, got '{}' and '{}'",
+                            parts[1], parts[3]
+                        ));
+                }
+            } else {
+                // Not enough parts for credentials, but parts[1] is not a valid format
+                return Err(format!(
+                    "Invalid Iceberg format '{}'. Must be 'Parquet' or 'ORC'",
+                    parts[1]
+                ));
+            }
+        } else {
+            return Err("Iceberg requires at least path and format parameters".to_string());
+        };
+
+        // Parse optional compression (next parameter after format)
+        let compression = if parts.len() > extra_params_start && parts[extra_params_start] != "null"
+        {
+            Some(parts[extra_params_start].clone())
+        } else {
+            None
+        };
+
+        Ok(ClickhouseEngine::IcebergS3 {
+            path,
+            format,
+            aws_access_key_id,
+            aws_secret_access_key,
+            compression,
+        })
+    }
+
+    /// Parse regular SummingMergeTree with parameters
+    fn parse_regular_summing_merge_tree<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        if let Some(content) = engine_name
+            .strip_prefix("SummingMergeTree(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
+            Self::parse_summing_merge_tree(content).map_err(|_| original_value)
+        } else {
+            Err(original_value)
+        }
+    }
+
+    /// Parse regular CollapsingMergeTree with parameters
+    fn parse_regular_collapsing_merge_tree<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        if let Some(content) = engine_name
+            .strip_prefix("CollapsingMergeTree(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
+            Self::parse_collapsing_merge_tree(content).map_err(|_| original_value)
+        } else {
+            Err(original_value)
+        }
+    }
+
+    /// Parse regular VersionedCollapsingMergeTree with parameters
+    fn parse_regular_versioned_collapsing_merge_tree<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        if let Some(content) = engine_name
+            .strip_prefix("VersionedCollapsingMergeTree(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
+            Self::parse_versioned_collapsing_merge_tree(content).map_err(|_| original_value)
+        } else {
+            Err(original_value)
+        }
+    }
+
+    /// Parse regular Buffer with parameters
+    /// Format: Buffer('db', 'table', num_layers, min_time, max_time, min_rows, max_rows, min_bytes, max_bytes[, flush_time][, flush_rows][, flush_bytes])
+    fn parse_regular_buffer<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        if let Some(content) = engine_name
+            .strip_prefix("Buffer(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
+            let params = parse_quoted_csv(content);
+
+            // Need at least 9 parameters (database, table, and 7 numeric values)
+            if params.len() < 9 {
+                return Err(original_value);
+            }
+
+            // Parse required parameters
+            let target_database = params[0].clone();
+            let target_table = params[1].clone();
+            let num_layers = params[2].parse::<u32>().map_err(|_| original_value)?;
+            let min_time = params[3].parse::<u32>().map_err(|_| original_value)?;
+            let max_time = params[4].parse::<u32>().map_err(|_| original_value)?;
+            let min_rows = params[5].parse::<u64>().map_err(|_| original_value)?;
+            let max_rows = params[6].parse::<u64>().map_err(|_| original_value)?;
+            let min_bytes = params[7].parse::<u64>().map_err(|_| original_value)?;
+            let max_bytes = params[8].parse::<u64>().map_err(|_| original_value)?;
+
+            // Parse optional parameters (flush_time, flush_rows, flush_bytes)
+            let flush_time = if params.len() > 9 {
+                Some(params[9].parse::<u32>().map_err(|_| original_value)?)
+            } else {
+                None
+            };
+
+            let flush_rows = if params.len() > 10 {
+                Some(params[10].parse::<u64>().map_err(|_| original_value)?)
+            } else {
+                None
+            };
+
+            let flush_bytes = if params.len() > 11 {
+                Some(params[11].parse::<u64>().map_err(|_| original_value)?)
+            } else {
+                None
+            };
+
+            Ok(ClickhouseEngine::Buffer(BufferEngine {
+                target_database,
+                target_table,
+                num_layers,
+                min_time,
+                max_time,
+                min_rows,
+                max_rows,
+                min_bytes,
+                max_bytes,
+                flush_time,
+                flush_rows,
+                flush_bytes,
+            }))
+        } else {
+            Err(original_value)
+        }
+    }
+
+    /// Parse regular Distributed with parameters
+    /// Format: Distributed('cluster', 'database', 'table'[, sharding_key][, 'policy'])
+    fn parse_regular_distributed<'a>(
+        engine_name: &str,
+        original_value: &'a str,
+    ) -> Result<Self, &'a str> {
+        if let Some(content) = engine_name
+            .strip_prefix("Distributed(")
+            .and_then(|s| s.strip_suffix(")"))
+        {
+            let params = parse_quoted_csv(content);
+
+            // Need at least 3 parameters (cluster, database, table)
+            if params.len() < 3 {
+                return Err(original_value);
+            }
+
+            let cluster = params[0].clone();
+            let target_database = params[1].clone();
+            let target_table = params[2].clone();
+
+            // Parse optional sharding_key (4th parameter, not quoted - it's an expression)
+            let sharding_key = if params.len() > 3 {
+                Some(params[3].clone())
+            } else {
+                None
+            };
+
+            // Parse optional policy_name (5th parameter, quoted)
+            let policy_name = if params.len() > 4 {
+                Some(params[4].clone())
+            } else {
+                None
+            };
+
+            Ok(ClickhouseEngine::Distributed {
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            })
+        } else {
+            Err(original_value)
+        }
+    }
+}
+
+/// Parse comma-separated values from a string
+/// Handles both quoted strings and unquoted keywords/values
+/// Preserves unquoted keywords like NOSIGN and null
+fn parse_quoted_csv(content: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut escape_next = false;
+
+    for ch in content.chars() {
+        if escape_next {
+            current.push(ch);
+            escape_next = false;
+        } else if ch == '\\' {
+            escape_next = true;
+        } else if ch == '\'' && !in_quotes {
+            in_quotes = true;
+        } else if ch == '\'' && in_quotes {
+            in_quotes = false;
+        } else if ch == ',' && !in_quotes {
+            // Trim the current value
+            let trimmed = current.trim();
+
+            // Check if this was a quoted value (starts and ends with quotes after trimming)
+            // If so, remove the quotes. Otherwise, keep as-is (for keywords like NOSIGN, null)
+            let final_value = if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+                trimmed.trim_matches('\'').to_string()
+            } else {
+                trimmed.to_string()
+            };
+
+            if !final_value.is_empty() {
+                parts.push(final_value);
+            }
+            current.clear();
+        } else if ch != ' ' || in_quotes || !current.is_empty() {
+            // Skip leading spaces, but preserve spaces within quotes or after content starts
+            current.push(ch);
+        }
+    }
+
+    // Don't forget the last part
+    if !current.is_empty() {
+        let trimmed = current.trim();
+        let final_value = if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
+            trimmed.trim_matches('\'').to_string()
+        } else {
+            trimmed.to_string()
+        };
+        if !final_value.is_empty() {
+            parts.push(final_value);
+        }
+    }
+
+    parts
+}
+
+impl ClickhouseEngine {
+    /// Check if this engine is part of the MergeTree family
+    pub fn is_merge_tree_family(&self) -> bool {
+        matches!(
+            self,
+            ClickhouseEngine::MergeTree
+                | ClickhouseEngine::ReplacingMergeTree { .. }
+                | ClickhouseEngine::AggregatingMergeTree
+                | ClickhouseEngine::SummingMergeTree { .. }
+                | ClickhouseEngine::CollapsingMergeTree { .. }
+                | ClickhouseEngine::VersionedCollapsingMergeTree { .. }
+                | ClickhouseEngine::ReplicatedMergeTree { .. }
+                | ClickhouseEngine::ReplicatedReplacingMergeTree { .. }
+                | ClickhouseEngine::ReplicatedAggregatingMergeTree { .. }
+                | ClickhouseEngine::ReplicatedSummingMergeTree { .. }
+                | ClickhouseEngine::ReplicatedCollapsingMergeTree { .. }
+                | ClickhouseEngine::ReplicatedVersionedCollapsingMergeTree { .. }
+        )
+    }
+
+    /// Returns true if this engine supports ORDER BY clause
+    /// MergeTree family and S3 support ORDER BY
+    /// Buffer, S3Queue, Distributed, Kafka, and IcebergS3 do NOT support ORDER BY
+    pub fn supports_order_by(&self) -> bool {
+        self.is_merge_tree_family() || matches!(self, ClickhouseEngine::S3 { .. })
+    }
+
+    /// Returns true if this engine supports SELECT queries
+    ///
+    /// Some engines like Kafka and S3Queue are write-only and cannot be queried with SELECT.
+    /// This is important for operations like mirroring and seeding that need to read data.
+    pub fn supports_select(&self) -> bool {
+        !matches!(
+            self,
+            ClickhouseEngine::Kafka { .. } | ClickhouseEngine::S3Queue { .. }
+        )
+    }
+
+    /// Returns table setting keys that contain sensitive credentials for this engine.
+    /// Used for masking credentials in stored state and migration files.
+    pub fn sensitive_settings(&self) -> &'static [&'static str] {
+        match self {
+            ClickhouseEngine::Kafka { .. } => &["kafka_sasl_password", "kafka_sasl_username"],
+            _ => &[],
+        }
+    }
+
+    /// Convert engine to string for proto storage (no sensitive data)
+    pub fn to_proto_string(&self) -> String {
+        match self {
+            ClickhouseEngine::MergeTree => "MergeTree".to_string(),
+            ClickhouseEngine::ReplacingMergeTree { ver, is_deleted } => {
+                Self::serialize_replacing_merge_tree(ver, is_deleted)
+            }
+            ClickhouseEngine::AggregatingMergeTree => "AggregatingMergeTree".to_string(),
+            ClickhouseEngine::SummingMergeTree { columns } => {
+                Self::serialize_summing_merge_tree(columns)
+            }
+            ClickhouseEngine::CollapsingMergeTree { sign } => {
+                Self::serialize_collapsing_merge_tree(sign)
+            }
+            ClickhouseEngine::VersionedCollapsingMergeTree { sign, version } => {
+                Self::serialize_versioned_collapsing_merge_tree(sign, version)
+            }
+            ClickhouseEngine::ReplicatedMergeTree {
+                keeper_path,
+                replica_name,
+            } => Self::serialize_replicated_merge_tree(keeper_path, replica_name),
+            ClickhouseEngine::ReplicatedReplacingMergeTree {
+                keeper_path,
+                replica_name,
+                ver,
+                is_deleted,
+            } => Self::serialize_replicated_replacing_merge_tree(
+                keeper_path,
+                replica_name,
+                ver,
+                is_deleted,
+            ),
+            ClickhouseEngine::ReplicatedAggregatingMergeTree {
+                keeper_path,
+                replica_name,
+            } => Self::serialize_replicated_aggregating_merge_tree(keeper_path, replica_name),
+            ClickhouseEngine::ReplicatedSummingMergeTree {
+                keeper_path,
+                replica_name,
+                columns,
+            } => Self::serialize_replicated_summing_merge_tree(keeper_path, replica_name, columns),
+            ClickhouseEngine::ReplicatedCollapsingMergeTree {
+                keeper_path,
+                replica_name,
+                sign,
+            } => Self::serialize_replicated_collapsing_merge_tree(keeper_path, replica_name, sign),
+            ClickhouseEngine::ReplicatedVersionedCollapsingMergeTree {
+                keeper_path,
+                replica_name,
+                sign,
+                version,
+            } => Self::serialize_replicated_versioned_collapsing_merge_tree(
+                keeper_path,
+                replica_name,
+                sign,
+                version,
+            ),
+            ClickhouseEngine::S3Queue {
+                s3_path,
+                format,
+                compression,
+                headers,
+                ..
+            } => Self::serialize_s3queue(s3_path, format, compression, headers),
+            ClickhouseEngine::S3 {
+                path,
+                format,
+                compression,
+                partition_strategy,
+                partition_columns_in_data_file,
+                ..
+            } => Self::serialize_s3(
+                path,
+                format,
+                compression,
+                partition_strategy,
+                partition_columns_in_data_file,
+            ),
+            ClickhouseEngine::Buffer(buffer_engine) => buffer_engine.build_string(),
+            ClickhouseEngine::Distributed {
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            } => Self::serialize_distributed_proto(
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            ),
+            ClickhouseEngine::IcebergS3 {
+                path,
+                format,
+                compression,
+                ..  // Omit credentials for protobuf
+            } => Self::serialize_icebergs3(
+                path,
+                format,
+                compression,
+            ),
+            ClickhouseEngine::Kafka {
+                broker_list,
+                topic_list,
+                group_name,
+                format,
+            } => Self::serialize_kafka(
+                broker_list,
+                topic_list,
+                group_name,
+                format,
+            ),
+            ClickhouseEngine::Merge {
+                source_database,
+                tables_regexp,
+            } => Self::serialize_merge(source_database, tables_regexp),
+        }
+    }
+
+    /// Serialize ReplacingMergeTree engine to string format
+    /// Format: ReplacingMergeTree | ReplacingMergeTree('ver') | ReplacingMergeTree('ver', 'is_deleted')
+    fn serialize_replacing_merge_tree(ver: &Option<String>, is_deleted: &Option<String>) -> String {
+        if ver.is_some() || is_deleted.is_some() {
+            let mut params = vec![];
+            if let Some(v) = ver {
+                params.push(format!("'{}'", v));
+            }
+            if let Some(d) = is_deleted {
+                // Only add is_deleted if ver is present (validated elsewhere)
+                if ver.is_some() {
+                    params.push(format!("'{}'", d));
+                } else {
+                    tracing::warn!("is_deleted requires ver to be specified, this was not caught by the validation");
+                }
+            }
+            if !params.is_empty() {
+                format!("ReplacingMergeTree({})", params.join(", "))
+            } else {
+                "ReplacingMergeTree".to_string()
+            }
+        } else {
+            "ReplacingMergeTree".to_string()
+        }
+    }
+
+    /// Helper function to format S3 credentials for DDL generation
+    /// Returns either credentials as two separate strings, or "NOSIGN" as a single string
+    fn format_s3_credentials_for_ddl(
+        aws_access_key_id: &Option<String>,
+        aws_secret_access_key: &Option<String>,
+    ) -> Vec<String> {
+        if let (Some(key_id), Some(secret)) = (aws_access_key_id, aws_secret_access_key) {
+            vec![format!("'{}'", key_id), format!("'{}'", secret)]
+        } else {
+            // Default to NOSIGN for public buckets or when credentials are not available
+            vec!["NOSIGN".to_string()]
+        }
+    }
+
+    /// Helper function to mask a secret for display
+    /// Shows the full access key ID and first 4 + last 4 chars of secret
+    fn mask_secret(secret: &str) -> String {
+        if secret.len() > 8 {
+            format!("{}...{}", &secret[..4], &secret[secret.len() - 4..])
+        } else {
+            // For very short secrets, just show partial
+            format!("{}...", &secret[..secret.len().min(3)])
+        }
+    }
+
+    /// Helper function to format masked S3 credentials for display
+    /// Returns a formatted auth string showing the key ID and a masked secret
+    fn format_s3_credentials_for_display(
+        aws_access_key_id: &Option<String>,
+        aws_secret_access_key: &Option<String>,
+    ) -> String {
+        match (aws_access_key_id, aws_secret_access_key) {
+            (Some(key_id), Some(secret)) => {
+                let masked_secret = Self::mask_secret(secret);
+                format!("auth='{}:{}'", key_id, masked_secret)
+            }
+            (None, None) => "auth=NOSIGN".to_string(),
+            _ => {
+                // Partial credentials (shouldn't happen but handle gracefully)
+                "auth=INVALID".to_string()
+            }
+        }
+    }
+
+    /// Serialize S3Queue engine to string format for proto storage
+    /// Format: S3Queue('path', 'format', 'compression'|null, 'headers_json'|null)
+    fn serialize_s3queue(
+        s3_path: &str,
+        format: &str,
+        compression: &Option<String>,
+        headers: &Option<std::collections::HashMap<String, String>>,
+    ) -> String {
+        let mut result = format!("S3Queue('{}', '{}'", s3_path, format);
+
+        // Add compression if present
+        if let Some(comp) = compression {
+            result.push_str(&format!(", '{}'", comp));
+        } else {
+            result.push_str(", null");
+        }
+
+        // Add headers as JSON if present
+        if let Some(hdrs) = headers {
+            let headers_json = serde_json::to_string(hdrs).unwrap_or_else(|_| "{}".to_string());
+            // Escape single quotes in JSON for SQL string
+            result.push_str(&format!(", '{}'", headers_json.replace('\'', "\\'")));
+        } else {
+            result.push_str(", null");
+        }
+
+        result.push(')');
+        result
+    }
+
+    /// Serialize S3 engine to string format for proto storage (no sensitive data)
+    /// Format: S3('path', 'format', 'compression'|null, 'partition_strategy'|null, 'partition_columns'|null)
+    fn serialize_s3(
+        path: &str,
+        format: &str,
+        compression: &Option<String>,
+        partition_strategy: &Option<String>,
+        partition_columns_in_data_file: &Option<String>,
+    ) -> String {
+        let mut result = format!("S3('{}', '{}'", path, format);
+
+        // Add compression if present
+        if let Some(comp) = compression {
+            result.push_str(&format!(", '{}'", comp));
+        } else {
+            result.push_str(", null");
+        }
+
+        // Add partition strategy if present
+        if let Some(ps) = partition_strategy {
+            result.push_str(&format!(", '{}'", ps));
+        } else {
+            result.push_str(", null");
+        }
+
+        // Add partition columns if present
+        if let Some(pc) = partition_columns_in_data_file {
+            result.push_str(&format!(", '{}'", pc));
+        } else {
+            result.push_str(", null");
+        }
+
+        result.push(')');
+        result
+    }
+
+    /// Helper function to append nested optional parameters for Distributed engine
+    /// Returns comma-separated string of parameters that are present
+    /// Validates nested optional constraint: policy_name requires sharding_key
+    fn append_distributed_optional_params(
+        sharding_key: &Option<String>,
+        policy_name: &Option<String>,
+        quote_policy: bool,
+    ) -> String {
+        // Warn about invalid combination
+        if policy_name.is_some() && sharding_key.is_none() {
+            tracing::warn!(
+                "Distributed engine has policy_name but no sharding_key - policy_name will be ignored. \
+                 This violates ClickHouse nested optional constraint."
+            );
+        }
+
+        let mut params = String::new();
+        if let Some(key) = sharding_key {
+            params.push_str(&format!(", {}", key)); // Expression, not quoted
+
+            if let Some(policy) = policy_name {
+                if quote_policy {
+                    params.push_str(&format!(", '{}'", policy));
+                } else {
+                    params.push_str(&format!(", {}", policy));
+                }
+            }
+        }
+        params
+    }
+
+    /// Serialize Distributed engine to string format for proto storage
+    /// Format: Distributed('cluster', 'database', 'table'[, sharding_key][, 'policy_name'])
+    fn serialize_distributed_proto(
+        cluster: &str,
+        target_database: &str,
+        target_table: &str,
+        sharding_key: &Option<String>,
+        policy_name: &Option<String>,
+    ) -> String {
+        let mut result = format!(
+            "Distributed('{}', '{}', '{}'",
+            cluster, target_database, target_table
+        );
+
+        result.push_str(&Self::append_distributed_optional_params(
+            sharding_key,
+            policy_name,
+            true,
+        ));
+        result.push(')');
+        result
+    }
+
+    /// Serialize S3Queue engine for display purposes, including masked credentials
+    /// Format: S3Queue('path', 'format', auth_info, 'compression'|null, 'headers_json'|null)
+    fn serialize_s3queue_for_display(
+        s3_path: &str,
+        format: &str,
+        compression: &Option<String>,
+        headers: &Option<std::collections::HashMap<String, String>>,
+        aws_access_key_id: &Option<String>,
+        aws_secret_access_key: &Option<String>,
+    ) -> String {
+        let mut result = format!("S3Queue('{}', '{}'", s3_path, format);
+
+        // Add authentication info for display using shared helper
+        result.push_str(", ");
+        result.push_str(&Self::format_s3_credentials_for_display(
+            aws_access_key_id,
+            aws_secret_access_key,
+        ));
+
+        // Add compression if present
+        if let Some(comp) = compression {
+            result.push_str(&format!(", compression='{}'", comp));
+        }
+
+        // Add headers count if present (don't show actual headers for brevity)
+        if let Some(hdrs) = headers {
+            if !hdrs.is_empty() {
+                result.push_str(&format!(", headers_count={}", hdrs.len()));
+            }
+        }
+
+        result.push(')');
+        result
+    }
+
+    /// Serialize S3 engine for display purposes, including masked credentials
+    /// Format: S3('path', auth_info, 'format'[, 'compression'][, ...])
+    #[allow(clippy::too_many_arguments)]
+    fn serialize_s3_for_display(
+        path: &str,
+        format: &str,
+        aws_access_key_id: &Option<String>,
+        aws_secret_access_key: &Option<String>,
+        compression: &Option<String>,
+        partition_strategy: &Option<String>,
+        partition_columns_in_data_file: &Option<String>,
+    ) -> String {
+        let mut result = format!("S3('{}'", path);
+
+        // Add authentication info for display - uses shared masking logic
+        match (aws_access_key_id, aws_secret_access_key) {
+            (Some(key_id), Some(secret)) => {
+                let masked_secret = Self::mask_secret(secret);
+                result.push_str(&format!(", '{}', '{}'", key_id, masked_secret));
+            }
+            _ => {
+                // No credentials provided - using NOSIGN for public buckets
+                result.push_str(", NOSIGN");
+            }
+        }
+
+        // Add format
+        result.push_str(&format!(", '{}'", format));
+
+        // Add compression if present
+        if let Some(comp) = compression {
+            result.push_str(&format!(", '{}'", comp));
+        }
+
+        // Add partition strategy if present
+        if let Some(ps) = partition_strategy {
+            result.push_str(&format!(", partition_strategy='{}'", ps));
+        }
+
+        // Add partition columns if present
+        if let Some(pc) = partition_columns_in_data_file {
+            result.push_str(&format!(", partition_columns='{}'", pc));
+        }
+
+        result.push(')');
+        result
+    }
+
+    /// Serialize Iceberg engine to string format for display (with masked credentials)
+    /// Format: Iceberg('url', [NOSIGN | 'access_key_id', 'secret_access_key'], 'format'[, 'compression'])
+    fn serialize_icebergs3_for_display(
+        path: &str,
+        format: &str,
+        aws_access_key_id: &Option<String>,
+        aws_secret_access_key: &Option<String>,
+        compression: &Option<String>,
+    ) -> String {
+        let mut result = format!("Iceberg('{}'", path);
+
+        // Add authentication info for display - uses shared masking logic
+        match (aws_access_key_id, aws_secret_access_key) {
+            (Some(key_id), Some(secret)) => {
+                let masked_secret = Self::mask_secret(secret);
+                result.push_str(&format!(", '{}', '{}'", key_id, masked_secret));
+            }
+            _ => {
+                // No credentials provided - using NOSIGN for public buckets or IAM roles
+                result.push_str(", NOSIGN");
+            }
+        }
+
+        // Add format
+        result.push_str(&format!(", '{}'", format));
+
+        // Add compression if present
+        if let Some(comp) = compression {
+            result.push_str(&format!(", '{}'", comp));
+        }
+
+        result.push(')');
+        result
+    }
+
+    /// Serialize Kafka engine for display
+    /// Format: Kafka('broker1,broker2', 'topic1,topic2', 'group', 'format')
+    fn serialize_kafka_for_display(
+        broker_list: &str,
+        topic_list: &str,
+        group_name: &str,
+        format: &str,
+    ) -> String {
+        format!(
+            "Kafka('{}', '{}', '{}', '{}')",
+            broker_list, topic_list, group_name, format
+        )
+    }
+
+    /// Serialize Kafka engine to string format for proto storage
+    /// Format: Kafka('broker1,broker2', 'topic1,topic2', 'group', 'format')
+    fn serialize_kafka(
+        broker_list: &str,
+        topic_list: &str,
+        group_name: &str,
+        format: &str,
+    ) -> String {
+        format!(
+            "Kafka('{}', '{}', '{}', '{}')",
+            broker_list, topic_list, group_name, format
+        )
+    }
+
+    /// Parse Kafka engine from string
+    /// Format: Kafka('broker_list', 'topic_list', 'group_name', 'format')
+    fn parse_kafka(content: &str) -> Result<ClickhouseEngine, &str> {
+        let params = parse_quoted_csv(content);
+
+        // Kafka requires exactly 4 parameters
+        if params.len() != 4 {
+            return Err(content);
+        }
+
+        Ok(ClickhouseEngine::Kafka {
+            broker_list: params[0].clone(),
+            topic_list: params[1].clone(),
+            group_name: params[2].clone(),
+            format: params[3].clone(),
+        })
+    }
+
+    /// Serialize Iceberg engine to string format for proto storage (without credentials)
+    /// Format: Iceberg('url', 'format'[, 'compression'])
+    fn serialize_icebergs3(path: &str, format: &str, compression: &Option<String>) -> String {
+        let mut result = format!("Iceberg('{}', '{}'", path, format);
+
+        // Add compression if present
+        if let Some(comp) = compression {
+            result.push_str(&format!(", '{}'", comp));
+        }
+
+        result.push(')');
+        result
+    }
+
+    /// Serialize Distributed engine to string format
+    /// Format: Distributed('cluster', 'database', 'table'[, sharding_key][, 'policy_name'])
+    fn serialize_distributed(
+        cluster: &str,
+        target_database: &str,
+        target_table: &str,
+        sharding_key: &Option<String>,
+        policy_name: &Option<String>,
+    ) -> String {
+        let mut result = format!(
+            "Distributed('{}', '{}', '{}'",
+            cluster, target_database, target_table
+        );
+
+        result.push_str(&Self::append_distributed_optional_params(
+            sharding_key,
+            policy_name,
+            true,
+        ));
+        result.push(')');
+        result
+    }
+
+    /// Serialize Merge engine. Literal database names are quoted; expressions
+    /// containing `(` (e.g., `currentDatabase()`, `REGEXP(...)`) are left unquoted.
+    fn serialize_merge(source_database: &str, tables_regexp: &str) -> String {
+        if source_database.contains('(') {
+            format!("Merge({}, '{}')", source_database, tables_regexp)
+        } else {
+            format!("Merge('{}', '{}')", source_database, tables_regexp)
+        }
+    }
+
+    /// Serialize SummingMergeTree engine to string format
+    /// Format: SummingMergeTree | SummingMergeTree('col1', 'col2', ...)
+    fn serialize_summing_merge_tree(columns: &Option<Vec<String>>) -> String {
+        if let Some(cols) = columns {
+            if !cols.is_empty() {
+                let col_list = cols
+                    .iter()
+                    .map(|c| format!("'{}'", c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return format!("SummingMergeTree({})", col_list);
+            }
+        }
+        "SummingMergeTree".to_string()
+    }
+
+    /// Serialize CollapsingMergeTree engine to string format
+    /// Format: CollapsingMergeTree('sign')
+    fn serialize_collapsing_merge_tree(sign: &str) -> String {
+        format!("CollapsingMergeTree('{}')", sign)
+    }
+
+    /// Serialize VersionedCollapsingMergeTree engine to string format
+    /// Format: VersionedCollapsingMergeTree('sign', 'version')
+    fn serialize_versioned_collapsing_merge_tree(sign: &str, version: &str) -> String {
+        format!("VersionedCollapsingMergeTree('{}', '{}')", sign, version)
+    }
+
+    /// Serialize ReplicatedMergeTree engine to string format
+    /// Format: ReplicatedMergeTree('keeper_path', 'replica_name') or ReplicatedMergeTree() for cloud
+    fn serialize_replicated_merge_tree(
+        keeper_path: &Option<String>,
+        replica_name: &Option<String>,
+    ) -> String {
+        match (keeper_path, replica_name) {
+            (Some(path), Some(name)) => format!("ReplicatedMergeTree('{}', '{}')", path, name),
+            _ => "ReplicatedMergeTree()".to_string(),
+        }
+    }
+
+    /// Serialize ReplicatedReplacingMergeTree engine to string format
+    /// Format: ReplicatedReplacingMergeTree('keeper_path', 'replica_name'[, 'ver'[, 'is_deleted']])
+    fn serialize_replicated_replacing_merge_tree(
+        keeper_path: &Option<String>,
+        replica_name: &Option<String>,
+        ver: &Option<String>,
+        is_deleted: &Option<String>,
+    ) -> String {
+        let mut params = vec![];
+
+        if let (Some(path), Some(name)) = (keeper_path, replica_name) {
+            params.push(format!("'{}'", path));
+            params.push(format!("'{}'", name));
+        }
+
+        if let Some(v) = ver {
+            params.push(format!("'{}'", v));
+        }
+
+        if let Some(d) = is_deleted {
+            if ver.is_some() {
+                params.push(format!("'{}'", d));
+            }
+        }
+
+        if params.is_empty() {
+            "ReplicatedReplacingMergeTree()".to_string()
+        } else {
+            format!("ReplicatedReplacingMergeTree({})", params.join(", "))
+        }
+    }
+
+    /// Serialize ReplicatedAggregatingMergeTree engine to string format
+    /// Format: ReplicatedAggregatingMergeTree('keeper_path', 'replica_name') or ReplicatedAggregatingMergeTree() for cloud
+    fn serialize_replicated_aggregating_merge_tree(
+        keeper_path: &Option<String>,
+        replica_name: &Option<String>,
+    ) -> String {
+        match (keeper_path, replica_name) {
+            (Some(path), Some(name)) => {
+                format!("ReplicatedAggregatingMergeTree('{}', '{}')", path, name)
+            }
+            _ => "ReplicatedAggregatingMergeTree()".to_string(),
+        }
+    }
+
+    /// Serialize ReplicatedSummingMergeTree engine to string format
+    /// Format: ReplicatedSummingMergeTree('keeper_path', 'replica_name'[, ('col1', 'col2', ...)])
+    fn serialize_replicated_summing_merge_tree(
+        keeper_path: &Option<String>,
+        replica_name: &Option<String>,
+        columns: &Option<Vec<String>>,
+    ) -> String {
+        let mut params = vec![];
+
+        if let (Some(path), Some(name)) = (keeper_path, replica_name) {
+            params.push(format!("'{}'", path));
+            params.push(format!("'{}'", name));
+        }
+
+        if let Some(cols) = columns {
+            if !cols.is_empty() {
+                let col_list = cols
+                    .iter()
+                    .map(|c| format!("'{}'", c))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                params.push(format!("({})", col_list));
+            }
+        }
+
+        if params.is_empty() {
+            "ReplicatedSummingMergeTree()".to_string()
+        } else {
+            format!("ReplicatedSummingMergeTree({})", params.join(", "))
+        }
+    }
+
+    /// Serialize ReplicatedCollapsingMergeTree engine to string format
+    /// Format: ReplicatedCollapsingMergeTree('keeper_path', 'replica_name', 'sign') or ReplicatedCollapsingMergeTree('sign') for cloud
+    fn serialize_replicated_collapsing_merge_tree(
+        keeper_path: &Option<String>,
+        replica_name: &Option<String>,
+        sign: &str,
+    ) -> String {
+        let mut params = vec![];
+
+        if let (Some(path), Some(name)) = (keeper_path, replica_name) {
+            params.push(format!("'{}'", path));
+            params.push(format!("'{}'", name));
+        }
+
+        params.push(format!("'{}'", sign));
+
+        format!("ReplicatedCollapsingMergeTree({})", params.join(", "))
+    }
+
+    /// Serialize ReplicatedVersionedCollapsingMergeTree engine to string format
+    /// Format: ReplicatedVersionedCollapsingMergeTree('keeper_path', 'replica_name', 'sign', 'version') or ReplicatedVersionedCollapsingMergeTree('sign', 'version') for cloud
+    fn serialize_replicated_versioned_collapsing_merge_tree(
+        keeper_path: &Option<String>,
+        replica_name: &Option<String>,
+        sign: &str,
+        version: &str,
+    ) -> String {
+        let mut params = vec![];
+
+        if let (Some(path), Some(name)) = (keeper_path, replica_name) {
+            params.push(format!("'{}'", path));
+            params.push(format!("'{}'", name));
+        }
+
+        params.push(format!("'{}'", sign));
+        params.push(format!("'{}'", version));
+
+        format!(
+            "ReplicatedVersionedCollapsingMergeTree({})",
+            params.join(", ")
+        )
+    }
+
+    /// Parse ReplacingMergeTree engine from serialized string format
+    /// Expected format: ReplacingMergeTree('ver'[, 'is_deleted'])
+    fn parse_replacing_merge_tree(content: &str) -> Result<ClickhouseEngine, &str> {
+        let parts = parse_quoted_csv(content);
+
+        let ver = if !parts.is_empty() && parts[0] != "null" {
+            Some(parts[0].clone())
+        } else {
+            None
+        };
+
+        let is_deleted = if parts.len() > 1 && parts[1] != "null" {
+            Some(parts[1].clone())
+        } else {
+            None
+        };
+
+        Ok(ClickhouseEngine::ReplacingMergeTree { ver, is_deleted })
+    }
+
+    /// Parse SummingMergeTree engine from serialized string format
+    /// Expected format: SummingMergeTree('col1', 'col2', ...) or SummingMergeTree
+    fn parse_summing_merge_tree(content: &str) -> Result<ClickhouseEngine, &str> {
+        let parts = parse_quoted_csv(content);
+
+        let columns = if !parts.is_empty() && parts.iter().any(|p| p != "null") {
+            Some(parts.into_iter().filter(|p| p != "null").collect())
+        } else {
+            None
+        };
+
+        Ok(ClickhouseEngine::SummingMergeTree { columns })
+    }
+
+    /// Parse CollapsingMergeTree engine from serialized string format
+    /// Expected format: CollapsingMergeTree('sign')
+    fn parse_collapsing_merge_tree(content: &str) -> Result<ClickhouseEngine, &str> {
+        let parts = parse_quoted_csv(content);
+
+        if parts.len() != 1 {
+            return Err("CollapsingMergeTree requires exactly one parameter: sign column");
+        }
+
+        Ok(ClickhouseEngine::CollapsingMergeTree {
+            sign: parts[0].clone(),
+        })
+    }
+
+    /// Parse VersionedCollapsingMergeTree engine from serialized string format
+    /// Expected format: VersionedCollapsingMergeTree('sign', 'version')
+    fn parse_versioned_collapsing_merge_tree(content: &str) -> Result<ClickhouseEngine, &str> {
+        let parts = parse_quoted_csv(content);
+
+        if parts.len() != 2 {
+            return Err(
+                "VersionedCollapsingMergeTree requires exactly two parameters: sign and version columns",
+            );
+        }
+
+        Ok(ClickhouseEngine::VersionedCollapsingMergeTree {
+            sign: parts[0].clone(),
+            version: parts[1].clone(),
+        })
+    }
+
+    /// Parse S3Queue engine from serialized string format
+    /// Expected format: S3Queue('path', 'format'[, 'compression'][, 'headers_json'])
+    fn parse_s3queue(content: &str) -> Result<ClickhouseEngine, &str> {
+        // Parse comma-separated quoted values with proper quote escaping
+        let parts = parse_quoted_csv(content);
+
+        if parts.len() < 2 {
+            return Err("S3Queue requires at least path and format parameters");
+        }
+
+        let s3_path = parts[0].clone();
+
+        // Determine authentication method and format position
+        // Possible formats:
+        // 1. S3Queue('path', 'format', ...) - no auth
+        // 2. S3Queue('path', NOSIGN, 'format', ...) - explicit no auth
+        // 3. S3Queue('path', 'access_key_id', 'secret_access_key', 'format', ...) - with credentials
+        let (format, aws_access_key_id, aws_secret_access_key, extra_params_start) =
+            if parts.len() >= 2 && parts[1].to_uppercase() == "NOSIGN" {
+                // NOSIGN authentication - format is at position 2
+                if parts.len() < 3 {
+                    return Err("S3Queue with NOSIGN requires format parameter");
+                }
+                (parts[2].clone(), None, None, 3)
+            } else if parts.len() >= 4 && !parts[1].is_empty() && !parts[2].is_empty() {
+                // Check if parts[1] and parts[2] look like credentials (not format names)
+                // Common formats are: CSV, TSV, JSON, Parquet, etc. - all uppercase or mixed case
+                // If parts[3] looks like a format name and parts[1] doesn't, assume we have credentials
+                let possible_format = &parts[3].to_uppercase();
+                if possible_format == "CSV"
+                    || possible_format == "TSV"
+                    || possible_format == "JSON"
+                    || possible_format == "PARQUET"
+                    || possible_format == "AVRO"
+                    || possible_format == "ORC"
+                    || possible_format == "ARROW"
+                    || possible_format == "NATIVE"
+                    || possible_format == "JSONCOMPACT"
+                    || possible_format == "JSONEACHROW"
+                {
+                    // parts[1] and parts[2] are likely credentials
+                    // Note: parts[2] might be "[HIDDEN]" when parsed from SHOW CREATE TABLE
+                    (
+                        parts[3].clone(),
+                        Some(parts[1].clone()),
+                        Some(parts[2].clone()),
+                        4,
+                    )
+                } else {
+                    // No credentials, parts[1] is the format
+                    (parts[1].clone(), None, None, 2)
+                }
+            } else {
+                // No credentials, parts[1] is the format
+                (parts[1].clone(), None, None, 2)
+            };
+
+        // Parse optional compression (next parameter after format)
+        let compression = if parts.len() > extra_params_start && parts[extra_params_start] != "null"
+        {
+            Some(parts[extra_params_start].clone())
+        } else {
+            None
+        };
+
+        // Parse optional headers JSON (parameter after compression)
+        let headers =
+            if parts.len() > extra_params_start + 1 && parts[extra_params_start + 1] != "null" {
+                // Unescape the JSON string (reverse the escaping we did during serialization)
+                let unescaped = parts[extra_params_start + 1].replace("\\'", "'");
+                serde_json::from_str::<std::collections::HashMap<String, String>>(&unescaped).ok()
+            } else {
+                None
+            };
+
+        Ok(ClickhouseEngine::S3Queue {
+            s3_path,
+            format,
+            compression,
+            headers,
+            aws_access_key_id,
+            aws_secret_access_key,
+        })
+    }
+
+    /// Parse S3 engine from serialized string format
+    /// Expected format: S3('path', 'format'[, 'compression'][, 'partition_strategy'][, 'partition_columns'])
+    /// Or with credentials: S3('path', 'access_key_id', 'secret_access_key', 'format'[, ...])
+    /// Or with NOSIGN: S3('path', NOSIGN, 'format'[, ...])
+    fn parse_s3(content: &str) -> Result<ClickhouseEngine, &str> {
+        // Parse comma-separated quoted values with proper quote escaping
+        let parts = parse_quoted_csv(content);
+
+        if parts.len() < 2 {
+            return Err("S3 requires at least path and format parameters");
+        }
+
+        let path = parts[0].clone();
+
+        // Determine authentication method and format position (same logic as S3Queue)
+        // Possible formats:
+        // 1. S3('path', 'format', ...) - no auth
+        // 2. S3('path', NOSIGN, 'format', ...) - explicit no auth
+        // 3. S3('path', 'access_key_id', 'secret_access_key', 'format', ...) - with credentials
+        let (format, aws_access_key_id, aws_secret_access_key, extra_params_start) =
+            if parts.len() >= 2 && parts[1].to_uppercase() == "NOSIGN" {
+                // NOSIGN authentication - format is at position 2
+                if parts.len() < 3 {
+                    return Err("S3 with NOSIGN requires format parameter");
+                }
+                (parts[2].clone(), None, None, 3)
+            } else if parts.len() >= 4 && !parts[1].is_empty() && !parts[2].is_empty() {
+                // Check if parts[1] and parts[2] look like credentials (same logic as S3Queue)
+                let possible_format = &parts[3].to_uppercase();
+                if possible_format == "CSV"
+                    || possible_format == "TSV"
+                    || possible_format == "JSON"
+                    || possible_format == "PARQUET"
+                    || possible_format == "AVRO"
+                    || possible_format == "ORC"
+                    || possible_format == "ARROW"
+                    || possible_format == "NATIVE"
+                    || possible_format == "JSONCOMPACT"
+                    || possible_format == "JSONEACHROW"
+                {
+                    // parts[1] and parts[2] are likely credentials
+                    (
+                        parts[3].clone(),
+                        Some(parts[1].clone()),
+                        Some(parts[2].clone()),
+                        4,
+                    )
+                } else {
+                    // No credentials, parts[1] is the format
+                    (parts[1].clone(), None, None, 2)
+                }
+            } else {
+                // No credentials, parts[1] is the format
+                (parts[1].clone(), None, None, 2)
+            };
+
+        // Parse optional compression (next parameter after format)
+        let compression = if parts.len() > extra_params_start && parts[extra_params_start] != "null"
+        {
+            Some(parts[extra_params_start].clone())
+        } else {
+            None
+        };
+
+        // Parse optional partition strategy (parameter after compression)
+        let partition_strategy =
+            if parts.len() > extra_params_start + 1 && parts[extra_params_start + 1] != "null" {
+                Some(parts[extra_params_start + 1].clone())
+            } else {
+                None
+            };
+
+        // Parse optional partition columns (parameter after partition strategy)
+        let partition_columns_in_data_file =
+            if parts.len() > extra_params_start + 2 && parts[extra_params_start + 2] != "null" {
+                Some(parts[extra_params_start + 2].clone())
+            } else {
+                None
+            };
+
+        Ok(ClickhouseEngine::S3 {
+            path,
+            format,
+            aws_access_key_id,
+            aws_secret_access_key,
+            compression,
+            partition_strategy,
+            partition_columns_in_data_file,
+        })
+    }
+
+    /// Calculate a hash of non-alterable parameters for change detection
+    /// This allows us to detect changes in constructor parameters without storing sensitive data
+    pub fn non_alterable_params_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+
+        // Note: We explicitly hash "null" for None values instead of skipping them.
+        // This ensures positional consistency and prevents hash collisions between different
+        // configurations. For example:
+        // - keeper_path=Some("abc"), replica_name=None -> hash("..." + "abc" + "null")
+        // - keeper_path=None, replica_name=Some("abc") -> hash("..." + "null" + "abc")
+        // Without hashing "null", both would produce identical hashes.
+
+        match self {
+            ClickhouseEngine::MergeTree => {
+                hasher.update("MergeTree".as_bytes());
+            }
+            ClickhouseEngine::ReplacingMergeTree { ver, is_deleted } => {
+                hasher.update("ReplacingMergeTree".as_bytes());
+                // Include parameters in hash
+                if let Some(v) = ver {
+                    hasher.update(v.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(d) = is_deleted {
+                    hasher.update(d.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+            }
+            ClickhouseEngine::AggregatingMergeTree => {
+                hasher.update("AggregatingMergeTree".as_bytes());
+            }
+            ClickhouseEngine::SummingMergeTree { columns } => {
+                hasher.update("SummingMergeTree".as_bytes());
+                if let Some(cols) = columns {
+                    for col in cols {
+                        hasher.update(col.as_bytes());
+                    }
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+            }
+            ClickhouseEngine::CollapsingMergeTree { sign } => {
+                hasher.update("CollapsingMergeTree".as_bytes());
+                hasher.update(sign.as_bytes());
+            }
+            ClickhouseEngine::VersionedCollapsingMergeTree { sign, version } => {
+                hasher.update("VersionedCollapsingMergeTree".as_bytes());
+                hasher.update(sign.as_bytes());
+                hasher.update(version.as_bytes());
+            }
+            ClickhouseEngine::ReplicatedMergeTree {
+                keeper_path,
+                replica_name,
+            } => {
+                hasher.update("ReplicatedMergeTree".as_bytes());
+                if let Some(path) = keeper_path {
+                    hasher.update(path.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(name) = replica_name {
+                    hasher.update(name.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+            }
+            ClickhouseEngine::ReplicatedReplacingMergeTree {
+                keeper_path,
+                replica_name,
+                ver,
+                is_deleted,
+            } => {
+                hasher.update("ReplicatedReplacingMergeTree".as_bytes());
+                if let Some(path) = keeper_path {
+                    hasher.update(path.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(name) = replica_name {
+                    hasher.update(name.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(v) = ver {
+                    hasher.update(v.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(d) = is_deleted {
+                    hasher.update(d.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+            }
+            ClickhouseEngine::ReplicatedAggregatingMergeTree {
+                keeper_path,
+                replica_name,
+            } => {
+                hasher.update("ReplicatedAggregatingMergeTree".as_bytes());
+                if let Some(path) = keeper_path {
+                    hasher.update(path.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(name) = replica_name {
+                    hasher.update(name.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+            }
+            ClickhouseEngine::ReplicatedSummingMergeTree {
+                keeper_path,
+                replica_name,
+                columns,
+            } => {
+                hasher.update("ReplicatedSummingMergeTree".as_bytes());
+                if let Some(path) = keeper_path {
+                    hasher.update(path.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(name) = replica_name {
+                    hasher.update(name.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(cols) = columns {
+                    for col in cols {
+                        hasher.update(col.as_bytes());
+                    }
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+            }
+            ClickhouseEngine::ReplicatedCollapsingMergeTree {
+                keeper_path,
+                replica_name,
+                sign,
+            } => {
+                hasher.update("ReplicatedCollapsingMergeTree".as_bytes());
+                if let Some(path) = keeper_path {
+                    hasher.update(path.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(name) = replica_name {
+                    hasher.update(name.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                hasher.update(sign.as_bytes());
+            }
+            ClickhouseEngine::ReplicatedVersionedCollapsingMergeTree {
+                keeper_path,
+                replica_name,
+                sign,
+                version,
+            } => {
+                hasher.update("ReplicatedVersionedCollapsingMergeTree".as_bytes());
+                if let Some(path) = keeper_path {
+                    hasher.update(path.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(name) = replica_name {
+                    hasher.update(name.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                hasher.update(sign.as_bytes());
+                hasher.update(version.as_bytes());
+            }
+            ClickhouseEngine::S3Queue {
+                s3_path,
+                format,
+                compression,
+                headers,
+                aws_access_key_id,
+                aws_secret_access_key,
+                ..
+            } => {
+                hasher.update("S3Queue".as_bytes());
+                hasher.update(s3_path.as_bytes());
+                hasher.update(format.as_bytes());
+
+                // Hash compression in a deterministic way
+                if let Some(comp) = compression {
+                    hasher.update(comp.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+
+                // Hash headers in a deterministic way
+                if let Some(headers_map) = headers {
+                    let mut sorted_headers: Vec<_> = headers_map.iter().collect();
+                    sorted_headers.sort_by_key(|(k, _)| *k);
+                    for (key, value) in sorted_headers {
+                        hasher.update(key.as_bytes());
+                        hasher.update(value.as_bytes());
+                    }
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+
+                // Include credentials in the hash for change detection
+                // They affect table creation but we don't store them in proto
+                // Note: When retrieved from SHOW CREATE TABLE, secret will be "[HIDDEN]"
+                // which produces a different hash. The reconciliation logic handles this
+                // by keeping the hash from the infrastructure map instead of the DB
+                // for ALL engines (not just S3Queue).
+                if let Some(key_id) = aws_access_key_id {
+                    hasher.update(key_id.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+
+                if let Some(secret) = aws_secret_access_key {
+                    hasher.update(secret.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+
+                // Note: settings are NOT included as they are alterable
+            }
+            ClickhouseEngine::S3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                compression,
+                partition_strategy,
+                partition_columns_in_data_file,
+            } => {
+                hasher.update("S3".as_bytes());
+                hasher.update(path.as_bytes());
+                hasher.update(format.as_bytes());
+
+                // Hash credentials
+                if let Some(key_id) = aws_access_key_id {
+                    hasher.update(key_id.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(secret) = aws_secret_access_key {
+                    hasher.update(secret.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+
+                // Hash optional parameters
+                if let Some(comp) = compression {
+                    hasher.update(comp.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(ps) = partition_strategy {
+                    hasher.update(ps.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(pc) = partition_columns_in_data_file {
+                    hasher.update(pc.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+            }
+            ClickhouseEngine::Buffer(BufferEngine {
+                target_database,
+                target_table,
+                num_layers,
+                min_time,
+                max_time,
+                min_rows,
+                max_rows,
+                min_bytes,
+                max_bytes,
+                flush_time,
+                flush_rows,
+                flush_bytes,
+            }) => {
+                hasher.update("Buffer".as_bytes());
+                hasher.update(target_database.as_bytes());
+                hasher.update(target_table.as_bytes());
+                hasher.update(num_layers.to_le_bytes());
+                hasher.update(min_time.to_le_bytes());
+                hasher.update(max_time.to_le_bytes());
+                hasher.update(min_rows.to_le_bytes());
+                hasher.update(max_rows.to_le_bytes());
+                hasher.update(min_bytes.to_le_bytes());
+                hasher.update(max_bytes.to_le_bytes());
+
+                // Hash optional flush parameters
+                if let Some(ft) = flush_time {
+                    hasher.update(ft.to_le_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(fr) = flush_rows {
+                    hasher.update(fr.to_le_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(fb) = flush_bytes {
+                    hasher.update(fb.to_le_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+            }
+            ClickhouseEngine::Distributed {
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            } => {
+                hasher.update("Distributed".as_bytes());
+                hasher.update(cluster.as_bytes());
+                hasher.update(target_database.as_bytes());
+                hasher.update(target_table.as_bytes());
+
+                // Hash optional parameters
+                if let Some(key) = sharding_key {
+                    hasher.update(key.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(policy) = policy_name {
+                    hasher.update(policy.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+            }
+            ClickhouseEngine::IcebergS3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                compression,
+            } => {
+                hasher.update("Iceberg".as_bytes());
+                hasher.update(path.as_bytes());
+                hasher.update(format.as_bytes());
+
+                // Hash credentials (consistent with S3 and S3Queue engines)
+                if let Some(key_id) = aws_access_key_id {
+                    hasher.update(key_id.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+                if let Some(secret) = aws_secret_access_key {
+                    hasher.update(secret.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+
+                // Hash optional parameters
+                if let Some(comp) = compression {
+                    hasher.update(comp.as_bytes());
+                } else {
+                    hasher.update("null".as_bytes());
+                }
+            }
+            ClickhouseEngine::Kafka {
+                broker_list,
+                topic_list,
+                group_name,
+                format,
+            } => {
+                hasher.update("Kafka".as_bytes());
+                // Hash constructor parameters only (4 params)
+                hasher.update(broker_list.as_bytes());
+                hasher.update(topic_list.as_bytes());
+                hasher.update(group_name.as_bytes());
+                hasher.update(format.as_bytes());
+            }
+            ClickhouseEngine::Merge {
+                source_database,
+                tables_regexp,
+            } => {
+                hasher.update("Merge".as_bytes());
+                hasher.update(source_database.as_bytes());
+                hasher.update(tables_regexp.as_bytes());
+            }
+        }
+
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+/// Generate DDL for ReplacingMergeTree engine
+fn build_replacing_merge_tree_ddl(
+    ver: &Option<String>,
+    is_deleted: &Option<String>,
+    order_by_empty: bool,
+) -> Result<String, ClickhouseError> {
+    if order_by_empty {
+        return Err(ClickhouseError::InvalidParameters {
+            message: "ReplacingMergeTree requires an order by clause".to_string(),
+        });
+    }
+
+    // Validate that is_deleted requires ver
+    if is_deleted.is_some() && ver.is_none() {
+        return Err(ClickhouseError::InvalidParameters {
+            message: "is_deleted parameter requires ver to be specified".to_string(),
+        });
+    }
+
+    let mut params = vec![];
+    if let Some(ver_col) = ver {
+        params.push(format!("`{}`", ver_col));
+    }
+    if let Some(is_deleted_col) = is_deleted {
+        params.push(format!("`{}`", is_deleted_col));
+    }
+
+    Ok(if params.is_empty() {
+        "ReplacingMergeTree".to_string()
+    } else {
+        format!("ReplacingMergeTree({})", params.join(", "))
+    })
+}
+
+/// Generate DDL for SummingMergeTree engine
+fn build_summing_merge_tree_ddl(columns: &Option<Vec<String>>) -> String {
+    if let Some(cols) = columns {
+        if !cols.is_empty() {
+            let col_list = cols
+                .iter()
+                .map(|c| format!("`{}`", c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return format!("SummingMergeTree({})", col_list);
+        }
+    }
+    "SummingMergeTree".to_string()
+}
+
+/// Generate DDL for CollapsingMergeTree engine
+fn build_collapsing_merge_tree_ddl(sign: &str) -> String {
+    format!("CollapsingMergeTree(`{}`)", sign)
+}
+
+/// Generate DDL for VersionedCollapsingMergeTree engine
+fn build_versioned_collapsing_merge_tree_ddl(sign: &str, version: &str) -> String {
+    format!("VersionedCollapsingMergeTree(`{}`, `{}`)", sign, version)
+}
+
+/// Build replication parameters for replicated engines
+///
+/// When keeper_path and replica_name are None:
+/// - Dev without cluster: Injects table_name-based paths (ON CLUSTER absent, {uuid} won't work)
+/// - Dev with cluster: Returns empty params (ON CLUSTER present, ClickHouse uses {uuid})
+/// - Prod with cluster: Returns empty params (ON CLUSTER present, ClickHouse uses {uuid})
+/// - Prod without cluster: Returns empty params (ClickHouse Cloud handles defaults)
+fn build_replication_params(
+    keeper_path: &Option<String>,
+    replica_name: &Option<String>,
+    cluster_name: &Option<String>,
+    engine_name: &str,
+    table_name: &str,
+    is_dev: bool,
+) -> Result<Vec<String>, ClickhouseError> {
+    match (keeper_path, replica_name) {
+        (Some(path), Some(name)) if !path.is_empty() && !name.is_empty() => {
+            Ok(vec![format!("'{}'", path), format!("'{}'", name)])
+        }
+        (None, None) => {
+            // The {uuid} macro only works with ON CLUSTER queries
+            // Only dev without cluster needs explicit params
+            if is_dev && cluster_name.is_none() {
+                // Dev mode without cluster: inject table_name-based paths
+                // {shard}, {replica}, and {database} macros are configured in docker-compose
+                Ok(vec![
+                    format!("'/clickhouse/tables/{{database}}/{{shard}}/{}'", table_name),
+                    "'{replica}'".to_string(),
+                ])
+            } else {
+                // All other cases: return empty parameters
+                // - Dev with cluster: ON CLUSTER present → ClickHouse uses {uuid}
+                // - Prod with cluster: ON CLUSTER present → ClickHouse uses {uuid}
+                // - Prod without cluster: ClickHouse Cloud handles defaults
+                Ok(vec![])
+            }
+        }
+        _ => Err(ClickhouseError::InvalidParameters {
+            message: format!(
+                "{} requires both keeper_path and replica_name, or neither",
+                engine_name
+            ),
+        }),
+    }
+}
+
+/// Generate DDL for ReplicatedMergeTree engine
+fn build_replicated_merge_tree_ddl(
+    keeper_path: &Option<String>,
+    replica_name: &Option<String>,
+    cluster_name: &Option<String>,
+    table_name: &str,
+    is_dev: bool,
+) -> Result<String, ClickhouseError> {
+    let params = build_replication_params(
+        keeper_path,
+        replica_name,
+        cluster_name,
+        "ReplicatedMergeTree",
+        table_name,
+        is_dev,
+    )?;
+    Ok(format!("ReplicatedMergeTree({})", params.join(", ")))
+}
+
+/// Generate DDL for ReplicatedReplacingMergeTree engine
+#[allow(clippy::too_many_arguments)]
+fn build_replicated_replacing_merge_tree_ddl(
+    keeper_path: &Option<String>,
+    replica_name: &Option<String>,
+    cluster_name: &Option<String>,
+    ver: &Option<String>,
+    is_deleted: &Option<String>,
+    order_by_empty: bool,
+    table_name: &str,
+    is_dev: bool,
+) -> Result<String, ClickhouseError> {
+    if order_by_empty {
+        return Err(ClickhouseError::InvalidParameters {
+            message: "ReplicatedReplacingMergeTree requires an order by clause".to_string(),
+        });
+    }
+
+    // Validate that is_deleted requires ver
+    if is_deleted.is_some() && ver.is_none() {
+        return Err(ClickhouseError::InvalidParameters {
+            message: "is_deleted parameter requires ver to be specified".to_string(),
+        });
+    }
+
+    let mut params = build_replication_params(
+        keeper_path,
+        replica_name,
+        cluster_name,
+        "ReplicatedReplacingMergeTree",
+        table_name,
+        is_dev,
+    )?;
+
+    if let Some(ver_col) = ver {
+        params.push(format!("`{}`", ver_col));
+    }
+    if let Some(is_deleted_col) = is_deleted {
+        params.push(format!("`{}`", is_deleted_col));
+    }
+
+    Ok(format!(
+        "ReplicatedReplacingMergeTree({})",
+        params.join(", ")
+    ))
+}
+
+/// Generate DDL for ReplicatedAggregatingMergeTree engine
+fn build_replicated_aggregating_merge_tree_ddl(
+    keeper_path: &Option<String>,
+    replica_name: &Option<String>,
+    cluster_name: &Option<String>,
+    table_name: &str,
+    is_dev: bool,
+) -> Result<String, ClickhouseError> {
+    let params = build_replication_params(
+        keeper_path,
+        replica_name,
+        cluster_name,
+        "ReplicatedAggregatingMergeTree",
+        table_name,
+        is_dev,
+    )?;
+    Ok(format!(
+        "ReplicatedAggregatingMergeTree({})",
+        params.join(", ")
+    ))
+}
+
+/// Generate DDL for ReplicatedSummingMergeTree engine
+fn build_replicated_summing_merge_tree_ddl(
+    keeper_path: &Option<String>,
+    replica_name: &Option<String>,
+    cluster_name: &Option<String>,
+    columns: &Option<Vec<String>>,
+    table_name: &str,
+    is_dev: bool,
+) -> Result<String, ClickhouseError> {
+    let mut params = build_replication_params(
+        keeper_path,
+        replica_name,
+        cluster_name,
+        "ReplicatedSummingMergeTree",
+        table_name,
+        is_dev,
+    )?;
+
+    if let Some(cols) = columns {
+        if !cols.is_empty() {
+            let col_list = cols
+                .iter()
+                .map(|c| format!("`{}`", c))
+                .collect::<Vec<_>>()
+                .join(", ");
+            params.push(format!("({})", col_list));
+        }
+    }
+
+    Ok(format!("ReplicatedSummingMergeTree({})", params.join(", ")))
+}
+
+/// Generate DDL for ReplicatedCollapsingMergeTree engine
+fn build_replicated_collapsing_merge_tree_ddl(
+    keeper_path: &Option<String>,
+    replica_name: &Option<String>,
+    cluster_name: &Option<String>,
+    sign: &str,
+    table_name: &str,
+    is_dev: bool,
+) -> Result<String, ClickhouseError> {
+    let mut params = build_replication_params(
+        keeper_path,
+        replica_name,
+        cluster_name,
+        "ReplicatedCollapsingMergeTree",
+        table_name,
+        is_dev,
+    )?;
+
+    params.push(format!("`{}`", sign));
+
+    Ok(format!(
+        "ReplicatedCollapsingMergeTree({})",
+        params.join(", ")
+    ))
+}
+
+/// Generate DDL for ReplicatedVersionedCollapsingMergeTree engine
+fn build_replicated_versioned_collapsing_merge_tree_ddl(
+    keeper_path: &Option<String>,
+    replica_name: &Option<String>,
+    cluster_name: &Option<String>,
+    sign: &str,
+    version: &str,
+    table_name: &str,
+    is_dev: bool,
+) -> Result<String, ClickhouseError> {
+    let mut params = build_replication_params(
+        keeper_path,
+        replica_name,
+        cluster_name,
+        "ReplicatedVersionedCollapsingMergeTree",
+        table_name,
+        is_dev,
+    )?;
+
+    params.push(format!("`{}`", sign));
+    params.push(format!("`{}`", version));
+
+    Ok(format!(
+        "ReplicatedVersionedCollapsingMergeTree({})",
+        params.join(", ")
+    ))
+}
+
+pub fn create_table_query(
+    db_name: &str,
+    table: ClickHouseTable,
+    is_dev: bool,
+) -> Result<String, ClickhouseError> {
+    let mut reg = Handlebars::new();
+    reg.register_escape_fn(no_escape);
+
+    let engine = match &table.engine {
+        ClickhouseEngine::MergeTree => "MergeTree".to_string(),
+        ClickhouseEngine::ReplacingMergeTree { ver, is_deleted } => build_replacing_merge_tree_ddl(
+            ver,
+            is_deleted,
+            matches!(table.order_by, OrderBy::Fields(ref v) if v.is_empty()),
+        )?,
+        ClickhouseEngine::AggregatingMergeTree => "AggregatingMergeTree".to_string(),
+        ClickhouseEngine::SummingMergeTree { columns } => build_summing_merge_tree_ddl(columns),
+        ClickhouseEngine::CollapsingMergeTree { sign } => build_collapsing_merge_tree_ddl(sign),
+        ClickhouseEngine::VersionedCollapsingMergeTree { sign, version } => {
+            build_versioned_collapsing_merge_tree_ddl(sign, version)
+        }
+        ClickhouseEngine::ReplicatedMergeTree {
+            keeper_path,
+            replica_name,
+        } => build_replicated_merge_tree_ddl(
+            keeper_path,
+            replica_name,
+            &table.cluster_name,
+            &table.name,
+            is_dev,
+        )?,
+        ClickhouseEngine::ReplicatedReplacingMergeTree {
+            keeper_path,
+            replica_name,
+            ver,
+            is_deleted,
+        } => build_replicated_replacing_merge_tree_ddl(
+            keeper_path,
+            replica_name,
+            &table.cluster_name,
+            ver,
+            is_deleted,
+            table.order_by.is_empty(),
+            &table.name,
+            is_dev,
+        )?,
+        ClickhouseEngine::ReplicatedAggregatingMergeTree {
+            keeper_path,
+            replica_name,
+        } => build_replicated_aggregating_merge_tree_ddl(
+            keeper_path,
+            replica_name,
+            &table.cluster_name,
+            &table.name,
+            is_dev,
+        )?,
+        ClickhouseEngine::ReplicatedSummingMergeTree {
+            keeper_path,
+            replica_name,
+            columns,
+        } => build_replicated_summing_merge_tree_ddl(
+            keeper_path,
+            replica_name,
+            &table.cluster_name,
+            columns,
+            &table.name,
+            is_dev,
+        )?,
+        ClickhouseEngine::ReplicatedCollapsingMergeTree {
+            keeper_path,
+            replica_name,
+            sign,
+        } => build_replicated_collapsing_merge_tree_ddl(
+            keeper_path,
+            replica_name,
+            &table.cluster_name,
+            sign,
+            &table.name,
+            is_dev,
+        )?,
+        ClickhouseEngine::ReplicatedVersionedCollapsingMergeTree {
+            keeper_path,
+            replica_name,
+            sign,
+            version,
+        } => build_replicated_versioned_collapsing_merge_tree_ddl(
+            keeper_path,
+            replica_name,
+            &table.cluster_name,
+            sign,
+            version,
+            &table.name,
+            is_dev,
+        )?,
+        ClickhouseEngine::S3Queue {
+            s3_path,
+            format,
+            compression,
+            headers: _headers, // TODO: Handle headers in future if needed
+            aws_access_key_id,
+            aws_secret_access_key,
+            ..
+        } => {
+            // Build the engine string based on available parameters
+            let mut engine_parts = vec![format!("'{}'", s3_path)];
+
+            // Handle credentials using shared helper
+            engine_parts.extend(ClickhouseEngine::format_s3_credentials_for_ddl(
+                aws_access_key_id,
+                aws_secret_access_key,
+            ));
+
+            engine_parts.push(format!("'{}'", format));
+
+            // Add compression if specified
+            if let Some(comp) = compression {
+                engine_parts.push(format!("'{}'", comp));
+            }
+
+            format!("S3Queue({})", engine_parts.join(", "))
+        }
+        ClickhouseEngine::S3 {
+            path,
+            format,
+            aws_access_key_id,
+            aws_secret_access_key,
+            compression,
+            partition_strategy,
+            partition_columns_in_data_file,
+        } => {
+            let mut engine_parts = vec![format!("'{}'", path)];
+
+            // Handle credentials using shared helper (same as S3Queue)
+            engine_parts.extend(ClickhouseEngine::format_s3_credentials_for_ddl(
+                aws_access_key_id,
+                aws_secret_access_key,
+            ));
+
+            engine_parts.push(format!("'{}'", format));
+
+            // Add optional parameters
+            if let Some(comp) = compression {
+                engine_parts.push(format!("'{}'", comp));
+            }
+            if let Some(ps) = partition_strategy {
+                engine_parts.push(format!("'{}'", ps));
+            }
+            if let Some(pc) = partition_columns_in_data_file {
+                engine_parts.push(format!("'{}'", pc));
+            }
+
+            format!("S3({})", engine_parts.join(", "))
+        }
+        ClickhouseEngine::Buffer(BufferEngine {
+            target_database,
+            target_table,
+            num_layers,
+            min_time,
+            max_time,
+            min_rows,
+            max_rows,
+            min_bytes,
+            max_bytes,
+            flush_time,
+            flush_rows,
+            flush_bytes,
+        }) => {
+            // Warn about invalid combinations
+            if flush_rows.is_some() && flush_time.is_none() {
+                tracing::warn!(
+                    "Buffer engine has flush_rows but no flush_time - flush_rows will be ignored. \
+                     This violates ClickHouse nested optional constraint."
+                );
+            }
+            if flush_bytes.is_some() && (flush_time.is_none() || flush_rows.is_none()) {
+                tracing::warn!(
+                    "Buffer engine has flush_bytes but missing flush_time or flush_rows - flush_bytes will be ignored. \
+                     This violates ClickHouse nested optional constraint."
+                );
+            }
+
+            let mut engine_parts = vec![
+                format!("'{}'", target_database),
+                format!("'{}'", target_table),
+                num_layers.to_string(),
+                min_time.to_string(),
+                max_time.to_string(),
+                min_rows.to_string(),
+                max_rows.to_string(),
+                min_bytes.to_string(),
+                max_bytes.to_string(),
+            ];
+
+            // Add optional flush parameters following nested optional constraint
+            if let Some(ft) = flush_time {
+                engine_parts.push(ft.to_string());
+
+                if let Some(fr) = flush_rows {
+                    engine_parts.push(fr.to_string());
+
+                    if let Some(fb) = flush_bytes {
+                        engine_parts.push(fb.to_string());
+                    }
+                }
+            }
+
+            format!("Buffer({})", engine_parts.join(", "))
+        }
+        ClickhouseEngine::Distributed {
+            cluster,
+            target_database,
+            target_table,
+            sharding_key,
+            policy_name,
+        } => {
+            // Warn about invalid combination
+            if policy_name.is_some() && sharding_key.is_none() {
+                tracing::warn!(
+                    "Distributed engine has policy_name but no sharding_key - policy_name will be ignored. \
+                     This violates ClickHouse nested optional constraint."
+                );
+            }
+
+            let mut engine_parts = vec![
+                format!("'{}'", cluster),
+                format!("'{}'", target_database),
+                format!("'{}'", target_table),
+            ];
+
+            // Add optional parameters following nested optional constraint
+            if let Some(key) = sharding_key {
+                engine_parts.push(key.clone()); // Don't quote - it's an expression
+
+                if let Some(policy) = policy_name {
+                    engine_parts.push(format!("'{}'", policy));
+                }
+            }
+
+            format!("Distributed({})", engine_parts.join(", "))
+        }
+        ClickhouseEngine::IcebergS3 {
+            path,
+            format,
+            aws_access_key_id,
+            aws_secret_access_key,
+            compression,
+        } => {
+            let mut engine_parts = vec![format!("'{}'", path)];
+
+            // Handle credentials using shared helper (same as S3Queue)
+            engine_parts.extend(ClickhouseEngine::format_s3_credentials_for_ddl(
+                aws_access_key_id,
+                aws_secret_access_key,
+            ));
+
+            // Add format
+            engine_parts.push(format!("'{}'", format));
+
+            // Add optional compression
+            if let Some(comp) = compression {
+                engine_parts.push(format!("'{}'", comp));
+            }
+
+            format!("Iceberg({})", engine_parts.join(", "))
+        }
+        ClickhouseEngine::Kafka {
+            broker_list,
+            topic_list,
+            group_name,
+            format,
+        } => {
+            // Kafka constructor: Kafka('broker', 'topic', 'group', 'format')
+            // All other params (schema, num_consumers, security) go in SETTINGS
+            format!(
+                "Kafka('{}', '{}', '{}', '{}')",
+                broker_list, topic_list, group_name, format
+            )
+        }
+        ClickhouseEngine::Merge {
+            source_database,
+            tables_regexp,
+        } => ClickhouseEngine::serialize_merge(source_database, tables_regexp),
+    };
+
+    // Format settings from table.table_settings
+    let settings = if let Some(ref table_settings) = table.table_settings {
+        if !table_settings.is_empty() {
+            let mut settings_pairs: Vec<(String, String)> = table_settings
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            settings_pairs.sort_by(|a, b| a.0.cmp(&b.0)); // Sort by key for deterministic order
+            let settings_strs: Vec<String> = settings_pairs
+                .iter()
+                .map(|(key, value)| format!("{} = {}", key, format_clickhouse_setting_value(value)))
+                .collect();
+            Some(settings_strs.join(", "))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // PRIMARY KEY: use primary_key_expression if specified, otherwise use columns with primary_key flag
+    let primary_key_str = if let Some(ref expr) = table.primary_key_expression {
+        // When primary_key_expression is specified, use it directly (ignoring column-level primary_key flags)
+        // Strip outer parentheses if present, as the template will add them
+        let trimmed = expr.trim();
+        if trimmed.starts_with('(') && trimmed.ends_with(')') {
+            Some(trimmed[1..trimmed.len() - 1].to_string())
+        } else {
+            Some(trimmed.to_string())
+        }
+    } else {
+        // Otherwise, use columns with primary_key flag
+        let primary_key = table
+            .columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .map(|column| column.name.clone())
+            .collect::<Vec<String>>();
+        if !primary_key.is_empty() {
+            Some(wrap_and_join_column_names(&primary_key, ","))
+        } else {
+            None
+        }
+    };
+
+    // Prepare indexes strings like: INDEX name expr TYPE type(args...) GRANULARITY n
+    let (has_indexes, index_strings): (bool, Vec<String>) = if table.indexes.is_empty() {
+        (false, vec![])
+    } else {
+        let mut items = Vec::with_capacity(table.indexes.len());
+        for idx in &table.indexes {
+            let args_part = if idx.arguments.is_empty() {
+                String::new()
+            } else {
+                format!("({})", idx.arguments.join(", "))
+            };
+            items.push(format!(
+                "INDEX {} {} TYPE {}{} GRANULARITY {}",
+                idx.name, idx.expression, idx.index_type, args_part, idx.granularity
+            ));
+        }
+        (true, items)
+    };
+
+    // Prepare projection strings like: PROJECTION name (body)
+    // Projections are only supported by MergeTree-family engines.
+    let (has_projections, projection_strings): (bool, Vec<String>) =
+        if table.projections.is_empty() || !table.engine.is_merge_tree_family() {
+            (false, vec![])
+        } else {
+            let items: Vec<String> = table
+                .projections
+                .iter()
+                .map(|p| format!("PROJECTION {} ({})", p.name, p.body))
+                .collect();
+            (true, items)
+        };
+
+    // Different engines support different clauses:
+    // - MergeTree family: Supports all clauses (ORDER BY, PRIMARY KEY, PARTITION BY, SAMPLE BY)
+    // - S3: Supports PARTITION BY and SETTINGS, but not ORDER BY, PRIMARY KEY, or SAMPLE BY
+    // - S3Queue, Buffer, Distributed: Don't support any of these clauses
+
+    let supports_order_by = table.engine.supports_order_by();
+    let supports_primary_key = table.engine.supports_order_by();
+    let supports_sample_by = table.engine.is_merge_tree_family();
+    let supports_partition_by = matches!(
+        table.engine,
+        ClickhouseEngine::MergeTree
+            | ClickhouseEngine::ReplacingMergeTree { .. }
+            | ClickhouseEngine::AggregatingMergeTree
+            | ClickhouseEngine::SummingMergeTree { .. }
+            | ClickhouseEngine::CollapsingMergeTree { .. }
+            | ClickhouseEngine::VersionedCollapsingMergeTree { .. }
+            | ClickhouseEngine::ReplicatedMergeTree { .. }
+            | ClickhouseEngine::ReplicatedReplacingMergeTree { .. }
+            | ClickhouseEngine::ReplicatedAggregatingMergeTree { .. }
+            | ClickhouseEngine::ReplicatedSummingMergeTree { .. }
+            | ClickhouseEngine::ReplicatedCollapsingMergeTree { .. }
+            | ClickhouseEngine::ReplicatedVersionedCollapsingMergeTree { .. }
+            | ClickhouseEngine::S3 { .. }
+    );
+
+    let template_context = json!({
+        "db_name": db_name,
+        "table_name": table.name,
+        "cluster_name": table.cluster_name.as_deref(),
+        "fields":  builds_field_context(&table.columns)?,
+        "has_fields": !table.columns.is_empty(),
+        "has_indexes": has_indexes,
+        "indexes": index_strings,
+        "has_projections": has_projections,
+        "projections": projection_strings,
+        "primary_key_string": if supports_primary_key {
+            primary_key_str
+        } else {
+            None
+        },
+        "order_by_string": if supports_order_by {
+            match &table.order_by {
+                OrderBy::Fields(v) if v.len() == 1 && v[0] == "tuple()" => Some("tuple()".to_string()),
+                OrderBy::Fields(v) if v.is_empty() => None,
+                OrderBy::Fields(v) => Some(wrap_and_join_column_names(v, ",")),
+                OrderBy::SingleExpr(expr) => {
+                    // Strip outer parentheses if present, as the template will add them
+                    // Exception: keep tuple() as-is since it's a function call
+                    let trimmed = expr.trim();
+                    if trimmed == "tuple()" {
+                        Some(trimmed.to_string())
+                    } else if trimmed.starts_with('(') && trimmed.ends_with(')') {
+                        Some(trimmed[1..trimmed.len()-1].to_string())
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                },
+            }
+        } else {
+            None
+        },
+        "partition_by": if supports_partition_by { table.partition_by.as_deref() } else { None },
+        "sample_by": if supports_sample_by { table.sample_by.as_deref() } else { None },
+        "engine": engine,
+        "settings": settings,
+        "ttl_clause": table.table_ttl_setting.as_deref()
+    });
+
+    Ok(reg.render_template(CREATE_TABLE_TEMPLATE, &template_context)?)
+}
+
+pub static DROP_TABLE_TEMPLATE: &str = r#"
+DROP TABLE IF EXISTS `{{db_name}}`.`{{table_name}}`{{#if cluster_name}} ON CLUSTER `{{cluster_name}}` SYNC{{/if}};
+"#;
+
+pub fn drop_table_query(
+    db_name: &str,
+    table_name: &str,
+    cluster_name: Option<&str>,
+) -> Result<String, ClickhouseError> {
+    let mut reg = Handlebars::new();
+    reg.register_escape_fn(no_escape);
+
+    let context = json!({
+        "db_name": db_name,
+        "table_name": table_name,
+        "cluster_name": cluster_name,
+    });
+
+    Ok(reg.render_template(DROP_TABLE_TEMPLATE, &context)?)
+}
+
+pub static ALTER_TABLE_MODIFY_SETTINGS_TEMPLATE: &str = r#"
+ALTER TABLE `{{db_name}}`.`{{table_name}}`{{#if cluster_name}} ON CLUSTER `{{cluster_name}}`{{/if}}
+MODIFY SETTING {{settings}};
+"#;
+
+pub static ALTER_TABLE_RESET_SETTINGS_TEMPLATE: &str = r#"
+ALTER TABLE `{{db_name}}`.`{{table_name}}`{{#if cluster_name}} ON CLUSTER `{{cluster_name}}`{{/if}}
+RESET SETTING {{settings}};
+"#;
+
+/// Generate an ALTER TABLE MODIFY SETTING query to change table settings
+pub fn alter_table_modify_settings_query(
+    db_name: &str,
+    table_name: &str,
+    settings: &std::collections::HashMap<String, String>,
+    cluster_name: Option<&str>,
+) -> Result<String, ClickhouseError> {
+    if settings.is_empty() {
+        return Err(ClickhouseError::InvalidParameters {
+            message: "No settings provided for ALTER TABLE MODIFY SETTING".to_string(),
+        });
+    }
+
+    let mut reg = Handlebars::new();
+    reg.register_escape_fn(no_escape);
+
+    // Format settings as key = value pairs with proper quoting
+    let mut settings_pairs: Vec<(String, String)> = settings
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    settings_pairs.sort_by(|a, b| a.0.cmp(&b.0)); // Sort by key for deterministic order
+    let settings_str = settings_pairs
+        .iter()
+        .map(|(key, value)| format!("{} = {}", key, format_clickhouse_setting_value(value)))
+        .collect::<Vec<String>>()
+        .join(", ");
+
+    let context = json!({
+        "db_name": db_name,
+        "table_name": table_name,
+        "settings": settings_str,
+        "cluster_name": cluster_name,
+    });
+
+    Ok(reg.render_template(ALTER_TABLE_MODIFY_SETTINGS_TEMPLATE, &context)?)
+}
+
+/// Generate an ALTER TABLE RESET SETTING query to reset table settings to defaults
+pub fn alter_table_reset_settings_query(
+    db_name: &str,
+    table_name: &str,
+    setting_names: &[String],
+    cluster_name: Option<&str>,
+) -> Result<String, ClickhouseError> {
+    if setting_names.is_empty() {
+        return Err(ClickhouseError::InvalidParameters {
+            message: "No settings provided for ALTER TABLE RESET SETTING".to_string(),
+        });
+    }
+
+    let mut reg = Handlebars::new();
+    reg.register_escape_fn(no_escape);
+
+    let settings_str = setting_names.join(", ");
+
+    let context = json!({
+        "db_name": db_name,
+        "table_name": table_name,
+        "settings": settings_str,
+        "cluster_name": cluster_name,
+    });
+
+    Ok(reg.render_template(ALTER_TABLE_RESET_SETTINGS_TEMPLATE, &context)?)
+}
+
+pub fn basic_field_type_to_string(
+    field_type: &ClickHouseColumnType,
+) -> Result<String, ClickhouseError> {
+    // Blowing out match statements here in case we need to customize the output string for some types.
+    match field_type {
+        ClickHouseColumnType::String => Ok(field_type.to_string()),
+        ClickHouseColumnType::FixedString(n) => Ok(format!("FixedString({n})")),
+        ClickHouseColumnType::Boolean => Ok(field_type.to_string()),
+        ClickHouseColumnType::ClickhouseInt(int) => match int {
+            ClickHouseInt::Int8 => Ok(int.to_string()),
+            ClickHouseInt::Int16 => Ok(int.to_string()),
+            ClickHouseInt::Int32 => Ok(int.to_string()),
+            ClickHouseInt::Int64 => Ok(int.to_string()),
+            ClickHouseInt::Int128 => Ok(int.to_string()),
+            ClickHouseInt::Int256 => Ok(int.to_string()),
+            ClickHouseInt::UInt8 => Ok(int.to_string()),
+            ClickHouseInt::UInt16 => Ok(int.to_string()),
+            ClickHouseInt::UInt32 => Ok(int.to_string()),
+            ClickHouseInt::UInt64 => Ok(int.to_string()),
+            ClickHouseInt::UInt128 => Ok(int.to_string()),
+            ClickHouseInt::UInt256 => Ok(int.to_string()),
+        },
+        ClickHouseColumnType::ClickhouseFloat(float) => match float {
+            ClickHouseFloat::Float32 => Ok(float.to_string()),
+            ClickHouseFloat::Float64 => Ok(float.to_string()),
+        },
+        ClickHouseColumnType::Decimal { precision, scale } => {
+            Ok(format!("Decimal({precision}, {scale})"))
+        }
+        ClickHouseColumnType::DateTime => Ok("DateTime('UTC')".to_string()),
+        ClickHouseColumnType::Enum(data_enum) => {
+            let enum_statement = data_enum
+                .values
+                .iter()
+                .map(|enum_member| match &enum_member.value {
+                    EnumValue::Int(int) => format!("'{}' = {}", enum_member.name, int),
+                    // "Numbers are assigned starting from 1 by default."
+                    EnumValue::String(string) => format!("'{string}'"),
+                })
+                .collect::<Vec<String>>()
+                .join(",");
+
+            Ok(format!("Enum({enum_statement})"))
+        }
+        ClickHouseColumnType::Nested(cols) => {
+            let nested_fields = cols
+                .iter()
+                .map(|col| {
+                    let field_type_string = basic_field_type_to_string(&col.column_type)?;
+                    match col.required {
+                        false
+                            if !matches!(
+                                col.column_type,
+                                // if type is Nullable, `field_type_string` is already wrapped in Nullable
+                                ClickHouseColumnType::Nullable(_)
+                                    // Nested and Array are not allowed to be nullable
+                                    | ClickHouseColumnType::Nested(_)
+                                    | ClickHouseColumnType::Array(_)
+                            ) =>
+                        {
+                            Ok(format!("{} Nullable({})", col.name, field_type_string))
+                        }
+                        _ => Ok(format!("{} {}", col.name, field_type_string)),
+                    }
+                })
+                .collect::<Result<Vec<String>, ClickhouseError>>()?
+                .join(", ");
+
+            Ok(format!("Nested({nested_fields})"))
+        }
+        ClickHouseColumnType::Json(opts) => {
+            let parts = opts.to_option_strings_with_type_convert(basic_field_type_to_string)?;
+            if parts.is_empty() {
+                Ok("JSON".to_string())
+            } else {
+                Ok(format!("JSON({})", parts.join(", ")))
+            }
+        }
+        ClickHouseColumnType::Bytes => Err(ClickhouseError::UnsupportedDataType {
+            type_name: "Bytes".to_string(),
+        }),
+        ClickHouseColumnType::Array(inner_type) => {
+            let inner_type_string = basic_field_type_to_string(inner_type)?;
+            Ok(format!("Array({inner_type_string})"))
+        }
+        ClickHouseColumnType::Nullable(inner_type) => {
+            let inner_type_string = basic_field_type_to_string(inner_type)?;
+            match inner_type.as_ref() {
+                ClickHouseColumnType::Array(_) | ClickHouseColumnType::Nested(_) => {
+                    info!("Nullability stripped from array/nested field as this is not allowed in ClickHouse.");
+                    Ok(inner_type_string)
+                }
+                // <column_name> String NULL is equivalent to <column_name> Nullable(String)
+                _ => Ok(format!("Nullable({inner_type_string})")),
+            }
+        }
+        ClickHouseColumnType::AggregateFunction(
+            AggregationFunction {
+                function_name,
+                argument_types,
+            },
+            _return_type,
+        ) => {
+            let inner_type_string = argument_types
+                .iter()
+                .map(basic_field_type_to_string)
+                .collect::<Result<Vec<String>, _>>()?
+                .join(", ");
+            Ok(format!(
+                "AggregateFunction({function_name}, {inner_type_string})"
+            ))
+        }
+        ClickHouseColumnType::SimpleAggregateFunction {
+            function_name,
+            argument_type,
+        } => {
+            let arg_type_string = basic_field_type_to_string(argument_type)?;
+            Ok(format!(
+                "SimpleAggregateFunction({function_name}, {arg_type_string})"
+            ))
+        }
+        ClickHouseColumnType::Uuid => Ok("UUID".to_string()),
+        ClickHouseColumnType::Date32 => Ok("Date32".to_string()),
+        ClickHouseColumnType::Date => Ok("Date".to_string()),
+        ClickHouseColumnType::DateTime64 { precision } => Ok(format!("DateTime64({precision})")),
+        ClickHouseColumnType::LowCardinality(inner_type) => Ok(format!(
+            "LowCardinality({})",
+            basic_field_type_to_string(inner_type)?
+        )),
+        ClickHouseColumnType::IpV4 => Ok("IPv4".to_string()),
+        ClickHouseColumnType::IpV6 => Ok("IPv6".to_string()),
+        // Geometry types
+        ClickHouseColumnType::Point => Ok("Point".to_string()),
+        ClickHouseColumnType::Ring => Ok("Ring".to_string()),
+        ClickHouseColumnType::LineString => Ok("LineString".to_string()),
+        ClickHouseColumnType::MultiLineString => Ok("MultiLineString".to_string()),
+        ClickHouseColumnType::Polygon => Ok("Polygon".to_string()),
+        ClickHouseColumnType::MultiPolygon => Ok("MultiPolygon".to_string()),
+
+        ClickHouseColumnType::NamedTuple(fields) => {
+            let pairs = fields
+                .iter()
+                .map(|(name, t)| {
+                    Ok::<_, ClickhouseError>(format!("{name} {}", basic_field_type_to_string(t)?))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            Ok(format!("Tuple({pairs})"))
+        }
+        ClickHouseColumnType::Map(key_type, value_type) => Ok(format!(
+            "Map({}, {})",
+            basic_field_type_to_string(key_type)?,
+            basic_field_type_to_string(value_type)?
+        )),
+    }
+}
+
+fn builds_field_context(columns: &[ClickHouseColumn]) -> Result<Vec<Value>, ClickhouseError> {
+    columns
+        .iter()
+        .map(|column| {
+            let field_type = basic_field_type_to_string(&column.column_type)?;
+            let field_properties = build_column_property_clauses(column);
+
+            Ok(json!({
+                "field_name": column.name,
+                "field_type": field_type,
+                "field_nullable": if let ClickHouseColumnType::Nullable(_) = column.column_type {
+                    // if type is Nullable, do not add extra specifier
+                    "".to_string()
+                } else if column.required || column.is_array() || column.is_nested() {
+                    // Clickhouse doesn't allow array/nested fields to be nullable
+                    "NOT NULL".to_string()
+                } else {
+                    "NULL".to_string()
+                },
+                "field_properties": field_properties,
+            }))
+        })
+        .collect::<Result<Vec<Value>, ClickhouseError>>()
+}
+
+// Tests
+#[cfg(test)]
+mod tests {
+    use std::vec;
+
+    use super::*;
+    use crate::framework::core::infrastructure::table::{DataEnum, EnumMember};
+    use crate::framework::versions::Version;
+
+    #[test]
+    fn test_nested_query_generator() {
+        let complete_nest_type = ClickHouseColumnType::Nested(vec![
+            ClickHouseColumn {
+                name: "nested_field_1".to_string(),
+                column_type: ClickHouseColumnType::String,
+                required: true,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            },
+            ClickHouseColumn {
+                name: "nested_field_2".to_string(),
+                column_type: ClickHouseColumnType::Boolean,
+                required: true,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            },
+            ClickHouseColumn {
+                name: "nested_field_3".to_string(),
+                column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int64),
+                required: true,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            },
+            ClickHouseColumn {
+                name: "nested_field_4".to_string(),
+                column_type: ClickHouseColumnType::ClickhouseFloat(ClickHouseFloat::Float64),
+                required: true,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            },
+            ClickHouseColumn {
+                name: "nested_field_5".to_string(),
+                column_type: ClickHouseColumnType::DateTime,
+                required: false,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            },
+            ClickHouseColumn {
+                name: "nested_field_6".to_string(),
+                column_type: ClickHouseColumnType::Enum(DataEnum {
+                    name: "TestEnum".to_string(),
+                    values: vec![
+                        EnumMember {
+                            name: "TestEnumValue1".to_string(),
+                            value: EnumValue::Int(1),
+                        },
+                        EnumMember {
+                            name: "TestEnumValue2".to_string(),
+                            value: EnumValue::Int(2),
+                        },
+                    ],
+                }),
+                required: true,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            },
+            ClickHouseColumn {
+                name: "nested_field_7".to_string(),
+                column_type: ClickHouseColumnType::Array(Box::new(ClickHouseColumnType::String)),
+                required: true,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            },
+        ]);
+
+        let expected_nested_query = "Nested(nested_field_1 String, nested_field_2 Boolean, nested_field_3 Int64, nested_field_4 Float64, nested_field_5 Nullable(DateTime('UTC')), nested_field_6 Enum('TestEnumValue1' = 1,'TestEnumValue2' = 2), nested_field_7 Array(String))";
+
+        let nested_query = basic_field_type_to_string(&complete_nest_type).unwrap();
+
+        assert_eq!(nested_query, expected_nested_query);
+    }
+
+    #[test]
+    fn test_nested_nested_generator() {}
+
+    #[test]
+    fn test_simple_aggregate_function_sql_generation() {
+        // Test SimpleAggregateFunction with UInt64
+        let col_type = ClickHouseColumnType::SimpleAggregateFunction {
+            function_name: "sum".to_string(),
+            argument_type: Box::new(ClickHouseColumnType::ClickhouseInt(ClickHouseInt::UInt64)),
+        };
+        let sql = basic_field_type_to_string(&col_type).unwrap();
+        assert_eq!(sql, "SimpleAggregateFunction(sum, UInt64)");
+
+        // Test SimpleAggregateFunction with max and Int32
+        let col_type2 = ClickHouseColumnType::SimpleAggregateFunction {
+            function_name: "max".to_string(),
+            argument_type: Box::new(ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32)),
+        };
+        let sql2 = basic_field_type_to_string(&col_type2).unwrap();
+        assert_eq!(sql2, "SimpleAggregateFunction(max, Int32)");
+
+        // Test SimpleAggregateFunction with anyLast and String
+        let col_type3 = ClickHouseColumnType::SimpleAggregateFunction {
+            function_name: "anyLast".to_string(),
+            argument_type: Box::new(ClickHouseColumnType::String),
+        };
+        let sql3 = basic_field_type_to_string(&col_type3).unwrap();
+        assert_eq!(sql3, "SimpleAggregateFunction(anyLast, String)");
+
+        // Test SimpleAggregateFunction with nullable argument
+        let col_type4 = ClickHouseColumnType::SimpleAggregateFunction {
+            function_name: "any".to_string(),
+            argument_type: Box::new(ClickHouseColumnType::Nullable(Box::new(
+                ClickHouseColumnType::ClickhouseFloat(ClickHouseFloat::Float64),
+            ))),
+        };
+        let sql4 = basic_field_type_to_string(&col_type4).unwrap();
+        assert_eq!(sql4, "SimpleAggregateFunction(any, Nullable(Float64))");
+    }
+
+    #[test]
+    fn test_fixedstring_ddl_generation() {
+        // Test FixedString(16)
+        let col_type = ClickHouseColumnType::FixedString(16);
+        let result = basic_field_type_to_string(&col_type).unwrap();
+        assert_eq!(result, "FixedString(16)");
+
+        // Test FixedString(32)
+        let col_type = ClickHouseColumnType::FixedString(32);
+        let result = basic_field_type_to_string(&col_type).unwrap();
+        assert_eq!(result, "FixedString(32)");
+
+        // Test Nullable(FixedString(16))
+        let col_type =
+            ClickHouseColumnType::Nullable(Box::new(ClickHouseColumnType::FixedString(16)));
+        let result = basic_field_type_to_string(&col_type).unwrap();
+        assert_eq!(result, "Nullable(FixedString(16))");
+    }
+
+    #[test]
+    fn test_create_table_query_basic() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![
+                ClickHouseColumn {
+                    name: "id".to_string(),
+                    column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                    required: true,
+                    primary_key: true,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "name".to_string(),
+                    column_type: ClickHouseColumnType::String,
+                    required: false,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec![]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `id` Int32 NOT NULL,
+ `name` String NULL
+)
+ENGINE = MergeTree
+PRIMARY KEY (`id`)
+"#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_create_table_query_with_default_nullable_string() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![ClickHouseColumn {
+                name: "name".to_string(),
+                column_type: ClickHouseColumnType::String,
+                required: false,
+                primary_key: false,
+                unique: false,
+                default: Some("'abc'".to_string()),
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec![]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        // DEFAULT should appear after nullable marker
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `name` String NULL DEFAULT 'abc'
+)
+ENGINE = MergeTree
+"#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_create_table_query_with_default_not_null_int() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![ClickHouseColumn {
+                name: "count".to_string(),
+                column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                required: true,
+                primary_key: false,
+                unique: false,
+                default: Some("42".to_string()),
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec![]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `count` Int32 NOT NULL DEFAULT 42
+)
+ENGINE = MergeTree
+"#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_create_table_query_with_sql_function_defaults() {
+        // Test that SQL function defaults (like xxHash64, now(), today()) are not quoted
+        // This is the fix for ENG-1162
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![
+                ClickHouseColumn {
+                    name: "_id".to_string(),
+                    column_type: ClickHouseColumnType::String,
+                    required: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "sample_hash".to_string(),
+                    column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::UInt64),
+                    required: true,
+                    primary_key: false,
+                    unique: false,
+                    default: Some("xxHash64(_id)".to_string()), // SQL function - no quotes
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "created_at".to_string(),
+                    column_type: ClickHouseColumnType::DateTime64 { precision: 3 },
+                    required: true,
+                    primary_key: false,
+                    unique: false,
+                    default: Some("now()".to_string()), // SQL function - no quotes
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec![]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `_id` String NOT NULL,
+ `sample_hash` UInt64 NOT NULL DEFAULT xxHash64(_id),
+ `created_at` DateTime64(3) NOT NULL DEFAULT now()
+)
+ENGINE = MergeTree
+"#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_create_table_query_replacing_merge_tree() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![ClickHouseColumn {
+                name: "id".to_string(),
+                column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                required: true,
+                primary_key: true,
+                unique: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::ReplacingMergeTree {
+                ver: None,
+                is_deleted: None,
+            },
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `id` Int32 NOT NULL
+)
+ENGINE = ReplacingMergeTree
+PRIMARY KEY (`id`)
+ORDER BY (`id`) "#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_create_table_query_replacing_merge_tree_error() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![ClickHouseColumn {
+                name: "id".to_string(),
+                column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                required: true,
+                primary_key: true,
+                unique: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            engine: ClickhouseEngine::ReplacingMergeTree {
+                ver: None,
+                is_deleted: None,
+            },
+            sample_by: None,
+            order_by: OrderBy::Fields(vec![]),
+            partition_by: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let result = create_table_query("test_db", table, false);
+        assert!(matches!(
+            result,
+            Err(ClickhouseError::InvalidParameters { message }) if message == "ReplacingMergeTree requires an order by clause"
+        ));
+    }
+
+    #[test]
+    fn test_create_table_query_replacing_merge_tree_with_ver() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![
+                ClickHouseColumn {
+                    name: "id".to_string(),
+                    column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                    required: true,
+                    primary_key: true,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "version".to_string(),
+                    column_type: ClickHouseColumnType::DateTime,
+                    required: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::ReplacingMergeTree {
+                ver: Some("version".to_string()),
+                is_deleted: None,
+            },
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `id` Int32 NOT NULL,
+ `version` DateTime('UTC') NOT NULL
+)
+ENGINE = ReplacingMergeTree(`version`)
+PRIMARY KEY (`id`)
+ORDER BY (`id`) "#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_create_table_query_replacing_merge_tree_with_ver_and_is_deleted() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![
+                ClickHouseColumn {
+                    name: "id".to_string(),
+                    column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                    required: true,
+                    primary_key: true,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "version".to_string(),
+                    column_type: ClickHouseColumnType::DateTime,
+                    required: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "is_deleted".to_string(),
+                    column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::UInt8),
+                    required: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::ReplacingMergeTree {
+                ver: Some("version".to_string()),
+                is_deleted: Some("is_deleted".to_string()),
+            },
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `id` Int32 NOT NULL,
+ `version` DateTime('UTC') NOT NULL,
+ `is_deleted` UInt8 NOT NULL
+)
+ENGINE = ReplacingMergeTree(`version`, `is_deleted`)
+PRIMARY KEY (`id`)
+ORDER BY (`id`) "#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_create_table_query_replacing_merge_tree_is_deleted_requires_ver() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![ClickHouseColumn {
+                name: "id".to_string(),
+                column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                required: true,
+                primary_key: true,
+                unique: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            sample_by: None,
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            engine: ClickhouseEngine::ReplacingMergeTree {
+                ver: None,
+                is_deleted: Some("is_deleted".to_string()),
+            },
+            table_settings: None,
+            table_ttl_setting: None,
+            indexes: vec![],
+            projections: vec![],
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let result = create_table_query("test_db", table, false);
+        assert!(matches!(
+            result,
+            Err(ClickhouseError::InvalidParameters { message }) if message == "is_deleted parameter requires ver to be specified"
+        ));
+    }
+
+    #[test]
+    fn test_serialize_replacing_merge_tree_validation() {
+        // Test that serialize_replacing_merge_tree properly handles the case where
+        // is_deleted is Some but ver is None (should not include is_deleted in output)
+        let result = ClickhouseEngine::serialize_replacing_merge_tree(
+            &None,
+            &Some("is_deleted".to_string()),
+        );
+        assert_eq!(result, "ReplacingMergeTree");
+
+        // Test normal cases
+        assert_eq!(
+            ClickhouseEngine::serialize_replacing_merge_tree(&None, &None),
+            "ReplacingMergeTree"
+        );
+        assert_eq!(
+            ClickhouseEngine::serialize_replacing_merge_tree(&Some("version".to_string()), &None),
+            "ReplacingMergeTree('version')"
+        );
+        assert_eq!(
+            ClickhouseEngine::serialize_replacing_merge_tree(
+                &Some("version".to_string()),
+                &Some("is_deleted".to_string())
+            ),
+            "ReplacingMergeTree('version', 'is_deleted')"
+        );
+    }
+
+    #[test]
+    fn test_replacing_merge_tree_round_trip() {
+        // Test round-trip conversion for ReplacingMergeTree with no parameters
+        let engine1 = ClickhouseEngine::ReplacingMergeTree {
+            ver: None,
+            is_deleted: None,
+        };
+        let str1: String = engine1.clone().into();
+        assert_eq!(str1, "ReplacingMergeTree");
+        let parsed1 = ClickhouseEngine::try_from(str1.as_str()).unwrap();
+        assert_eq!(parsed1, engine1);
+
+        // Test round-trip conversion for ReplacingMergeTree with ver
+        let engine2 = ClickhouseEngine::ReplacingMergeTree {
+            ver: Some("version".to_string()),
+            is_deleted: None,
+        };
+        let str2: String = engine2.clone().into();
+        assert_eq!(str2, "ReplacingMergeTree('version')");
+        let parsed2 = ClickhouseEngine::try_from(str2.as_str()).unwrap();
+        assert_eq!(parsed2, engine2);
+
+        // Test round-trip conversion for ReplacingMergeTree with ver and is_deleted
+        let engine3 = ClickhouseEngine::ReplacingMergeTree {
+            ver: Some("version".to_string()),
+            is_deleted: Some("is_deleted".to_string()),
+        };
+        let str3: String = engine3.clone().into();
+        assert_eq!(str3, "ReplacingMergeTree('version', 'is_deleted')");
+        let parsed3 = ClickhouseEngine::try_from(str3.as_str()).unwrap();
+        assert_eq!(parsed3, engine3);
+
+        // Also verify to_proto_string produces the same format
+        assert_eq!(engine1.to_proto_string(), "ReplacingMergeTree");
+        assert_eq!(engine2.to_proto_string(), "ReplacingMergeTree('version')");
+        assert_eq!(
+            engine3.to_proto_string(),
+            "ReplacingMergeTree('version', 'is_deleted')"
+        );
+    }
+
+    #[test]
+    fn test_create_table_query_complex() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![
+                ClickHouseColumn {
+                    name: "id".to_string(),
+                    column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                    required: true,
+                    primary_key: true,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "nested_data".to_string(),
+                    column_type: ClickHouseColumnType::Nested(vec![
+                        ClickHouseColumn {
+                            name: "field1".to_string(),
+                            column_type: ClickHouseColumnType::String,
+                            required: true,
+                            primary_key: false,
+                            unique: false,
+                            default: None,
+                            comment: None,
+                            ttl: None,
+                            codec: None,
+                            materialized: None,
+                            alias: None,
+                        },
+                        ClickHouseColumn {
+                            name: "field2".to_string(),
+                            column_type: ClickHouseColumnType::Boolean,
+                            required: false,
+                            primary_key: false,
+                            unique: false,
+                            default: None,
+                            comment: None,
+                            ttl: None,
+                            codec: None,
+                            materialized: None,
+                            alias: None,
+                        },
+                    ]),
+                    required: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "status".to_string(),
+                    column_type: ClickHouseColumnType::Enum(DataEnum {
+                        name: "Status".to_string(),
+                        values: vec![
+                            EnumMember {
+                                name: "Active".to_string(),
+                                value: EnumValue::Int(1),
+                            },
+                            EnumMember {
+                                name: "Inactive".to_string(),
+                                value: EnumValue::Int(2),
+                            },
+                        ],
+                    }),
+                    required: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `id` Int32 NOT NULL,
+ `nested_data` Nested(field1 String, field2 Nullable(Boolean)) NOT NULL,
+ `status` Enum('Active' = 1,'Inactive' = 2) NOT NULL
+)
+ENGINE = MergeTree
+PRIMARY KEY (`id`)
+ORDER BY (`id`) "#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_create_table_query_with_primary_key_expression() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![
+                ClickHouseColumn {
+                    name: "user_id".to_string(),
+                    column_type: ClickHouseColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false, // primary_key flag ignored when primary_key_expression is set
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "event_id".to_string(),
+                    column_type: ClickHouseColumnType::String,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "timestamp".to_string(),
+                    column_type: ClickHouseColumnType::DateTime,
+                    required: true,
+                    unique: false,
+                    primary_key: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::SingleExpr("(user_id, cityHash64(event_id), timestamp)".to_string()),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: Some("(user_id, cityHash64(event_id))".to_string()),
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `user_id` String NOT NULL,
+ `event_id` String NOT NULL,
+ `timestamp` DateTime('UTC') NOT NULL
+)
+ENGINE = MergeTree
+PRIMARY KEY (user_id, cityHash64(event_id))
+ORDER BY (user_id, cityHash64(event_id), timestamp)"#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_create_table_query_with_primary_key_expression_no_parens() {
+        // Test that primary_key_expression works even without outer parentheses
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![ClickHouseColumn {
+                name: "product_id".to_string(),
+                column_type: ClickHouseColumnType::String,
+                required: true,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec!["product_id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: Some("product_id".to_string()),
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        assert!(query.contains("PRIMARY KEY (product_id)"));
+        // Should have single parentheses, not double
+        assert!(!query.contains("PRIMARY KEY ((product_id))"));
+    }
+
+    #[test]
+    fn test_create_table_query_s3queue() {
+        let mut settings = std::collections::HashMap::new();
+        settings.insert("mode".to_string(), "unordered".to_string());
+        settings.insert(
+            "keeper_path".to_string(),
+            "/clickhouse/s3queue/test_table".to_string(),
+        );
+        settings.insert("s3queue_loading_retries".to_string(), "3".to_string());
+
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![
+                ClickHouseColumn {
+                    name: "id".to_string(),
+                    column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                    required: true,
+                    primary_key: true,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "data".to_string(),
+                    column_type: ClickHouseColumnType::String,
+                    required: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec![]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::S3Queue {
+                s3_path: "s3://my-bucket/data/*.json".to_string(),
+                format: "JSONEachRow".to_string(),
+                compression: None,
+                headers: None,
+                aws_access_key_id: None,
+                aws_secret_access_key: None,
+            },
+            table_settings: Some(settings),
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `id` Int32 NOT NULL,
+ `data` String NOT NULL
+)
+ENGINE = S3Queue('s3://my-bucket/data/*.json', NOSIGN, 'JSONEachRow')
+SETTINGS keeper_path = '/clickhouse/s3queue/test_table', mode = 'unordered', s3queue_loading_retries = 3"#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_s3queue_parsing_with_credentials() {
+        let engine_str = "S3Queue('https://test-s3-queue-engine.s3.eu-north-1.amazonaws.com/*', 'AKIA6OQXSVQF4HIUAX5J', 'secret123', 'CSV')";
+        let result = ClickhouseEngine::try_from(engine_str);
+        assert!(result.is_ok());
+
+        if let Ok(ClickhouseEngine::S3Queue {
+            s3_path,
+            format,
+            aws_access_key_id,
+            aws_secret_access_key,
+            ..
+        }) = result
+        {
+            assert_eq!(
+                s3_path,
+                "https://test-s3-queue-engine.s3.eu-north-1.amazonaws.com/*"
+            );
+            assert_eq!(format, "CSV");
+            assert_eq!(aws_access_key_id, Some("AKIA6OQXSVQF4HIUAX5J".to_string()));
+            assert_eq!(aws_secret_access_key, Some("secret123".to_string()));
+        } else {
+            panic!("Expected S3Queue engine");
+        }
+    }
+
+    #[test]
+    fn test_s3queue_parsing_without_credentials() {
+        let engine_str = "S3Queue('https://public-bucket.s3.amazonaws.com/*', 'JSON')";
+        let result = ClickhouseEngine::try_from(engine_str);
+        assert!(result.is_ok());
+
+        if let Ok(ClickhouseEngine::S3Queue {
+            s3_path,
+            format,
+            aws_access_key_id,
+            aws_secret_access_key,
+            ..
+        }) = result
+        {
+            assert_eq!(s3_path, "https://public-bucket.s3.amazonaws.com/*");
+            assert_eq!(format, "JSON");
+            assert_eq!(aws_access_key_id, None);
+            assert_eq!(aws_secret_access_key, None);
+        } else {
+            panic!("Expected S3Queue engine");
+        }
+    }
+
+    #[test]
+    fn test_s3queue_parsing_with_nosign() {
+        let engine_str = "S3Queue('https://public-bucket.s3.amazonaws.com/*', NOSIGN, 'CSV')";
+        let result = ClickhouseEngine::try_from(engine_str);
+        assert!(result.is_ok());
+
+        if let Ok(ClickhouseEngine::S3Queue {
+            s3_path,
+            format,
+            aws_access_key_id,
+            aws_secret_access_key,
+            ..
+        }) = result
+        {
+            assert_eq!(s3_path, "https://public-bucket.s3.amazonaws.com/*");
+            assert_eq!(format, "CSV");
+            assert_eq!(aws_access_key_id, None);
+            assert_eq!(aws_secret_access_key, None);
+        } else {
+            panic!("Expected S3Queue engine");
+        }
+    }
+
+    #[test]
+    fn test_s3queue_parsing_with_nosign_and_compression() {
+        let engine_str =
+            "S3Queue('https://public-bucket.s3.amazonaws.com/*', NOSIGN, 'CSV', 'gzip')";
+        let result = ClickhouseEngine::try_from(engine_str);
+        assert!(result.is_ok());
+
+        if let Ok(ClickhouseEngine::S3Queue {
+            s3_path,
+            format,
+            compression,
+            aws_access_key_id,
+            aws_secret_access_key,
+            ..
+        }) = result
+        {
+            assert_eq!(s3_path, "https://public-bucket.s3.amazonaws.com/*");
+            assert_eq!(format, "CSV");
+            assert_eq!(compression, Some("gzip".to_string()));
+            assert_eq!(aws_access_key_id, None);
+            assert_eq!(aws_secret_access_key, None);
+        } else {
+            panic!("Expected S3Queue engine");
+        }
+    }
+
+    #[test]
+    fn test_parse_quoted_csv() {
+        // Test basic parsing
+        assert_eq!(
+            parse_quoted_csv("'value1', 'value2'"),
+            vec!["value1", "value2"]
+        );
+
+        // Test with spaces
+        assert_eq!(
+            parse_quoted_csv("  'value1'  ,  'value2'  "),
+            vec!["value1", "value2"]
+        );
+
+        // Test with null values
+        assert_eq!(
+            parse_quoted_csv("'value1', null, 'value3'"),
+            vec!["value1", "null", "value3"]
+        );
+
+        // Test with escaped quotes
+        assert_eq!(
+            parse_quoted_csv("'value1', 'val\\'ue2'"),
+            vec!["value1", "val'ue2"]
+        );
+
+        // Test with JSON containing quotes
+        assert_eq!(
+            parse_quoted_csv("'path', 'format', null, '{\"key\": \"val\\'ue\"}'"),
+            vec!["path", "format", "null", "{\"key\": \"val'ue\"}"]
+        );
+
+        // Test empty string
+        assert_eq!(parse_quoted_csv(""), Vec::<String>::new());
+
+        // Test single value
+        assert_eq!(parse_quoted_csv("'single'"), vec!["single"]);
+    }
+
+    #[test]
+    fn test_s3queue_serialization() {
+        // Test with all parameters
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-custom".to_string(), "value".to_string());
+
+        let result = ClickhouseEngine::serialize_s3queue(
+            "s3://bucket/path",
+            "JSONEachRow",
+            &Some("gzip".to_string()),
+            &Some(headers),
+        );
+
+        assert!(result.starts_with("S3Queue('s3://bucket/path', 'JSONEachRow', 'gzip',"));
+        assert!(result.contains("x-custom"));
+
+        // Test with minimal parameters
+        let minimal = ClickhouseEngine::serialize_s3queue("s3://bucket/data", "CSV", &None, &None);
+
+        assert_eq!(minimal, "S3Queue('s3://bucket/data', 'CSV', null, null)");
+
+        // Test with special characters in path
+        let special = ClickhouseEngine::serialize_s3queue(
+            "s3://bucket/path with spaces/*.json",
+            "JSONEachRow",
+            &None,
+            &None,
+        );
+
+        assert_eq!(
+            special,
+            "S3Queue('s3://bucket/path with spaces/*.json', 'JSONEachRow', null, null)"
+        );
+    }
+
+    #[test]
+    fn test_s3queue_display_with_credentials() {
+        let engine = ClickhouseEngine::S3Queue {
+            s3_path: "s3://bucket/data/*.json".to_string(),
+            format: "JSONEachRow".to_string(),
+            compression: None,
+            headers: None,
+            aws_access_key_id: Some("AKIAIOSFODNN7EXAMPLE".to_string()),
+            aws_secret_access_key: Some("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string()),
+        };
+        let display: String = engine.into();
+        assert!(display.contains("auth='AKIAIOSFODNN7EXAMPLE:wJal...EKEY'"));
+        assert!(display.contains("S3Queue('s3://bucket/data/*.json', 'JSONEachRow'"));
+    }
+
+    #[test]
+    fn test_s3queue_display_without_credentials() {
+        let engine = ClickhouseEngine::S3Queue {
+            s3_path: "s3://public-bucket/data/*.csv".to_string(),
+            format: "CSV".to_string(),
+            compression: Some("gzip".to_string()),
+            headers: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+        };
+        let display: String = engine.into();
+        assert!(display.contains("auth=NOSIGN"));
+        assert!(display.contains("compression='gzip'"));
+        assert!(display.contains("S3Queue('s3://public-bucket/data/*.csv', 'CSV'"));
+    }
+
+    #[test]
+    fn test_s3queue_display_with_headers() {
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("x-custom".to_string(), "value".to_string());
+        headers.insert("x-another".to_string(), "test".to_string());
+
+        let engine = ClickhouseEngine::S3Queue {
+            s3_path: "s3://bucket/path/*.json".to_string(),
+            format: "JSON".to_string(),
+            compression: None,
+            headers: Some(headers),
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+        };
+        let display: String = engine.into();
+        assert!(display.contains("headers_count=2"));
+        assert!(display.contains("auth=NOSIGN"));
+    }
+
+    #[test]
+    fn test_s3queue_parsing() {
+        // Test basic parsing
+        let engine = ClickhouseEngine::parse_s3queue("'s3://bucket/path', 'JSONEachRow'").unwrap();
+        match engine {
+            ClickhouseEngine::S3Queue {
+                s3_path,
+                format,
+                compression,
+                headers,
+                ..
+            } => {
+                assert_eq!(s3_path, "s3://bucket/path");
+                assert_eq!(format, "JSONEachRow");
+                assert_eq!(compression, None);
+                assert_eq!(headers, None);
+            }
+            _ => panic!("Expected S3Queue"),
+        }
+
+        // Test with compression
+        let with_comp =
+            ClickhouseEngine::parse_s3queue("'s3://bucket/path', 'CSV', 'gzip', null").unwrap();
+        match with_comp {
+            ClickhouseEngine::S3Queue { compression, .. } => {
+                assert_eq!(compression, Some("gzip".to_string()));
+            }
+            _ => panic!("Expected S3Queue"),
+        }
+
+        // Test with headers
+        let with_headers = ClickhouseEngine::parse_s3queue(
+            "'s3://bucket/path', 'JSON', null, '{\"x-custom\": \"value\"}'",
+        )
+        .unwrap();
+        match with_headers {
+            ClickhouseEngine::S3Queue { headers, .. } => {
+                assert!(headers.is_some());
+                let hdrs = headers.unwrap();
+                assert_eq!(hdrs.get("x-custom"), Some(&"value".to_string()));
+            }
+            _ => panic!("Expected S3Queue"),
+        }
+
+        // Test error case - missing format
+        let err = ClickhouseEngine::parse_s3queue("'s3://bucket/path'");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_s3queue_engine_round_trip() {
+        // Test case 1: Full parameters with compression and headers
+        let mut headers1 = std::collections::HashMap::new();
+        headers1.insert("x-custom-header".to_string(), "value1".to_string());
+        headers1.insert("authorization".to_string(), "Bearer token".to_string());
+
+        let engine1 = ClickhouseEngine::S3Queue {
+            s3_path: "s3://bucket/path/*.json".to_string(),
+            format: "JSONEachRow".to_string(),
+            compression: Some("gzip".to_string()),
+            headers: Some(headers1.clone()),
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+        };
+
+        let serialized1 = engine1.to_proto_string();
+        let deserialized1 = ClickhouseEngine::try_from(serialized1.as_str()).unwrap();
+
+        match deserialized1 {
+            ClickhouseEngine::S3Queue {
+                s3_path,
+                format,
+                compression,
+                headers,
+                ..
+            } => {
+                assert_eq!(s3_path, "s3://bucket/path/*.json");
+                assert_eq!(format, "JSONEachRow");
+                assert_eq!(compression, Some("gzip".to_string()));
+                assert!(headers.is_some());
+                let hdrs = headers.unwrap();
+                assert_eq!(hdrs.len(), 2);
+                assert_eq!(hdrs.get("x-custom-header"), Some(&"value1".to_string()));
+                assert_eq!(hdrs.get("authorization"), Some(&"Bearer token".to_string()));
+            }
+            _ => panic!("Expected S3Queue engine"),
+        }
+
+        // Test case 2: Minimal parameters
+        let engine2 = ClickhouseEngine::S3Queue {
+            s3_path: "s3://bucket/data".to_string(),
+            format: "CSV".to_string(),
+            compression: None,
+            headers: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+        };
+
+        let serialized2 = engine2.to_proto_string();
+        assert_eq!(
+            serialized2,
+            "S3Queue('s3://bucket/data', 'CSV', null, null)"
+        );
+
+        let deserialized2 = ClickhouseEngine::try_from(serialized2.as_str()).unwrap();
+        match deserialized2 {
+            ClickhouseEngine::S3Queue {
+                s3_path,
+                format,
+                compression,
+                headers,
+                ..
+            } => {
+                assert_eq!(s3_path, "s3://bucket/data");
+                assert_eq!(format, "CSV");
+                assert_eq!(compression, None);
+                assert_eq!(headers, None);
+            }
+            _ => panic!("Expected S3Queue engine"),
+        }
+
+        // Test case 3: Path with special characters
+        let engine3 = ClickhouseEngine::S3Queue {
+            s3_path: "s3://my-bucket/data/year=2024/month=01/*.parquet".to_string(),
+            format: "Parquet".to_string(),
+            compression: Some("snappy".to_string()),
+            headers: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+        };
+
+        let serialized3 = engine3.to_proto_string();
+        let deserialized3 = ClickhouseEngine::try_from(serialized3.as_str()).unwrap();
+
+        match deserialized3 {
+            ClickhouseEngine::S3Queue {
+                s3_path,
+                format,
+                compression,
+                ..
+            } => {
+                assert_eq!(s3_path, "s3://my-bucket/data/year=2024/month=01/*.parquet");
+                assert_eq!(format, "Parquet");
+                assert_eq!(compression, Some("snappy".to_string()));
+            }
+            _ => panic!("Expected S3Queue engine"),
+        }
+
+        // Test case 4: Headers with quotes and special characters
+        let mut headers4 = std::collections::HashMap::new();
+        headers4.insert("x-meta".to_string(), "value with 'quotes'".to_string());
+
+        let engine4 = ClickhouseEngine::S3Queue {
+            s3_path: "s3://bucket/test".to_string(),
+            format: "JSON".to_string(),
+            compression: None,
+            headers: Some(headers4),
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+        };
+
+        let serialized4 = engine4.to_proto_string();
+        let deserialized4 = ClickhouseEngine::try_from(serialized4.as_str()).unwrap();
+
+        match deserialized4 {
+            ClickhouseEngine::S3Queue { headers, .. } => {
+                assert!(headers.is_some());
+                let hdrs = headers.unwrap();
+                assert_eq!(hdrs.get("x-meta"), Some(&"value with 'quotes'".to_string()));
+            }
+            _ => panic!("Expected S3Queue engine"),
+        }
+    }
+
+    #[test]
+    fn test_s3queue_with_settings_preservation() {
+        // Verify that settings are preserved separately from serialization
+        let mut settings = std::collections::HashMap::new();
+        settings.insert("mode".to_string(), "ordered".to_string());
+        settings.insert("keeper_path".to_string(), "/clickhouse/s3".to_string());
+
+        let engine = ClickhouseEngine::S3Queue {
+            s3_path: "s3://bucket/path".to_string(),
+            format: "JSONEachRow".to_string(),
+            compression: None,
+            headers: None,
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+        };
+
+        // Serialize (settings are NOT included in the string representation)
+        let serialized = engine.to_proto_string();
+        assert_eq!(
+            serialized,
+            "S3Queue('s3://bucket/path', 'JSONEachRow', null, null)"
+        );
+
+        // When deserializing, settings come back empty
+        let deserialized = ClickhouseEngine::try_from(serialized.as_str()).unwrap();
+        match &deserialized {
+            ClickhouseEngine::S3Queue { .. } => {
+                // Settings are now in table_settings, not in the engine
+            }
+            _ => panic!("Expected S3Queue"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_query_s3queue_without_settings() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![ClickHouseColumn {
+                name: "id".to_string(),
+                column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                required: true,
+                primary_key: true,
+                unique: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec![]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::S3Queue {
+                s3_path: "s3://my-bucket/data/*.csv".to_string(),
+                format: "CSV".to_string(),
+                compression: None,
+                headers: None,
+                aws_access_key_id: None,
+                aws_secret_access_key: None,
+            },
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `id` Int32 NOT NULL
+)
+ENGINE = S3Queue('s3://my-bucket/data/*.csv', NOSIGN, 'CSV')"#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_hash_consistency() {
+        // Test that the same engine produces the same hash multiple times
+        let engine1 = ClickhouseEngine::S3Queue {
+            s3_path: "s3://test-bucket/data/*.json".to_string(),
+            format: "JSONEachRow".to_string(),
+            compression: Some("gzip".to_string()),
+            headers: None,
+            aws_access_key_id: Some("test-key".to_string()),
+            aws_secret_access_key: Some("test-secret".to_string()),
+        };
+
+        let engine2 = ClickhouseEngine::S3Queue {
+            s3_path: "s3://test-bucket/data/*.json".to_string(),
+            format: "JSONEachRow".to_string(),
+            compression: Some("gzip".to_string()),
+            headers: None,
+            aws_access_key_id: Some("test-key".to_string()),
+            aws_secret_access_key: Some("test-secret".to_string()),
+        };
+
+        let hash1 = engine1.non_alterable_params_hash();
+        let hash2 = engine2.non_alterable_params_hash();
+
+        // Hashes should be identical for identical engines
+        assert_eq!(hash1, hash2);
+
+        // Hash should be a valid hex string (64 characters for SHA256)
+        assert_eq!(hash1.len(), 64);
+        assert!(hash1.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Test different engines produce different hashes
+        let merge_tree = ClickhouseEngine::MergeTree;
+        let merge_tree_hash = merge_tree.non_alterable_params_hash();
+        assert_ne!(hash1, merge_tree_hash);
+    }
+
+    #[test]
+    fn test_shared_replacing_merge_tree_parsing() {
+        // Test SharedReplacingMergeTree parsing with different parameter combinations
+        let test_cases = vec![
+            (
+                "SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}')",
+                None,
+                None,
+            ),
+            (
+                "SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', _peerdb_version)",
+                Some("_peerdb_version"),
+                None,
+            ),
+            (
+                "SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', _peerdb_version, _peerdb_is_deleted)",
+                Some("_peerdb_version"),
+                Some("_peerdb_is_deleted"),
+            ),
+        ];
+
+        for (input, expected_ver, expected_is_deleted) in test_cases {
+            let engine: ClickhouseEngine = input.try_into().unwrap();
+            match engine {
+                ClickhouseEngine::ReplacingMergeTree { ver, is_deleted } => {
+                    assert_eq!(ver.as_deref(), expected_ver, "Failed for input: {}", input);
+                    assert_eq!(
+                        is_deleted.as_deref(),
+                        expected_is_deleted,
+                        "Failed for input: {}",
+                        input
+                    );
+                }
+                _ => panic!("Expected ReplacingMergeTree for input: {}", input),
+            }
+        }
+    }
+
+    #[test]
+    fn test_replicated_replacing_merge_tree_parsing() {
+        // Test ReplicatedReplacingMergeTree with default parameters - should normalize to None
+        let test_cases_default = vec![
+            (
+                "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}')",
+                None,
+                None,
+            ),
+            (
+                "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version_col)",
+                Some("version_col"),
+                None,
+            ),
+            (
+                "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version_col, is_deleted_col)",
+                Some("version_col"),
+                Some("is_deleted_col"),
+            ),
+        ];
+
+        for (input, expected_ver, expected_is_deleted) in test_cases_default {
+            let engine: ClickhouseEngine = input.try_into().unwrap();
+            match engine {
+                ClickhouseEngine::ReplicatedReplacingMergeTree {
+                    keeper_path,
+                    replica_name,
+                    ver,
+                    is_deleted,
+                } => {
+                    assert_eq!(
+                        keeper_path, None,
+                        "Default paths should be normalized to None for input: {}",
+                        input
+                    );
+                    assert_eq!(
+                        replica_name, None,
+                        "Default paths should be normalized to None for input: {}",
+                        input
+                    );
+                    assert_eq!(ver.as_deref(), expected_ver, "Failed for input: {}", input);
+                    assert_eq!(
+                        is_deleted.as_deref(),
+                        expected_is_deleted,
+                        "Failed for input: {}",
+                        input
+                    );
+                }
+                _ => panic!("Expected ReplicatedReplacingMergeTree for input: {}", input),
+            }
+        }
+    }
+
+    #[test]
+    fn test_shared_merge_tree_engine_parsing() {
+        // Test SharedMergeTree without parameters
+        let engine = ClickhouseEngine::try_from("SharedMergeTree").unwrap();
+        assert_eq!(engine, ClickhouseEngine::MergeTree);
+
+        // Test SharedMergeTree with parameters - should normalize to MergeTree
+        let test_cases = vec![
+            "SharedMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}')",
+            "SharedMergeTree('/clickhouse/prod/tables/{database}/{table}', 'replica-{num}')",
+        ];
+
+        for input in test_cases {
+            let engine = ClickhouseEngine::try_from(input).unwrap();
+            assert_eq!(
+                engine,
+                ClickhouseEngine::MergeTree,
+                "Failed for input: {}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_shared_aggregating_merge_tree_engine_parsing() {
+        // Test SharedAggregatingMergeTree without parameters
+        let engine = ClickhouseEngine::try_from("SharedAggregatingMergeTree").unwrap();
+        assert_eq!(engine, ClickhouseEngine::AggregatingMergeTree);
+
+        // Test SharedAggregatingMergeTree with parameters - should normalize to AggregatingMergeTree
+        let test_cases = vec![
+            "SharedAggregatingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}')",
+            "SharedAggregatingMergeTree('/clickhouse/tables/{uuid}', 'replica-1')",
+        ];
+
+        for input in test_cases {
+            let engine = ClickhouseEngine::try_from(input).unwrap();
+            assert_eq!(
+                engine,
+                ClickhouseEngine::AggregatingMergeTree,
+                "Failed for input: {}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_shared_summing_merge_tree_engine_parsing() {
+        // Test SharedSummingMergeTree without parameters
+        let engine = ClickhouseEngine::try_from("SharedSummingMergeTree").unwrap();
+        assert_eq!(engine, ClickhouseEngine::SummingMergeTree { columns: None });
+
+        // Test SharedSummingMergeTree with parameters - should normalize to SummingMergeTree
+        let test_cases = vec![
+            "SharedSummingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}')",
+            "SharedSummingMergeTree('/clickhouse/tables/{uuid}', 'replica-1')",
+        ];
+
+        for input in test_cases {
+            let engine = ClickhouseEngine::try_from(input).unwrap();
+            assert_eq!(
+                engine,
+                ClickhouseEngine::SummingMergeTree { columns: None },
+                "Failed for input: {}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_replicated_merge_tree_engine_parsing() {
+        // Test ReplicatedMergeTree without parameters - should return ReplicatedMergeTree with None parameters
+        let engine = ClickhouseEngine::try_from("ReplicatedMergeTree").unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::ReplicatedMergeTree {
+                keeper_path: None,
+                replica_name: None
+            }
+        );
+
+        // Test ReplicatedMergeTree with default parameters - should normalize back to None
+        let engine = ClickhouseEngine::try_from(
+            "ReplicatedMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}')",
+        )
+        .unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::ReplicatedMergeTree {
+                keeper_path: None,
+                replica_name: None
+            },
+            "Default paths should be normalized to None"
+        );
+
+        // Test ReplicatedMergeTree with custom parameters - should preserve replication config
+        let test_cases = vec![(
+            "ReplicatedMergeTree('/clickhouse/prod/tables/{database}', 'replica-{num}')",
+            "/clickhouse/prod/tables/{database}",
+            "replica-{num}",
+        )];
+
+        for (input, expected_path, expected_replica) in test_cases {
+            let engine = ClickhouseEngine::try_from(input).unwrap();
+            match engine {
+                ClickhouseEngine::ReplicatedMergeTree {
+                    keeper_path,
+                    replica_name,
+                } => {
+                    assert_eq!(keeper_path, Some(expected_path.to_string()));
+                    assert_eq!(replica_name, Some(expected_replica.to_string()));
+                }
+                _ => panic!("Expected ReplicatedMergeTree for input: {}", input),
+            }
+        }
+    }
+
+    #[test]
+    fn test_replicated_aggregating_merge_tree_engine_parsing() {
+        // Test ReplicatedAggregatingMergeTree without parameters - should return ReplicatedAggregatingMergeTree with None parameters
+        let engine = ClickhouseEngine::try_from("ReplicatedAggregatingMergeTree").unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::ReplicatedAggregatingMergeTree {
+                keeper_path: None,
+                replica_name: None
+            }
+        );
+
+        // Test ReplicatedAggregatingMergeTree with default parameters - should normalize back to None
+        let engine = ClickhouseEngine::try_from(
+            "ReplicatedAggregatingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}')",
+        )
+        .unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::ReplicatedAggregatingMergeTree {
+                keeper_path: None,
+                replica_name: None
+            },
+            "Default paths should be normalized to None"
+        );
+
+        // Test ReplicatedAggregatingMergeTree with custom parameters - should preserve replication config
+        let test_cases = vec![(
+            "ReplicatedAggregatingMergeTree('/clickhouse/tables/{uuid}', 'replica-1')",
+            "/clickhouse/tables/{uuid}",
+            "replica-1",
+        )];
+
+        for (input, expected_path, expected_replica) in test_cases {
+            let engine = ClickhouseEngine::try_from(input).unwrap();
+            match engine {
+                ClickhouseEngine::ReplicatedAggregatingMergeTree {
+                    keeper_path,
+                    replica_name,
+                } => {
+                    assert_eq!(keeper_path, Some(expected_path.to_string()));
+                    assert_eq!(replica_name, Some(expected_replica.to_string()));
+                }
+                _ => panic!(
+                    "Expected ReplicatedAggregatingMergeTree for input: {}",
+                    input
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_replicated_summing_merge_tree_engine_parsing() {
+        // Test ReplicatedSummingMergeTree without parameters - should return ReplicatedSummingMergeTree with None parameters
+        let engine = ClickhouseEngine::try_from("ReplicatedSummingMergeTree").unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::ReplicatedSummingMergeTree {
+                keeper_path: None,
+                replica_name: None,
+                columns: None
+            }
+        );
+
+        // Test ReplicatedSummingMergeTree with default parameters - should normalize back to None
+        let engine = ClickhouseEngine::try_from(
+            "ReplicatedSummingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}')",
+        )
+        .unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::ReplicatedSummingMergeTree {
+                keeper_path: None,
+                replica_name: None,
+                columns: None
+            },
+            "Default paths should be normalized to None"
+        );
+
+        // Test ReplicatedSummingMergeTree with custom parameters - should preserve replication config
+        let test_cases = vec![(
+            "ReplicatedSummingMergeTree('/clickhouse/tables/{uuid}', 'replica-1')",
+            "/clickhouse/tables/{uuid}",
+            "replica-1",
+            None,
+        )];
+
+        for (input, expected_path, expected_replica, expected_columns) in test_cases {
+            let engine = ClickhouseEngine::try_from(input).unwrap();
+            match engine {
+                ClickhouseEngine::ReplicatedSummingMergeTree {
+                    keeper_path,
+                    replica_name,
+                    columns,
+                } => {
+                    assert_eq!(keeper_path, Some(expected_path.to_string()));
+                    assert_eq!(replica_name, Some(expected_replica.to_string()));
+                    assert_eq!(columns, expected_columns);
+                }
+                _ => panic!("Expected ReplicatedSummingMergeTree for input: {}", input),
+            }
+        }
+    }
+
+    #[test]
+    fn test_shared_replacing_merge_tree_with_backticks() {
+        // Test with backticks in column names
+        let input = "SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', `version`, `is_deleted`)";
+        let engine = ClickhouseEngine::try_from(input).unwrap();
+        match engine {
+            ClickhouseEngine::ReplacingMergeTree { ver, is_deleted } => {
+                assert_eq!(ver, Some("`version`".to_string()));
+                assert_eq!(is_deleted, Some("`is_deleted`".to_string()));
+            }
+            _ => panic!("Expected ReplacingMergeTree"),
+        }
+    }
+
+    #[test]
+    fn test_shared_replacing_merge_tree_complex_paths() {
+        // Test with complex path patterns
+        let test_cases = vec![
+            (
+                "SharedReplacingMergeTree('/clickhouse/prod/tables/{database}/{table}/{uuid}', 'replica-{replica_num}')",
+                None,
+                None,
+            ),
+            (
+                "SharedReplacingMergeTree('/clickhouse/tables-v2/{uuid:01234-5678}/{shard}', '{replica}', updated_at)",
+                Some("updated_at"),
+                None,
+            ),
+        ];
+
+        for (input, expected_ver, expected_is_deleted) in test_cases {
+            let engine = ClickhouseEngine::try_from(input).unwrap();
+            match engine {
+                ClickhouseEngine::ReplacingMergeTree { ver, is_deleted } => {
+                    assert_eq!(ver.as_deref(), expected_ver, "Failed for input: {}", input);
+                    assert_eq!(
+                        is_deleted.as_deref(),
+                        expected_is_deleted,
+                        "Failed for input: {}",
+                        input
+                    );
+                }
+                _ => panic!("Expected ReplacingMergeTree for input: {}", input),
+            }
+        }
+    }
+
+    #[test]
+    fn test_shared_merge_tree_invalid_params() {
+        // Test invalid SharedReplacingMergeTree with missing parameters
+        let invalid_cases = vec![
+            "SharedReplacingMergeTree()",        // No parameters
+            "SharedReplacingMergeTree('/path')", // Only one parameter
+            "SharedMergeTree()",                 // No parameters for SharedMergeTree
+        ];
+
+        for input in invalid_cases {
+            let result = ClickhouseEngine::try_from(input);
+            assert!(result.is_err(), "Should fail for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_replacing_merge_tree_rejects_extra_params() {
+        // Guard against silent truncation: extra parameters beyond ver and is_deleted should error
+        let extra_param_cases = vec![
+            // ReplicatedReplacingMergeTree with 5 params (path, replica, ver, is_deleted, EXTRA)
+            "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', 'ver', 'is_deleted', 'extra')",
+            // SharedReplacingMergeTree with 5 params (path, replica, ver, is_deleted, EXTRA)
+            "SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', 'ver', 'is_deleted', 'extra')",
+        ];
+
+        for input in extra_param_cases {
+            let result = ClickhouseEngine::try_from(input);
+            assert!(
+                result.is_err(),
+                "Should reject extra parameters for input: {}. Got: {:?}",
+                input,
+                result
+            );
+        }
+
+        // Guard against insufficient parameters: single-parameter forms should error
+        // Both engines require 2 params minimum when not using automatic configuration
+        let insufficient_param_cases = vec![
+            // ReplicatedReplacingMergeTree with 1 param (only path, missing replica)
+            "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}')",
+            // SharedReplacingMergeTree with 1 param (only path, missing replica)
+            "SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}')",
+        ];
+
+        for input in insufficient_param_cases {
+            let result = ClickhouseEngine::try_from(input);
+            assert!(
+                result.is_err(),
+                "Should reject insufficient parameters for input: {}. Got: {:?}",
+                input,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_quoted_csv_with_shared_merge_tree_params() {
+        // Test the parse_quoted_csv helper function with SharedMergeTree parameters
+        let test_cases = vec![
+            (
+                "'/clickhouse/tables/{uuid}/{shard}', '{replica}'",
+                vec!["/clickhouse/tables/{uuid}/{shard}", "{replica}"],
+            ),
+            (
+                "'/clickhouse/tables/{uuid}/{shard}', '{replica}', version",
+                vec!["/clickhouse/tables/{uuid}/{shard}", "{replica}", "version"],
+            ),
+            (
+                "'/clickhouse/tables/{uuid}/{shard}', '{replica}', 'version', 'is_deleted'",
+                vec![
+                    "/clickhouse/tables/{uuid}/{shard}",
+                    "{replica}",
+                    "version",
+                    "is_deleted",
+                ],
+            ),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = parse_quoted_csv(input);
+            assert_eq!(result, expected, "Failed for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_engine_normalization_consistency() {
+        // Test that Shared normalizes to base engine and Replicated with default paths normalizes to None
+        let shared_input =
+            "SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version)";
+        let replicated_input = "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version)";
+
+        let shared_engine = ClickhouseEngine::try_from(shared_input).unwrap();
+        let replicated_engine = ClickhouseEngine::try_from(replicated_input).unwrap();
+
+        // Shared should normalize to ReplacingMergeTree (without keeper_path/replica_name)
+        match &shared_engine {
+            ClickhouseEngine::ReplacingMergeTree { ver, is_deleted } => {
+                assert_eq!(ver, &Some("version".to_string()));
+                assert_eq!(is_deleted, &None);
+            }
+            _ => panic!("Expected ReplacingMergeTree for Shared variant"),
+        }
+
+        // Replicated with default paths should also normalize paths to None for cross-environment compatibility
+        match &replicated_engine {
+            ClickhouseEngine::ReplicatedReplacingMergeTree {
+                keeper_path,
+                replica_name,
+                ver,
+                is_deleted,
+            } => {
+                assert_eq!(keeper_path, &None, "Default paths should normalize to None");
+                assert_eq!(
+                    replica_name, &None,
+                    "Default replica should normalize to None"
+                );
+                assert_eq!(ver, &Some("version".to_string()));
+                assert_eq!(is_deleted, &None);
+            }
+            _ => panic!("Expected ReplicatedReplacingMergeTree for Replicated variant"),
+        }
+
+        // They should be different engine types
+        assert_ne!(
+            format!("{:?}", shared_engine),
+            format!("{:?}", replicated_engine),
+            "Shared and Replicated variants should be different engine types"
+        );
+    }
+
+    #[test]
+    fn test_clickhouse_cloud_real_engine_parsing() {
+        // Real example from ClickHouse Cloud
+        let engine_str = "SharedMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}')";
+        let engine = ClickhouseEngine::try_from(engine_str).unwrap();
+        assert_eq!(engine, ClickhouseEngine::MergeTree);
+
+        // Another real example with SharedReplacingMergeTree
+        let replacing_str = "SharedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', _version, _is_deleted)";
+        let replacing_engine = ClickhouseEngine::try_from(replacing_str).unwrap();
+        match replacing_engine {
+            ClickhouseEngine::ReplacingMergeTree { ver, is_deleted } => {
+                assert_eq!(ver, Some("_version".to_string()));
+                assert_eq!(is_deleted, Some("_is_deleted".to_string()));
+            }
+            _ => panic!("Expected ReplacingMergeTree"),
+        }
+    }
+
+    #[test]
+    fn test_create_table_with_cluster_includes_on_cluster() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![ClickHouseColumn {
+                name: "id".to_string(),
+                column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                required: true,
+                primary_key: true,
+                unique: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec![]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::ReplicatedMergeTree {
+                keeper_path: None,
+                replica_name: None,
+            },
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: Some("test_cluster".to_string()),
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+
+        // Should include ON CLUSTER clause
+        assert!(
+            query.contains("ON CLUSTER `test_cluster`"),
+            "Query should contain ON CLUSTER clause"
+        );
+
+        // ON CLUSTER should come after CREATE TABLE but before column definitions
+        let create_idx = query.find("CREATE TABLE").unwrap();
+        let on_cluster_idx = query.find("ON CLUSTER").unwrap();
+        let engine_idx = query.find("ENGINE").unwrap();
+
+        assert!(
+            create_idx < on_cluster_idx && on_cluster_idx < engine_idx,
+            "ON CLUSTER should be between CREATE TABLE and ENGINE"
+        );
+    }
+
+    #[test]
+    fn test_create_table_without_cluster_no_on_cluster() {
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns: vec![ClickHouseColumn {
+                name: "id".to_string(),
+                column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int32),
+                required: true,
+                primary_key: true,
+                unique: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec![]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+
+        // Should NOT include ON CLUSTER clause
+        assert!(
+            !query.contains("ON CLUSTER"),
+            "Query should not contain ON CLUSTER clause when cluster_name is None"
+        );
+    }
+
+    #[test]
+    fn test_drop_table_with_cluster() {
+        let cluster_name = Some("test_cluster");
+        let query = drop_table_query("test_db", "test_table", cluster_name).unwrap();
+
+        // Should include ON CLUSTER clause
+        assert!(
+            query.contains("ON CLUSTER `test_cluster`"),
+            "DROP query should contain ON CLUSTER clause"
+        );
+
+        // Should have SYNC (when using ON CLUSTER)
+        assert!(
+            query.contains("SYNC"),
+            "DROP query should contain SYNC with ON CLUSTER"
+        );
+
+        // Should have DROP TABLE
+        assert!(query.contains("DROP TABLE"));
+    }
+
+    #[test]
+    fn test_drop_table_without_cluster() {
+        let cluster_name = None;
+        let query = drop_table_query("test_db", "test_table", cluster_name).unwrap();
+
+        // Should NOT include ON CLUSTER clause
+        assert!(
+            !query.contains("ON CLUSTER"),
+            "DROP query should not contain ON CLUSTER clause when cluster_name is None"
+        );
+
+        // Should NOT have SYNC (only needed with ON CLUSTER)
+        assert!(
+            !query.contains("SYNC"),
+            "DROP query should not contain SYNC without ON CLUSTER"
+        );
+
+        // Should still have DROP TABLE
+        assert!(query.contains("DROP TABLE"));
+    }
+
+    #[test]
+    fn test_alter_table_modify_setting_with_cluster() {
+        use std::collections::HashMap;
+
+        let mut settings = HashMap::new();
+        settings.insert("index_granularity".to_string(), "4096".to_string());
+        settings.insert("ttl_only_drop_parts".to_string(), "1".to_string());
+
+        let query = alter_table_modify_settings_query(
+            "test_db",
+            "test_table",
+            &settings,
+            Some("test_cluster"),
+        )
+        .unwrap();
+
+        assert!(
+            query.contains("ON CLUSTER `test_cluster`"),
+            "MODIFY SETTING query should contain ON CLUSTER clause"
+        );
+        assert!(query.contains("ALTER TABLE"));
+        assert!(query.contains("MODIFY SETTING"));
+    }
+
+    #[test]
+    fn test_alter_table_add_column_with_cluster() {
+        let column = ClickHouseColumn {
+            name: "new_col".to_string(),
+            column_type: ClickHouseColumnType::String,
+            required: false,
+            primary_key: false,
+            unique: false,
+            default: None,
+            comment: None,
+            ttl: None,
+            codec: None,
+            materialized: None,
+            alias: None,
+        };
+
+        let cluster_clause = Some("test_cluster")
+            .map(|c| format!(" ON CLUSTER `{}`", c))
+            .unwrap_or_default();
+
+        let query = format!(
+            "ALTER TABLE `test_db`.`test_table`{} ADD COLUMN `{}` String FIRST",
+            cluster_clause, column.name
+        );
+
+        assert!(
+            query.contains("ON CLUSTER `test_cluster`"),
+            "ADD COLUMN query should contain ON CLUSTER clause"
+        );
+        assert!(query.contains("ALTER TABLE"));
+        assert!(query.contains("ADD COLUMN"));
+    }
+
+    #[test]
+    fn test_replication_params_dev_no_cluster_no_keeper_args_auto_injects() {
+        let result = build_replication_params(
+            &None,
+            &None,
+            &None,
+            "ReplicatedMergeTree",
+            "test_table",
+            true, // is_dev
+        );
+
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        // Should auto-inject params in dev mode
+        assert_eq!(params.len(), 2);
+        assert!(params[0].contains("/clickhouse/tables/"));
+        assert!(params[1].contains("{replica}"));
+    }
+
+    #[test]
+    fn test_replication_params_dev_with_cluster_no_keeper_args_succeeds() {
+        let result = build_replication_params(
+            &None,
+            &None,
+            &Some("test_cluster".to_string()),
+            "ReplicatedMergeTree",
+            "test_table",
+            true, // is_dev
+        );
+
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        // Dev with cluster: should return empty params (let CH use {uuid} with ON CLUSTER)
+        assert_eq!(params.len(), 0);
+    }
+
+    #[test]
+    fn test_replication_params_dev_no_cluster_with_keeper_args_succeeds() {
+        let result = build_replication_params(
+            &Some("/clickhouse/tables/{database}/{table}".to_string()),
+            &Some("{replica}".to_string()),
+            &None,
+            "ReplicatedMergeTree",
+            "test_table",
+            true, // is_dev
+        );
+
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], "'/clickhouse/tables/{database}/{table}'");
+        assert_eq!(params[1], "'{replica}'");
+    }
+
+    #[test]
+    fn test_replication_params_prod_no_cluster_no_keeper_args_succeeds() {
+        let result = build_replication_params(
+            &None,
+            &None,
+            &None,
+            "ReplicatedMergeTree",
+            "test_table",
+            false, // is_dev = false (production)
+        );
+
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        // Should return empty params for ClickHouse Cloud
+        assert_eq!(params.len(), 0);
+    }
+
+    #[test]
+    fn test_replication_params_dev_with_cluster_and_keeper_args_succeeds() {
+        let result = build_replication_params(
+            &Some("/clickhouse/tables/{database}/{table}".to_string()),
+            &Some("{replica}".to_string()),
+            &Some("test_cluster".to_string()),
+            "ReplicatedMergeTree",
+            "test_table",
+            true, // is_dev
+        );
+
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        // Should use explicit params, not auto-inject
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0], "'/clickhouse/tables/{database}/{table}'");
+        assert_eq!(params[1], "'{replica}'");
+    }
+
+    #[test]
+    fn test_replication_params_prod_with_cluster_no_keeper_args_empty() {
+        let result = build_replication_params(
+            &None,
+            &None,
+            &Some("test_cluster".to_string()),
+            "ReplicatedMergeTree",
+            "test_table",
+            false, // is_dev = false (production)
+        );
+
+        assert!(result.is_ok());
+        let params = result.unwrap();
+        // Prod with cluster: should return empty params (let CH use {uuid} with ON CLUSTER)
+        assert_eq!(params.len(), 0);
+    }
+
+    #[test]
+    fn test_replication_params_mismatched_keeper_args_fails() {
+        // Only keeper_path, no replica_name
+        let result = build_replication_params(
+            &Some("/clickhouse/tables/{database}/{table}".to_string()),
+            &None,
+            &Some("test_cluster".to_string()),
+            "ReplicatedMergeTree",
+            "test_table",
+            true,
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            ClickhouseError::InvalidParameters { message } => {
+                assert!(message.contains("requires both keeper_path and replica_name"));
+            }
+            _ => panic!("Expected InvalidParameters error"),
+        }
+    }
+
+    #[test]
+    fn test_buffer_engine_round_trip() {
+        // Test Buffer engine with all parameters
+        let engine = ClickhouseEngine::Buffer(BufferEngine {
+            target_database: "db".to_string(),
+            target_table: "table".to_string(),
+            num_layers: 16,
+            min_time: 10,
+            max_time: 100,
+            min_rows: 10000,
+            max_rows: 100000,
+            min_bytes: 10000000,
+            max_bytes: 100000000,
+            flush_time: Some(5),
+            flush_rows: Some(50000),
+            flush_bytes: Some(50000000),
+        });
+
+        let serialized: String = engine.clone().into();
+        assert_eq!(
+            serialized,
+            "Buffer('db', 'table', 16, 10, 100, 10000, 100000, 10000000, 100000000, 5, 50000, 50000000)"
+        );
+
+        let parsed = ClickhouseEngine::try_from(serialized.as_str()).unwrap();
+        match parsed {
+            ClickhouseEngine::Buffer(BufferEngine {
+                target_database,
+                target_table,
+                num_layers,
+                min_time,
+                max_time,
+                min_rows,
+                max_rows,
+                min_bytes,
+                max_bytes,
+                flush_time,
+                flush_rows,
+                flush_bytes,
+            }) => {
+                assert_eq!(target_database, "db");
+                assert_eq!(target_table, "table");
+                assert_eq!(num_layers, 16);
+                assert_eq!(min_time, 10);
+                assert_eq!(max_time, 100);
+                assert_eq!(min_rows, 10000);
+                assert_eq!(max_rows, 100000);
+                assert_eq!(min_bytes, 10000000);
+                assert_eq!(max_bytes, 100000000);
+                assert_eq!(flush_time, Some(5));
+                assert_eq!(flush_rows, Some(50000));
+                assert_eq!(flush_bytes, Some(50000000));
+            }
+            _ => panic!("Expected Buffer engine"),
+        }
+
+        // Test Buffer engine without optional parameters
+        let engine2 = ClickhouseEngine::Buffer(BufferEngine {
+            target_database: "mydb".to_string(),
+            target_table: "mytable".to_string(),
+            num_layers: 8,
+            min_time: 5,
+            max_time: 50,
+            min_rows: 5000,
+            max_rows: 50000,
+            min_bytes: 5000000,
+            max_bytes: 50000000,
+            flush_time: None,
+            flush_rows: None,
+            flush_bytes: None,
+        });
+
+        let serialized2: String = engine2.clone().into();
+        assert_eq!(
+            serialized2,
+            "Buffer('mydb', 'mytable', 8, 5, 50, 5000, 50000, 5000000, 50000000)"
+        );
+
+        let parsed2 = ClickhouseEngine::try_from(serialized2.as_str()).unwrap();
+        match parsed2 {
+            ClickhouseEngine::Buffer(BufferEngine {
+                target_database,
+                target_table,
+                num_layers,
+                min_time,
+                max_time,
+                min_rows,
+                max_rows,
+                min_bytes,
+                max_bytes,
+                flush_time,
+                flush_rows,
+                flush_bytes,
+            }) => {
+                assert_eq!(target_database, "mydb");
+                assert_eq!(target_table, "mytable");
+                assert_eq!(num_layers, 8);
+                assert_eq!(min_time, 5);
+                assert_eq!(max_time, 50);
+                assert_eq!(min_rows, 5000);
+                assert_eq!(max_rows, 50000);
+                assert_eq!(min_bytes, 5000000);
+                assert_eq!(max_bytes, 50000000);
+                assert_eq!(flush_time, None);
+                assert_eq!(flush_rows, None);
+                assert_eq!(flush_bytes, None);
+            }
+            _ => panic!("Expected Buffer engine"),
+        }
+
+        // Test Buffer engine with only flush_time (nested optional - level 1)
+        let engine3 = ClickhouseEngine::Buffer(BufferEngine {
+            target_database: "db3".to_string(),
+            target_table: "table3".to_string(),
+            num_layers: 4,
+            min_time: 1,
+            max_time: 10,
+            min_rows: 1000,
+            max_rows: 10000,
+            min_bytes: 1000000,
+            max_bytes: 10000000,
+            flush_time: Some(3),
+            flush_rows: None,
+            flush_bytes: None,
+        });
+
+        let serialized3: String = engine3.clone().into();
+        assert_eq!(
+            serialized3,
+            "Buffer('db3', 'table3', 4, 1, 10, 1000, 10000, 1000000, 10000000, 3)"
+        );
+
+        let parsed3 = ClickhouseEngine::try_from(serialized3.as_str()).unwrap();
+        match parsed3 {
+            ClickhouseEngine::Buffer(BufferEngine {
+                target_database,
+                target_table,
+                num_layers,
+                min_time,
+                max_time,
+                min_rows,
+                max_rows,
+                min_bytes,
+                max_bytes,
+                flush_time,
+                flush_rows,
+                flush_bytes,
+            }) => {
+                assert_eq!(target_database, "db3");
+                assert_eq!(target_table, "table3");
+                assert_eq!(num_layers, 4);
+                assert_eq!(min_time, 1);
+                assert_eq!(max_time, 10);
+                assert_eq!(min_rows, 1000);
+                assert_eq!(max_rows, 10000);
+                assert_eq!(min_bytes, 1000000);
+                assert_eq!(max_bytes, 10000000);
+                assert_eq!(flush_time, Some(3));
+                assert_eq!(flush_rows, None);
+                assert_eq!(flush_bytes, None);
+            }
+            _ => panic!("Expected Buffer engine"),
+        }
+
+        // Test Buffer engine with flush_time and flush_rows (nested optional - level 2)
+        let engine4 = ClickhouseEngine::Buffer(BufferEngine {
+            target_database: "db4".to_string(),
+            target_table: "table4".to_string(),
+            num_layers: 2,
+            min_time: 2,
+            max_time: 20,
+            min_rows: 2000,
+            max_rows: 20000,
+            min_bytes: 2000000,
+            max_bytes: 20000000,
+            flush_time: Some(7),
+            flush_rows: Some(15000),
+            flush_bytes: None,
+        });
+
+        let serialized4: String = engine4.clone().into();
+        assert_eq!(
+            serialized4,
+            "Buffer('db4', 'table4', 2, 2, 20, 2000, 20000, 2000000, 20000000, 7, 15000)"
+        );
+
+        let parsed4 = ClickhouseEngine::try_from(serialized4.as_str()).unwrap();
+        match parsed4 {
+            ClickhouseEngine::Buffer(BufferEngine {
+                target_database,
+                target_table,
+                num_layers,
+                min_time,
+                max_time,
+                min_rows,
+                max_rows,
+                min_bytes,
+                max_bytes,
+                flush_time,
+                flush_rows,
+                flush_bytes,
+            }) => {
+                assert_eq!(target_database, "db4");
+                assert_eq!(target_table, "table4");
+                assert_eq!(num_layers, 2);
+                assert_eq!(min_time, 2);
+                assert_eq!(max_time, 20);
+                assert_eq!(min_rows, 2000);
+                assert_eq!(max_rows, 20000);
+                assert_eq!(min_bytes, 2000000);
+                assert_eq!(max_bytes, 20000000);
+                assert_eq!(flush_time, Some(7));
+                assert_eq!(flush_rows, Some(15000));
+                assert_eq!(flush_bytes, None);
+            }
+            _ => panic!("Expected Buffer engine"),
+        }
+    }
+
+    #[test]
+    fn test_distributed_engine_round_trip() {
+        // Test Distributed engine with all parameters
+        let engine = ClickhouseEngine::Distributed {
+            cluster: "my_cluster".to_string(),
+            target_database: "db".to_string(),
+            target_table: "table".to_string(),
+            sharding_key: Some("cityHash64(user_id)".to_string()),
+            policy_name: Some("my_policy".to_string()),
+        };
+
+        let serialized: String = engine.clone().into();
+        assert_eq!(
+            serialized,
+            "Distributed('my_cluster', 'db', 'table', cityHash64(user_id), 'my_policy')"
+        );
+
+        let parsed = ClickhouseEngine::try_from(serialized.as_str()).unwrap();
+        match parsed {
+            ClickhouseEngine::Distributed {
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            } => {
+                assert_eq!(cluster, "my_cluster");
+                assert_eq!(target_database, "db");
+                assert_eq!(target_table, "table");
+                assert_eq!(sharding_key, Some("cityHash64(user_id)".to_string()));
+                assert_eq!(policy_name, Some("my_policy".to_string()));
+            }
+            _ => panic!("Expected Distributed engine"),
+        }
+
+        // Test Distributed engine with only required parameters
+        let engine2 = ClickhouseEngine::Distributed {
+            cluster: "prod_cluster".to_string(),
+            target_database: "mydb".to_string(),
+            target_table: "mytable".to_string(),
+            sharding_key: None,
+            policy_name: None,
+        };
+
+        let serialized2: String = engine2.clone().into();
+        assert_eq!(
+            serialized2,
+            "Distributed('prod_cluster', 'mydb', 'mytable')"
+        );
+
+        let parsed2 = ClickhouseEngine::try_from(serialized2.as_str()).unwrap();
+        match parsed2 {
+            ClickhouseEngine::Distributed {
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            } => {
+                assert_eq!(cluster, "prod_cluster");
+                assert_eq!(target_database, "mydb");
+                assert_eq!(target_table, "mytable");
+                assert_eq!(sharding_key, None);
+                assert_eq!(policy_name, None);
+            }
+            _ => panic!("Expected Distributed engine"),
+        }
+
+        // Test Distributed engine with sharding key but no policy
+        let engine3 = ClickhouseEngine::Distributed {
+            cluster: "test_cluster".to_string(),
+            target_database: "testdb".to_string(),
+            target_table: "testtable".to_string(),
+            sharding_key: Some("rand()".to_string()),
+            policy_name: None,
+        };
+
+        let serialized3: String = engine3.clone().into();
+        assert_eq!(
+            serialized3,
+            "Distributed('test_cluster', 'testdb', 'testtable', rand())"
+        );
+
+        let parsed3 = ClickhouseEngine::try_from(serialized3.as_str()).unwrap();
+        match parsed3 {
+            ClickhouseEngine::Distributed {
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            } => {
+                assert_eq!(cluster, "test_cluster");
+                assert_eq!(target_database, "testdb");
+                assert_eq!(target_table, "testtable");
+                assert_eq!(sharding_key, Some("rand()".to_string()));
+                assert_eq!(policy_name, None);
+            }
+            _ => panic!("Expected Distributed engine"),
+        }
+
+        // Test edge case: policy_name without sharding_key should be silently dropped
+        // This matches ClickHouse specification where policy_name requires sharding_key
+        let engine4 = ClickhouseEngine::Distributed {
+            cluster: "edge_cluster".to_string(),
+            target_database: "edgedb".to_string(),
+            target_table: "edgetable".to_string(),
+            sharding_key: None,
+            policy_name: Some("orphan_policy".to_string()), // This should be dropped
+        };
+
+        let serialized4: String = engine4.clone().into();
+        // policy_name should NOT appear since sharding_key is None
+        assert_eq!(
+            serialized4,
+            "Distributed('edge_cluster', 'edgedb', 'edgetable')"
+        );
+
+        // Round-trip should work correctly
+        let parsed4 = ClickhouseEngine::try_from(serialized4.as_str()).unwrap();
+        match parsed4 {
+            ClickhouseEngine::Distributed {
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            } => {
+                assert_eq!(cluster, "edge_cluster");
+                assert_eq!(target_database, "edgedb");
+                assert_eq!(target_table, "edgetable");
+                assert_eq!(sharding_key, None);
+                assert_eq!(policy_name, None); // Both should be None after round-trip
+            }
+            _ => panic!("Expected Distributed engine"),
+        }
+    }
+
+    #[test]
+    fn test_buffer_invalid_flush_combinations_logged() {
+        // Test: flush_rows without flush_time - should warn and ignore flush_rows
+        let engine = ClickhouseEngine::Buffer(BufferEngine {
+            target_database: "db".to_string(),
+            target_table: "table".to_string(),
+            num_layers: 16,
+            min_time: 10,
+            max_time: 100,
+            min_rows: 10000,
+            max_rows: 100000,
+            min_bytes: 10000000,
+            max_bytes: 100000000,
+            flush_time: None,
+            flush_rows: Some(50000), // Invalid: no flush_time
+            flush_bytes: None,
+        });
+
+        let serialized: String = engine.clone().into();
+        // flush_rows should be ignored, so only required params present
+        assert_eq!(
+            serialized,
+            "Buffer('db', 'table', 16, 10, 100, 10000, 100000, 10000000, 100000000)"
+        );
+
+        // Test: flush_bytes without flush_time or flush_rows - should warn and ignore flush_bytes
+        let engine2 = ClickhouseEngine::Buffer(BufferEngine {
+            target_database: "db2".to_string(),
+            target_table: "table2".to_string(),
+            num_layers: 8,
+            min_time: 5,
+            max_time: 50,
+            min_rows: 5000,
+            max_rows: 50000,
+            min_bytes: 5000000,
+            max_bytes: 50000000,
+            flush_time: Some(3),
+            flush_rows: None,
+            flush_bytes: Some(25000000), // Invalid: no flush_rows
+        });
+
+        let serialized2: String = engine2.clone().into();
+        // flush_bytes should be ignored, only flush_time present
+        assert_eq!(
+            serialized2,
+            "Buffer('db2', 'table2', 8, 5, 50, 5000, 50000, 5000000, 50000000, 3)"
+        );
+    }
+
+    #[test]
+    fn test_distributed_invalid_policy_without_sharding_logged() {
+        // Test: policy_name without sharding_key - should warn and ignore policy_name
+        let engine = ClickhouseEngine::Distributed {
+            cluster: "my_cluster".to_string(),
+            target_database: "db".to_string(),
+            target_table: "table".to_string(),
+            sharding_key: None,
+            policy_name: Some("orphan_policy".to_string()), // Invalid: no sharding_key
+        };
+
+        let serialized: String = engine.clone().into();
+        // policy_name should be ignored
+        assert_eq!(serialized, "Distributed('my_cluster', 'db', 'table')");
+
+        // Verify round-trip works correctly
+        let parsed = ClickhouseEngine::try_from(serialized.as_str()).unwrap();
+        match parsed {
+            ClickhouseEngine::Distributed {
+                cluster,
+                target_database,
+                target_table,
+                sharding_key,
+                policy_name,
+            } => {
+                assert_eq!(cluster, "my_cluster");
+                assert_eq!(target_database, "db");
+                assert_eq!(target_table, "table");
+                assert_eq!(sharding_key, None);
+                assert_eq!(policy_name, None); // Both should be None
+            }
+            _ => panic!("Expected Distributed engine"),
+        }
+    }
+
+    #[test]
+    fn test_icebergs3_hash_consistency() {
+        // Test that identical engines produce identical hashes
+        let engine1 = ClickhouseEngine::IcebergS3 {
+            path: "s3://test-bucket/warehouse/table/".to_string(),
+            format: "Parquet".to_string(),
+            aws_access_key_id: Some("AKIATEST".to_string()),
+            aws_secret_access_key: Some("secretkey".to_string()),
+            compression: Some("gzip".to_string()),
+        };
+
+        let engine2 = ClickhouseEngine::IcebergS3 {
+            path: "s3://test-bucket/warehouse/table/".to_string(),
+            format: "Parquet".to_string(),
+            aws_access_key_id: Some("AKIATEST".to_string()),
+            aws_secret_access_key: Some("secretkey".to_string()),
+            compression: Some("gzip".to_string()),
+        };
+
+        let hash1 = engine1.non_alterable_params_hash();
+        let hash2 = engine2.non_alterable_params_hash();
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 64); // SHA256 hex string
+
+        // Test that credential changes produce different hashes
+        let engine_diff_key = ClickhouseEngine::IcebergS3 {
+            path: "s3://test-bucket/warehouse/table/".to_string(),
+            format: "Parquet".to_string(),
+            aws_access_key_id: Some("AKIADIFFERENT".to_string()),
+            aws_secret_access_key: Some("secretkey".to_string()),
+            compression: Some("gzip".to_string()),
+        };
+        let hash_diff_key = engine_diff_key.non_alterable_params_hash();
+        assert_ne!(
+            hash1, hash_diff_key,
+            "Different access keys should produce different hashes"
+        );
+
+        // Test that path changes produce different hashes
+        let engine_diff_path = ClickhouseEngine::IcebergS3 {
+            path: "s3://different-bucket/table/".to_string(),
+            format: "Parquet".to_string(),
+            aws_access_key_id: Some("AKIATEST".to_string()),
+            aws_secret_access_key: Some("secretkey".to_string()),
+            compression: Some("gzip".to_string()),
+        };
+        let hash_diff_path = engine_diff_path.non_alterable_params_hash();
+        assert_ne!(
+            hash1, hash_diff_path,
+            "Different paths should produce different hashes"
+        );
+
+        // Test that compression changes produce different hashes
+        let engine_no_compression = ClickhouseEngine::IcebergS3 {
+            path: "s3://test-bucket/warehouse/table/".to_string(),
+            format: "Parquet".to_string(),
+            aws_access_key_id: Some("AKIATEST".to_string()),
+            aws_secret_access_key: Some("secretkey".to_string()),
+            compression: None,
+        };
+        let hash_no_compression = engine_no_compression.non_alterable_params_hash();
+        assert_ne!(
+            hash1, hash_no_compression,
+            "Different compression should produce different hashes"
+        );
+
+        // Test that IcebergS3 hash differs from other engines
+        let merge_tree = ClickhouseEngine::MergeTree;
+        assert_ne!(hash1, merge_tree.non_alterable_params_hash());
+    }
+
+    #[test]
+    fn test_icebergs3_display() {
+        // Test display with credentials
+        let engine_with_creds = ClickhouseEngine::IcebergS3 {
+            path: "s3://bucket/warehouse/table/".to_string(),
+            format: "Parquet".to_string(),
+            aws_access_key_id: Some("AKIATEST".to_string()),
+            aws_secret_access_key: Some("secretkey123".to_string()),
+            compression: Some("gzip".to_string()),
+        };
+
+        let display: String = engine_with_creds.clone().into();
+        assert!(display.contains("Iceberg"));
+        assert!(display.contains("s3://bucket/warehouse/table/"));
+        assert!(display.contains("AKIATEST"));
+        assert!(display.contains("secr...y123")); // Masked secret (first 4 + ... + last 4)
+        assert!(display.contains("Parquet"));
+        assert!(display.contains("gzip"));
+
+        // Test display with NOSIGN
+        let engine_nosign = ClickhouseEngine::IcebergS3 {
+            path: "s3://public-bucket/table/".to_string(),
+            format: "ORC".to_string(),
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            compression: None,
+        };
+
+        let display_nosign: String = engine_nosign.into();
+        assert!(display_nosign.contains("Iceberg"));
+        assert!(display_nosign.contains("NOSIGN"));
+        assert!(display_nosign.contains("ORC"));
+    }
+
+    #[test]
+    fn test_icebergs3_protobuf_serialization() {
+        // Test with credentials (should be excluded from proto)
+        let engine_with_creds = ClickhouseEngine::IcebergS3 {
+            path: "s3://bucket/table/".to_string(),
+            format: "Parquet".to_string(),
+            aws_access_key_id: Some("key".to_string()),
+            aws_secret_access_key: Some("secret".to_string()),
+            compression: None,
+        };
+
+        let proto = engine_with_creds.to_proto_string();
+        assert!(!proto.contains("key")); // Credentials excluded for security
+        assert!(!proto.contains("secret"));
+        assert!(proto.contains("s3://bucket/table/"));
+        assert!(proto.contains("Parquet"));
+
+        // Test with compression (should be included in proto)
+        let engine_with_compression = ClickhouseEngine::IcebergS3 {
+            path: "s3://test-bucket/warehouse/events/".to_string(),
+            format: "ORC".to_string(),
+            aws_access_key_id: None,
+            aws_secret_access_key: None,
+            compression: Some("gzip".to_string()),
+        };
+
+        let proto_with_compression = engine_with_compression.to_proto_string();
+        assert!(proto_with_compression.contains("s3://test-bucket/warehouse/events/"));
+        assert!(proto_with_compression.contains("ORC"));
+        assert!(proto_with_compression.contains("gzip")); // Compression IS included
+    }
+
+    #[test]
+    fn test_icebergs3_parsing() {
+        // Test 1: Simple format without credentials or compression
+        let simple = "Iceberg('s3://bucket/table/', 'Parquet')";
+        let engine = ClickhouseEngine::try_from(simple).unwrap();
+        match engine {
+            ClickhouseEngine::IcebergS3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                compression,
+            } => {
+                assert_eq!(path, "s3://bucket/table/");
+                assert_eq!(format, "Parquet");
+                assert_eq!(aws_access_key_id, None);
+                assert_eq!(aws_secret_access_key, None);
+                assert_eq!(compression, None);
+            }
+            _ => panic!("Expected IcebergS3 engine"),
+        }
+
+        // Test 2: With credentials (should be parsed now)
+        let with_creds = "Iceberg('s3://bucket/table/', 'AKIATEST', '[HIDDEN]', 'Parquet')";
+        let engine = ClickhouseEngine::try_from(with_creds).unwrap();
+        match engine {
+            ClickhouseEngine::IcebergS3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                compression,
+            } => {
+                assert_eq!(path, "s3://bucket/table/");
+                assert_eq!(format, "Parquet");
+                assert_eq!(aws_access_key_id, Some("AKIATEST".to_string()));
+                assert_eq!(aws_secret_access_key, Some("[HIDDEN]".to_string()));
+                assert_eq!(compression, None);
+            }
+            _ => panic!("Expected IcebergS3 engine"),
+        }
+
+        // Test 3: With compression but no credentials - format at position 1
+        let with_compression = "Iceberg('s3://bucket/table/', 'ORC', 'gzip')";
+        let engine = ClickhouseEngine::try_from(with_compression).unwrap();
+        match engine {
+            ClickhouseEngine::IcebergS3 {
+                path,
+                format,
+                compression,
+                aws_access_key_id,
+                aws_secret_access_key,
+            } => {
+                assert_eq!(path, "s3://bucket/table/");
+                assert_eq!(format, "ORC");
+                assert_eq!(compression, Some("gzip".to_string()));
+                assert_eq!(aws_access_key_id, None);
+                assert_eq!(aws_secret_access_key, None);
+            }
+            _ => panic!("Expected IcebergS3 engine"),
+        }
+
+        // Test 4: Edge case - format name at position 1 with extra params (bug from bot review)
+        // This tests that we correctly identify format at position 1, not confuse it with credentials
+        let format_first =
+            "Iceberg('s3://bucket/table/', 'Parquet', 'extra_param', 'another_param')";
+        let engine = ClickhouseEngine::try_from(format_first).unwrap();
+        match engine {
+            ClickhouseEngine::IcebergS3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                compression,
+            } => {
+                assert_eq!(path, "s3://bucket/table/");
+                assert_eq!(format, "Parquet");
+                assert_eq!(aws_access_key_id, None);
+                assert_eq!(aws_secret_access_key, None);
+                // extra_param is treated as compression since it's at position 2 (extra_params_start)
+                assert_eq!(compression, Some("extra_param".to_string()));
+            }
+            _ => panic!("Expected IcebergS3 engine"),
+        }
+
+        // Test 5: With NOSIGN
+        let with_nosign = "Iceberg('s3://public-bucket/table/', NOSIGN, 'Parquet')";
+        let engine = ClickhouseEngine::try_from(with_nosign).unwrap();
+        match engine {
+            ClickhouseEngine::IcebergS3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                ..
+            } => {
+                assert_eq!(path, "s3://public-bucket/table/");
+                assert_eq!(format, "Parquet");
+                assert_eq!(aws_access_key_id, None);
+                assert_eq!(aws_secret_access_key, None);
+            }
+            _ => panic!("Expected IcebergS3 engine"),
+        }
+
+        // Test 6: With credentials AND compression
+        let full_config = "Iceberg('s3://bucket/table/', 'AKIATEST', 'secret', 'ORC', 'zstd')";
+        let engine = ClickhouseEngine::try_from(full_config).unwrap();
+        match engine {
+            ClickhouseEngine::IcebergS3 {
+                path,
+                format,
+                aws_access_key_id,
+                aws_secret_access_key,
+                compression,
+            } => {
+                assert_eq!(path, "s3://bucket/table/");
+                assert_eq!(format, "ORC");
+                assert_eq!(aws_access_key_id, Some("AKIATEST".to_string()));
+                assert_eq!(aws_secret_access_key, Some("secret".to_string()));
+                assert_eq!(compression, Some("zstd".to_string()));
+            }
+            _ => panic!("Expected IcebergS3 engine"),
+        }
+
+        // Test 7: Invalid format in ambiguous case - should return error
+        let invalid_format = "Iceberg('s3://bucket/table/', 'InvalidFormat', 'something', 'else')";
+        let result = ClickhouseEngine::try_from(invalid_format);
+        assert!(
+            result.is_err(),
+            "Should reject invalid format 'InvalidFormat'"
+        );
+
+        // Test 8: Another invalid format edge case
+        let another_invalid = "Iceberg('s3://bucket/table/', 'BadFormat', 'test')";
+        let result2 = ClickhouseEngine::try_from(another_invalid);
+        assert!(result2.is_err(), "Should reject invalid format 'BadFormat'");
+    }
+
+    #[test]
+    fn test_create_table_with_codec() {
+        let columns = vec![
+            ClickHouseColumn {
+                name: "id".to_string(),
+                column_type: ClickHouseColumnType::String,
+                required: true,
+                unique: false,
+                primary_key: true,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            },
+            ClickHouseColumn {
+                name: "log_blob".to_string(),
+                column_type: ClickHouseColumnType::Json(Default::default()),
+                required: true,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: Some("ZSTD(3)".to_string()),
+                materialized: None,
+                alias: None,
+            },
+            ClickHouseColumn {
+                name: "timestamp".to_string(),
+                column_type: ClickHouseColumnType::DateTime64 { precision: 3 },
+                required: true,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: Some("Delta, LZ4".to_string()),
+                materialized: None,
+                alias: None,
+            },
+            ClickHouseColumn {
+                name: "tags".to_string(),
+                column_type: ClickHouseColumnType::Array(Box::new(ClickHouseColumnType::String)),
+                required: true,
+                unique: false,
+                primary_key: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: Some("ZSTD(1)".to_string()),
+                materialized: None,
+                alias: None,
+            },
+        ];
+
+        let table = ClickHouseTable {
+            name: "test_table".to_string(),
+            version: None,
+            columns,
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            engine: ClickhouseEngine::MergeTree,
+            table_ttl_setting: None,
+            partition_by: None,
+            sample_by: None,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `id` String NOT NULL,
+ `log_blob` JSON NOT NULL CODEC(ZSTD(3)),
+ `timestamp` DateTime64(3) NOT NULL CODEC(Delta, LZ4),
+ `tags` Array(String) NOT NULL CODEC(ZSTD(1))
+)
+ENGINE = MergeTree
+PRIMARY KEY (`id`)
+ORDER BY (`id`)
+"#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_create_table_with_materialized_column() {
+        use crate::framework::versions::Version;
+
+        let columns = vec![
+            ClickHouseColumn {
+                name: "event_time".to_string(),
+                column_type: ClickHouseColumnType::DateTime64 { precision: 3 },
+                required: true,
+                primary_key: false,
+                unique: false,
+                default: None,
+                materialized: None,
+                alias: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+            },
+            ClickHouseColumn {
+                name: "event_date".to_string(),
+                column_type: ClickHouseColumnType::Date,
+                required: true,
+                primary_key: false,
+                unique: false,
+                default: None,
+                materialized: Some("toDate(event_time)".to_string()),
+                alias: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+            },
+        ];
+
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "test_table".to_string(),
+            columns,
+            order_by: OrderBy::Fields(vec!["event_time".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        let expected = r#"
+CREATE TABLE IF NOT EXISTS `test_db`.`test_table`
+(
+ `event_time` DateTime64(3) NOT NULL,
+ `event_date` Date NOT NULL MATERIALIZED toDate(event_time)
+)
+ENGINE = MergeTree
+ORDER BY (`event_time`)
+"#;
+        assert_eq!(query.trim(), expected.trim());
+    }
+
+    #[test]
+    fn test_materialized_column_with_codec() {
+        use crate::framework::core::infrastructure::table::JsonOptions;
+        use crate::framework::versions::Version;
+
+        // Test customer's use case: MATERIALIZED column with CODEC
+        let columns = vec![
+            ClickHouseColumn {
+                name: "log_blob".to_string(),
+                column_type: ClickHouseColumnType::Json(JsonOptions::default()),
+                required: true,
+                primary_key: false,
+                unique: false,
+                default: None,
+                materialized: None,
+            alias: None,
+                comment: None,
+                ttl: None,
+                codec: Some("ZSTD(3)".to_string()),
+            },
+            ClickHouseColumn {
+                name: "combination_hash".to_string(),
+                column_type: ClickHouseColumnType::Array(Box::new(
+                    ClickHouseColumnType::ClickhouseInt(ClickHouseInt::UInt64),
+                )),
+                required: true,
+                primary_key: false,
+                unique: false,
+                default: None,
+                materialized: Some(
+                    "arrayMap(kv -> cityHash64(kv.1, kv.2), JSONExtractKeysAndValuesRaw(toString(log_blob)))".to_string(),
+                ),
+                alias: None,
+                comment: None,
+                ttl: None,
+                codec: Some("ZSTD(1)".to_string()),
+            },
+        ];
+
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "logs".to_string(),
+            columns,
+            order_by: OrderBy::SingleExpr("tuple()".to_string()),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+
+        // Verify the query contains the MATERIALIZED clause and CODEC
+        assert!(query.contains("MATERIALIZED arrayMap"));
+        assert!(query.contains("CODEC(ZSTD(1))"));
+        assert!(query.contains("CODEC(ZSTD(3))"));
+    }
+
+    #[test]
+    fn test_validation_default_and_materialized_mutually_exclusive() {
+        use crate::framework::core::infrastructure::table::{Column, ColumnType, IntType};
+        use crate::infrastructure::olap::clickhouse::mapper::std_column_to_clickhouse_column;
+
+        let column = Column {
+            name: "bad_column".to_string(),
+            data_type: ColumnType::Int(IntType::Int32),
+            required: true,
+            unique: false,
+            primary_key: false,
+            default: Some("42".to_string()),
+            materialized: Some("id + 1".to_string()), // Invalid: both default and materialized
+            alias: None,
+            annotations: vec![],
+            comment: None,
+            ttl: None,
+            codec: None,
+        };
+
+        let result = std_column_to_clickhouse_column(column);
+        assert!(result.is_err());
+        let error_msg = result.unwrap_err().to_string();
+        assert!(error_msg.contains("only have one of DEFAULT, MATERIALIZED, or ALIAS"));
+    }
+
+    #[test]
+    fn test_kafka_parsing_roundtrip() {
+        // Test parsing Kafka engine from ClickHouse's format and back
+        let engine_str =
+            "Kafka('broker1:9092,broker2:9092', 'events', 'events_consumer', 'JSONEachRow')";
+        let engine = ClickhouseEngine::try_from(engine_str).unwrap();
+
+        match &engine {
+            ClickhouseEngine::Kafka {
+                broker_list,
+                topic_list,
+                group_name,
+                format,
+            } => {
+                assert_eq!(broker_list, "broker1:9092,broker2:9092");
+                assert_eq!(topic_list, "events");
+                assert_eq!(group_name, "events_consumer");
+                assert_eq!(format, "JSONEachRow");
+            }
+            _ => panic!("Expected Kafka engine, got {:?}", engine),
+        }
+
+        // Test round-trip: parse -> serialize -> parse
+        let serialized: String = engine.clone().into();
+        assert!(serialized.contains("Kafka("));
+        assert!(serialized.contains("broker1:9092,broker2:9092"));
+
+        let reparsed = ClickhouseEngine::try_from(serialized.as_str()).unwrap();
+        match reparsed {
+            ClickhouseEngine::Kafka {
+                broker_list,
+                topic_list,
+                ..
+            } => {
+                assert_eq!(broker_list, "broker1:9092,broker2:9092");
+                assert_eq!(topic_list, "events");
+            }
+            _ => panic!("Round-trip failed"),
+        }
+    }
+
+    #[test]
+    fn test_kafka_supports_order_by_returns_false() {
+        // Critical: Kafka engine does NOT support ORDER BY
+        // This is used by code generation to skip orderByExpression for Kafka tables
+        let kafka_engine = ClickhouseEngine::Kafka {
+            broker_list: "kafka:9092".to_string(),
+            topic_list: "events".to_string(),
+            group_name: "consumer".to_string(),
+            format: "JSONEachRow".to_string(),
+        };
+
+        assert!(
+            !kafka_engine.supports_order_by(),
+            "Kafka engine should NOT support ORDER BY"
+        );
+
+        // Verify MergeTree family does support it (for contrast)
+        assert!(ClickhouseEngine::MergeTree.supports_order_by());
+        assert!(ClickhouseEngine::ReplacingMergeTree {
+            ver: None,
+            is_deleted: None
+        }
+        .supports_order_by());
+    }
+
+    #[test]
+    fn test_engine_proto_roundtrip_replicated_replacing_merge_tree() {
+        // Test case 1: Empty params (ClickHouse Cloud mode)
+        let engine = ClickhouseEngine::ReplicatedReplacingMergeTree {
+            keeper_path: None,
+            replica_name: None,
+            ver: None,
+            is_deleted: None,
+        };
+        let serialized = engine.to_proto_string();
+        println!("Serialized (empty params): {}", serialized);
+        let parsed: Result<ClickhouseEngine, _> = serialized.as_str().try_into();
+        assert!(
+            parsed.is_ok(),
+            "Failed to parse '{}': {:?}",
+            serialized,
+            parsed
+        );
+        assert_eq!(parsed.unwrap(), engine);
+
+        // Test case 2: With keeper_path and replica_name
+        let engine_with_paths = ClickhouseEngine::ReplicatedReplacingMergeTree {
+            keeper_path: Some("/clickhouse/tables/{uuid}/{shard}".to_string()),
+            replica_name: Some("{replica}".to_string()),
+            ver: None,
+            is_deleted: None,
+        };
+        let serialized = engine_with_paths.to_proto_string();
+        println!("Serialized (with paths): {}", serialized);
+        let parsed: Result<ClickhouseEngine, _> = serialized.as_str().try_into();
+        assert!(
+            parsed.is_ok(),
+            "Failed to parse '{}': {:?}",
+            serialized,
+            parsed
+        );
+        // Note: default paths get normalized to None
+        let expected = ClickhouseEngine::ReplicatedReplacingMergeTree {
+            keeper_path: None,
+            replica_name: None,
+            ver: None,
+            is_deleted: None,
+        };
+        assert_eq!(parsed.unwrap(), expected);
+
+        // Test case 3: With ver parameter
+        let engine_with_ver = ClickhouseEngine::ReplicatedReplacingMergeTree {
+            keeper_path: Some("/custom/path".to_string()),
+            replica_name: Some("replica1".to_string()),
+            ver: Some("version_col".to_string()),
+            is_deleted: None,
+        };
+        let serialized = engine_with_ver.to_proto_string();
+        println!("Serialized (with ver): {}", serialized);
+        let parsed: Result<ClickhouseEngine, _> = serialized.as_str().try_into();
+        assert!(
+            parsed.is_ok(),
+            "Failed to parse '{}': {:?}",
+            serialized,
+            parsed
+        );
+        assert_eq!(parsed.unwrap(), engine_with_ver);
+
+        // Test case 4: All parameters
+        let engine_full = ClickhouseEngine::ReplicatedReplacingMergeTree {
+            keeper_path: Some("/custom/path".to_string()),
+            replica_name: Some("replica1".to_string()),
+            ver: Some("version_col".to_string()),
+            is_deleted: Some("is_deleted_col".to_string()),
+        };
+        let serialized = engine_full.to_proto_string();
+        println!("Serialized (full): {}", serialized);
+        let parsed: Result<ClickhouseEngine, _> = serialized.as_str().try_into();
+        assert!(
+            parsed.is_ok(),
+            "Failed to parse '{}': {:?}",
+            serialized,
+            parsed
+        );
+        assert_eq!(parsed.unwrap(), engine_full);
+    }
+
+    #[test]
+    fn test_engine_proto_roundtrip_all_replicated_engines() {
+        // ReplicatedMergeTree
+        let engine = ClickhouseEngine::ReplicatedMergeTree {
+            keeper_path: None,
+            replica_name: None,
+        };
+        let serialized = engine.to_proto_string();
+        println!("ReplicatedMergeTree: {}", serialized);
+        let parsed: Result<ClickhouseEngine, _> = serialized.as_str().try_into();
+        assert!(parsed.is_ok(), "Failed to parse '{}'", serialized);
+        assert_eq!(parsed.unwrap(), engine);
+
+        // ReplicatedAggregatingMergeTree
+        let engine = ClickhouseEngine::ReplicatedAggregatingMergeTree {
+            keeper_path: None,
+            replica_name: None,
+        };
+        let serialized = engine.to_proto_string();
+        println!("ReplicatedAggregatingMergeTree: {}", serialized);
+        let parsed: Result<ClickhouseEngine, _> = serialized.as_str().try_into();
+        assert!(parsed.is_ok(), "Failed to parse '{}'", serialized);
+        assert_eq!(parsed.unwrap(), engine);
+
+        // ReplicatedSummingMergeTree
+        let engine = ClickhouseEngine::ReplicatedSummingMergeTree {
+            keeper_path: None,
+            replica_name: None,
+            columns: None,
+        };
+        let serialized = engine.to_proto_string();
+        println!("ReplicatedSummingMergeTree: {}", serialized);
+        let parsed: Result<ClickhouseEngine, _> = serialized.as_str().try_into();
+        assert!(parsed.is_ok(), "Failed to parse '{}'", serialized);
+        assert_eq!(parsed.unwrap(), engine);
+
+        // ReplicatedCollapsingMergeTree
+        let engine = ClickhouseEngine::ReplicatedCollapsingMergeTree {
+            keeper_path: None,
+            replica_name: None,
+            sign: "sign_col".to_string(),
+        };
+        let serialized = engine.to_proto_string();
+        println!("ReplicatedCollapsingMergeTree: {}", serialized);
+        let parsed: Result<ClickhouseEngine, _> = serialized.as_str().try_into();
+        assert!(parsed.is_ok(), "Failed to parse '{}'", serialized);
+        assert_eq!(parsed.unwrap(), engine);
+
+        // ReplicatedVersionedCollapsingMergeTree
+        let engine = ClickhouseEngine::ReplicatedVersionedCollapsingMergeTree {
+            keeper_path: None,
+            replica_name: None,
+            sign: "sign_col".to_string(),
+            version: "ver_col".to_string(),
+        };
+        let serialized = engine.to_proto_string();
+        println!("ReplicatedVersionedCollapsingMergeTree: {}", serialized);
+        let parsed: Result<ClickhouseEngine, _> = serialized.as_str().try_into();
+        assert!(parsed.is_ok(), "Failed to parse '{}'", serialized);
+        assert_eq!(parsed.unwrap(), engine);
+    }
+
+    #[test]
+    fn test_merge_parsing_from_clickhouse() {
+        // Inputs match real ClickHouse create_table_query output
+
+        // Literal database
+        let engine = ClickhouseEngine::try_from("Merge('local', '^test_merge_source')").unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::Merge {
+                source_database: "local".to_string(),
+                tables_regexp: "^test_merge_source".to_string(),
+            }
+        );
+        let serialized: String = engine.clone().into();
+        assert_eq!(serialized, "Merge('local', '^test_merge_source')");
+        assert_eq!(
+            ClickhouseEngine::try_from(serialized.as_str()).unwrap(),
+            engine
+        );
+
+        // Backslash regex — ClickHouse stores \d as \\d
+        let engine = ClickhouseEngine::try_from("Merge('local', '^events_\\\\d+$')").unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::Merge {
+                source_database: "local".to_string(),
+                tables_regexp: "^events_\\d+$".to_string(),
+            }
+        );
+
+        // REGEXP database — preserved as-is, backslashes double-escaped
+        let engine = ClickhouseEngine::try_from("Merge(REGEXP('db_\\\\d+'), '^events_')").unwrap();
+        assert_eq!(
+            engine,
+            ClickhouseEngine::Merge {
+                source_database: "REGEXP('db_\\d+')".to_string(),
+                tables_regexp: "^events_".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_merge_proto_roundtrip() {
+        let engine = ClickhouseEngine::Merge {
+            source_database: "my_database".to_string(),
+            tables_regexp: "^events_.*$".to_string(),
+        };
+        let serialized = engine.to_proto_string();
+        assert_eq!(serialized, "Merge('my_database', '^events_.*$')");
+        assert_eq!(
+            ClickhouseEngine::try_from(serialized.as_str()).unwrap(),
+            engine
+        );
+
+        // With backslash in regex
+        let engine = ClickhouseEngine::Merge {
+            source_database: "local".to_string(),
+            tables_regexp: "^events_\\d+$".to_string(),
+        };
+        let serialized = engine.to_proto_string();
+        assert_eq!(serialized, "Merge('local', '^events_\\d+$')");
+        assert_eq!(
+            ClickhouseEngine::try_from(serialized.as_str()).unwrap(),
+            engine
+        );
+    }
+
+    #[test]
+    fn test_merge_desired_vs_actual_state_match() {
+        // User's desired state (single backslash) must equal ClickHouse's stored state
+        // (double backslash) after parsing, to avoid false DROP+CREATE on restart.
+        let desired = ClickhouseEngine::Merge {
+            source_database: "local".to_string(),
+            tables_regexp: "^events_\\d+$".to_string(),
+        };
+        let actual = ClickhouseEngine::try_from("Merge('local', '^events_\\\\d+$')").unwrap();
+        assert_eq!(desired, actual);
+    }
+
+    #[test]
+    fn test_merge_engine_traits() {
+        let engine = ClickhouseEngine::Merge {
+            source_database: "local".to_string(),
+            tables_regexp: "^events_.*$".to_string(),
+        };
+        assert!(!engine.is_merge_tree_family());
+        assert!(!engine.supports_order_by());
+        assert!(engine.supports_select());
+        assert!(engine.sensitive_settings().is_empty());
+    }
+
+    #[test]
+    fn test_merge_non_alterable_params_hash() {
+        let engine1 = ClickhouseEngine::Merge {
+            source_database: "local".to_string(),
+            tables_regexp: "^events_.*$".to_string(),
+        };
+        let engine2 = ClickhouseEngine::Merge {
+            source_database: "local".to_string(),
+            tables_regexp: "^logs_.*$".to_string(),
+        };
+        let engine3 = ClickhouseEngine::Merge {
+            source_database: "other_db".to_string(),
+            tables_regexp: "^events_.*$".to_string(),
+        };
+        assert_ne!(
+            engine1.non_alterable_params_hash(),
+            engine2.non_alterable_params_hash()
+        );
+        assert_ne!(
+            engine1.non_alterable_params_hash(),
+            engine3.non_alterable_params_hash()
+        );
+        assert_eq!(
+            engine1.non_alterable_params_hash(),
+            engine1.non_alterable_params_hash()
+        );
+    }
+
+    #[test]
+    fn test_merge_parse_malformed_single_quote_source_database() {
+        // Malformed input ClickHouse would never produce. Without the len() >= 2 guard this panics.
+        let _result = ClickhouseEngine::try_from("Merge(', '^test')");
+    }
+
+    #[test]
+    fn test_create_table_query_with_projection_mergetree() {
+        use crate::infrastructure::olap::clickhouse::model::ClickHouseProjection;
+
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "events".to_string(),
+            columns: vec![
+                ClickHouseColumn {
+                    name: "id".to_string(),
+                    column_type: ClickHouseColumnType::ClickhouseInt(ClickHouseInt::Int64),
+                    required: true,
+                    primary_key: true,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+                ClickHouseColumn {
+                    name: "user_id".to_string(),
+                    column_type: ClickHouseColumnType::String,
+                    required: true,
+                    primary_key: false,
+                    unique: false,
+                    default: None,
+                    comment: None,
+                    ttl: None,
+                    codec: None,
+                    materialized: None,
+                    alias: None,
+                },
+            ],
+            order_by: OrderBy::Fields(vec!["id".to_string()]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::MergeTree,
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![ClickHouseProjection {
+                name: "proj_by_user".to_string(),
+                body: "SELECT * ORDER BY user_id".to_string(),
+            }],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        assert!(
+            query.contains("PROJECTION proj_by_user (SELECT * ORDER BY user_id)"),
+            "MergeTree DDL should contain the projection. Got: {}",
+            query
+        );
+    }
+
+    #[test]
+    fn test_create_table_query_drops_projection_for_non_mergetree() {
+        use crate::infrastructure::olap::clickhouse::model::ClickHouseProjection;
+
+        let table = ClickHouseTable {
+            version: Some(Version::from_string("1".to_string())),
+            name: "events_kafka".to_string(),
+            columns: vec![ClickHouseColumn {
+                name: "data".to_string(),
+                column_type: ClickHouseColumnType::String,
+                required: true,
+                primary_key: false,
+                unique: false,
+                default: None,
+                comment: None,
+                ttl: None,
+                codec: None,
+                materialized: None,
+                alias: None,
+            }],
+            order_by: OrderBy::Fields(vec![]),
+            partition_by: None,
+            sample_by: None,
+            engine: ClickhouseEngine::Kafka {
+                broker_list: "localhost:9092".to_string(),
+                topic_list: "events".to_string(),
+                group_name: "grp".to_string(),
+                format: "JSONEachRow".to_string(),
+            },
+            table_settings: None,
+            indexes: vec![],
+            projections: vec![ClickHouseProjection {
+                name: "should_be_ignored".to_string(),
+                body: "SELECT * ORDER BY data".to_string(),
+            }],
+            table_ttl_setting: None,
+            cluster_name: None,
+            primary_key_expression: None,
+        };
+
+        let query = create_table_query("test_db", table, false).unwrap();
+        assert!(
+            !query.contains("PROJECTION"),
+            "Non-MergeTree DDL should NOT contain projections. Got: {}",
+            query
+        );
+    }
+}
