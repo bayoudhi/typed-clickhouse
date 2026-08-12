@@ -315,14 +315,15 @@ jobs:
       id-token: "write"
     env:
       TAG_LATEST: "true"
-      # NPM_CONFIG_PROVENANCE is intentionally not set while this repo is
-      # private -- npm rejects the attestation with "422 Unprocessable Entity:
-      # Unsupported GitHub Actions source repository visibility: 'private'".
-      # It killed a real release on the predecessor project after the platform
-      # packages had already published, burning a version number, so don't
-      # re-add it speculatively: flip this to NPM_CONFIG_PROVENANCE: "true" (in
-      # all three publishing jobs) once the repository is made public.
-      # Provenance is genuinely valuable and worth restoring at that point.
+      # Provenance signs each package with a verifiable link back to the commit
+      # and workflow that built it. It requires a public source repository --
+      # npm rejects the attestation from a private one with "422 Unprocessable
+      # Entity: Unsupported GitHub Actions source repository visibility:
+      # 'private'", which killed a release on the predecessor project after
+      # some packages had already published. This repository is public, so it
+      # is on. If it is ever made private again, unset this in all three
+      # publishing jobs first, or the next release will fail mid-publish.
+      NPM_CONFIG_PROVENANCE: "true"
     steps:
       - uses: actions/setup-node@v4
         with:
@@ -378,9 +379,10 @@ jobs:
     permissions:
       contents: "read"
       id-token: "write"
-    # NPM_CONFIG_PROVENANCE is intentionally not set here while this repo is
-    # private -- see the comment in publish-binaries' env block for
-    # why, and re-add `NPM_CONFIG_PROVENANCE: "true"` here too once public.
+    env:
+      # See the comment in publish-binaries' env block: provenance requires a
+      # public source repository, and this one is public.
+      NPM_CONFIG_PROVENANCE: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -414,9 +416,10 @@ jobs:
     permissions:
       contents: "read"
       id-token: "write"
-    # NPM_CONFIG_PROVENANCE is intentionally not set here while this repo is
-    # private -- see the comment in publish-binaries' env block for
-    # why, and re-add `NPM_CONFIG_PROVENANCE: "true"` here too once public.
+    env:
+      # See the comment in publish-binaries' env block: provenance requires a
+      # public source repository, and this one is public.
+      NPM_CONFIG_PROVENANCE: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

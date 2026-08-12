@@ -76,8 +76,13 @@ users; the short version for contributors:
   and setting names baked into row policies in live databases.
 - `MOOSE_RLS_ROLE`, `MOOSE_RLS_USER`, `MOOSE_RLS_SETTING_PREFIX`,
   `MOOSE_RUNTIME_ENV_PREFIX`, `mooseRuntimeEnv`, `mooseEnvSecrets` — the six
-  `@typed-clickhouse/core` exports that still carry the old name. They are the
-  published surface, pinned by `packages/core/tests/golden/exports.json`.
+  `@typed-clickhouse/core` exports that still carry the old name. Published to
+  npm since 0.1.0 and pinned by `packages/core/tests/golden/exports.json`, so
+  renaming them is now a breaking change for consumers. Their *values* are
+  worse: `moose_rls_role` and `SQL_moose_rls_*` are the ClickHouse role and
+  setting names compiled into row policies in live databases, and RLS is a
+  security boundary — a rename can leave policies attached to the old role
+  while the app sets the new setting names, which can fail open.
 - `moose_version` — proto field 19, kept as provenance beside
   `data_model_version`.
 - `MOOSE_CLI_VERSION` — the build-time version contract between `build.rs` and
@@ -103,7 +108,7 @@ dry run (`workflow_dispatch`).
   `scripts/gen-third-party-notices.sh` on every run, including dry runs: it
   uses `cargo-about` for the crates and resolves `commander` for the bundle.
   The result is uploaded as a build artifact and downloaded by both
-  `build-and-publish-binaries` and `publish-library` before they publish, and
+  `build-binaries` and `publish-library` before they publish, and
   it is listed in the `files` allowlist of `packages/core/package.json` and
   `apps/cli-npm/package.json.tmpl` — so every release regenerates it fresh
   rather than carrying a stale copy.
@@ -111,22 +116,26 @@ dry run (`workflow_dispatch`).
   version to `tch-runner print-version` with strict equality, so both packages
   must publish from the same tag. `release.yaml`'s `version` job computes it
   once and every publishing job consumes that output.
-
-### Before the first release
-
-- **The `@typed-clickhouse` npm scope must be claimed** by the publishing
-  account. `publish-wrapper` and `publish-library` publish under
-  `@typed-clickhouse/*` with `--access public`; the first publish fails until
-  that organization exists on npm.
-- `NPM_TOKEN` is configured. `build-and-publish-binaries`, `publish-wrapper`
-  and `publish-library` authenticate with `secrets.NPM_TOKEN`.
+- **Publishing is all-or-nothing per artifact class.** `build-binaries` packs a
+  tarball per target and uploads it; `publish-binaries` publishes all three
+  together, and asserts it has all three first. Nothing publishes from inside
+  the build matrix -- a failure on one leg after another had published would
+  burn the version, since npm versions are immutable.
+- **Publishing the library is idempotent.** It skips when the exact
+  `name@version` is already on the registry, so a release that half-published
+  can be re-run to completion instead of being abandoned for a version bump.
+- **Tarballs are published by `./`-prefixed path.** npm reads a bare
+  `dir/file.tgz` as the GitHub shorthand `owner/repo` and tries to clone it.
 
 ### Provenance
 
-npm provenance (`NPM_CONFIG_PROVENANCE`) is deliberately unset in all three
-publishing jobs while this repository is private. npm rejects provenance
-attestations from a private source repository with `422 Unprocessable Entity`,
-and that failure previously burned a version number on the predecessor project
-after some artifacts had already published. Set `NPM_CONFIG_PROVENANCE: "true"`
-in `build-and-publish-binaries`, `publish-wrapper`, and `publish-library` once
-this repository is public — provenance is worth having back at that point.
+npm provenance is **on**: `NPM_CONFIG_PROVENANCE: "true"` in `publish-binaries`,
+`publish-wrapper` and `publish-library`, each of which also has
+`id-token: write`. It signs every package with a verifiable link back to the
+commit and workflow that built it.
+
+It requires a public source repository. npm rejects the attestation from a
+private one with `422 Unprocessable Entity`, and that failure burned a version
+number on the predecessor project after some artifacts had already published.
+If this repository is ever made private again, unset it in all three jobs
+first, or the next release will fail mid-publish.
