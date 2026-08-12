@@ -241,14 +241,29 @@ jobs:
               mkdir -p /usr/local/bin
               mkdir -p /usr/local/include
 
-              # Retry explicitly. Release runs have died here on transient
-              # github.com trouble -- "curl: (56) Connection died" and, on the
-              # host-side setup-protoc step, "socket hang up" -- and a download
-              # blip should cost a few seconds, not a release. --fail so an
-              # error page is never unzipped as if it were an archive.
-              curl --fail --location --remote-name \
-                --retry 5 --retry-delay 5 --retry-all-errors \
-                https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/$PROTOC_ZIP
+              # Retry in the shell rather than with curl's --retry-all-errors:
+              # the RHEL-based manylinux image ships a curl old enough to reject
+              # that flag outright ("option --retry-all-errors: is unknown"),
+              # and plain --retry does not cover the connection-level failures
+              # actually seen here. Release runs have died on transient
+              # github.com trouble more than once -- "curl: (56) Connection
+              # died" here, "socket hang up" in the host-side setup-protoc step
+              # -- and a download blip should cost seconds, not a release.
+              # --fail so an error page is never unzipped as if it were an
+              # archive.
+              protoc_url="https://github.com/protocolbuffers/protobuf/releases/download/v$PROTOC_VERSION/$PROTOC_ZIP"
+              for attempt in 1 2 3 4 5; do
+                if curl --fail --location --show-error --silent \
+                     --connect-timeout 30 --output "$PROTOC_ZIP" "$protoc_url"; then
+                  break
+                fi
+                if [ "$attempt" = 5 ]; then
+                  echo "failed to download $protoc_url after 5 attempts" >&2
+                  exit 1
+                fi
+                echo "protoc download failed (attempt $attempt), retrying..." >&2
+                sleep $((attempt * 5))
+              done
               unzip -o $PROTOC_ZIP -d /usr/local bin/protoc
               unzip -o $PROTOC_ZIP -d /usr/local 'include/*'
               rm -f $PROTOC_ZIP
