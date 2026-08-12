@@ -145,7 +145,7 @@ pub async fn normalize_infra_map_for_comparison<T: OlapOperations + Sync>(
     // - Wrapped in CREATE TABLE: sqlparser mangles the body on re-serialization
     // Simple whitespace collapsing handles the main case (ClickHouse multi-line DDL
     // vs user-defined single-line bodies) without producing invalid output.
-    for (_table_name, table) in normalized_map.tables.iter_mut() {
+    for table in normalized_map.tables.values_mut() {
         for projection in table.projections.iter_mut() {
             projection.body = projection
                 .body
