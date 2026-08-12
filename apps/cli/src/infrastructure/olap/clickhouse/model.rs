@@ -167,17 +167,13 @@ impl ClickHouseColumnType {
             // recursively parsing Nullable and Array
             t if t.starts_with("Nullable(") => {
                 let inner = t.trim_start_matches("Nullable(").trim_end_matches(')');
-                match Self::from_type_str(inner) {
-                    None => return None,
-                    Some(inner_t) => Self::Nullable(Box::new(inner_t)),
-                }
+                let inner_t = Self::from_type_str(inner)?;
+                Self::Nullable(Box::new(inner_t))
             }
             t if t.starts_with("Array(") => {
                 let inner = t.trim_start_matches("Array(").trim_end_matches(')');
-                match Self::from_type_str(inner) {
-                    None => return None,
-                    Some(inner_t) => Self::Array(Box::new(inner_t)),
-                }
+                let inner_t = Self::from_type_str(inner)?;
+                Self::Array(Box::new(inner_t))
             }
 
             t if t.starts_with("Tuple(") => {
@@ -190,18 +186,12 @@ impl ClickHouseColumnType {
                         // Named tuple element: "name Type"
                         let name = part[..space_pos].trim().to_string();
                         let type_str = part[space_pos + 1..].trim();
-                        if let Some(field_type) = Self::from_type_str(type_str) {
-                            fields.push((name, field_type));
-                        } else {
-                            return None;
-                        }
+                        let field_type = Self::from_type_str(type_str)?;
+                        fields.push((name, field_type));
                     } else {
                         // Unnamed tuple element, use index as name
-                        if let Some(field_type) = Self::from_type_str(part) {
-                            fields.push((format!("field_{i}"), field_type));
-                        } else {
-                            return None;
-                        }
+                        let field_type = Self::from_type_str(part)?;
+                        fields.push((format!("field_{i}"), field_type));
                     }
                 }
                 Self::NamedTuple(fields)
@@ -306,12 +296,9 @@ fn parse_json_options(inner: &str) -> Option<JsonOptions<ClickHouseColumnType>> 
             if path.eq_ignore_ascii_case("SKIP") {
                 continue;
             }
-            if let Some(ty) = ClickHouseColumnType::from_type_str(ty_str) {
-                opts.typed_paths.push((path.to_string(), ty));
-                continue;
-            } else {
-                return None;
-            }
+            let ty = ClickHouseColumnType::from_type_str(ty_str)?;
+            opts.typed_paths.push((path.to_string(), ty));
+            continue;
         }
         return None;
     }
