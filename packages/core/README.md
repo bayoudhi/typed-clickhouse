@@ -1,5 +1,8 @@
 # @typed-clickhouse/core
 
+[![npm](https://img.shields.io/npm/v/@typed-clickhouse/core.svg)](https://www.npmjs.com/package/@typed-clickhouse/core)
+[![MIT license](https://img.shields.io/badge/license-MIT-yellow.svg)](https://github.com/bayoudhi/typed-clickhouse/blob/main/LICENSE)
+
 The TypeScript library for **typed-clickhouse**, a type-driven, ClickHouse-only
 schema and query toolkit. You declare ClickHouse tables and views as
 TypeScript types; a compiler plugin derives their schema from those types at
@@ -216,7 +219,8 @@ No extra configuration is needed beyond the standard
 ## Origin
 
 This package is derived from [514-labs/moosestack](https://github.com/514-labs/moosestack), MIT
-licensed, Copyright (c) 2023 Tim Delisle, Nicolas Joseph. See [`NOTICE`](../../NOTICE) for the
+licensed, Copyright (c) 2023 Tim Delisle, Nicolas Joseph. See
+[`NOTICE`](https://github.com/bayoudhi/typed-clickhouse/blob/main/NOTICE) for the
 full attribution.
 
 - **Original project**: https://github.com/514-labs/moosestack

@@ -1,9 +1,32 @@
 {
   "name": "@typed-clickhouse/cli",
   "version": "0.0.0",
+  "description": "CLI for typed-clickhouse: diff your TypeScript-declared ClickHouse schema against a live database, review the migration plan, and apply it.",
+  "keywords": [
+    "clickhouse",
+    "typescript",
+    "type-safe",
+    "schema",
+    "schema-as-code",
+    "migration",
+    "migrations",
+    "database",
+    "sql",
+    "olap",
+    "analytics",
+    "ddl",
+    "cli",
+    "data-engineering"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/bayoudhi/typed-clickhouse#readme",
+  "bugs": {
+    "url": "https://github.com/bayoudhi/typed-clickhouse/issues"
+  },
   "repository": {
     "type": "git",
-    "url": "https://github.com/bayoudhi/typed-clickhouse"
+    "url": "https://github.com/bayoudhi/typed-clickhouse",
+    "directory": "apps/cli-npm"
   },
   "bin": {
     "typed-clickhouse": "dist/index.js"
