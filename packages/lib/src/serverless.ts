@@ -142,6 +142,18 @@ export {
   type RowPoliciesConfig,
 } from "./rls-constants";
 
+// Standalone query utilities: `getHandlerUtils()` returns a ClickHouse-backed
+// `ResourceClient` plus the `sql` tag, resolving connection details from the
+// configuration registry (`tch.config.toml`, or `configureClickHouse()` in a
+// serverless environment). Pass `{ rlsContext }` for a row-policy-scoped
+// client. Native-free: the only non-pure imports are `@clickhouse/client`,
+// `jose` (types only), and `node:async_hooks` -- available on AWS Lambda, but
+// not on edge runtimes that ship a partial Node built-in surface.
+export { getHandlerUtils } from "./consumption-apis/standalone";
+export type { GetHandlerUtilsOptions } from "./consumption-apis/standalone";
+export { ResourceClient } from "./consumption-apis/helpers";
+export type { HandlerUtils } from "./consumption-apis/helpers";
+
 // Type-safe SQL query building on top of the SQL layer (defineQueryModel,
 // the fluent query builder, filter/aggregation helpers, and MCP tool
 // generation for query models).
