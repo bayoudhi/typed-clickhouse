@@ -80,6 +80,7 @@ pub mod errors;
 pub mod inserter;
 pub mod mapper;
 pub mod model;
+pub mod mutations;
 pub mod queries;
 pub mod remote;
 pub mod sql_parser;
@@ -110,6 +111,10 @@ pub enum ClickhouseChangesError {
     /// Error for unsupported operations
     #[error("Not Supported {0}")]
     NotSupported(String),
+
+    /// Waiting for a table's in-flight mutations to finish did not succeed
+    #[error(transparent)]
+    MutationWait(#[from] mutations::MutationWaitError),
 }
 
 /// Represents atomic DDL operations for OLAP resources.
@@ -512,10 +517,23 @@ pub async fn execute_changes(
         teardown_plan.len()
     );
     debug!("Ordered Teardown plan: {:?}", teardown_plan);
+    // ClickHouse queues ALTER mutations asynchronously, so consecutive operations
+    // on the same table would otherwise pile up and be rejected with
+    // CANNOT_ASSIGN_ALTER. Each operation waits for its table to drain first.
+    let executor =
+        mutations::AtomicOperationExecutor::new(&client, db_name, !project.is_production);
+    let mutation_wait = mutations::MutationWaitConfig::default();
+
     for op in teardown_plan {
         debug!("Teardown operation: {:?}", op);
-        execute_atomic_operation(db_name, &op.to_minimal(), &client, !project.is_production)
-            .await?;
+        mutations::apply_operation_with_mutation_barrier(
+            &client,
+            &executor,
+            &op.to_minimal(),
+            db_name,
+            &mutation_wait,
+        )
+        .await?;
     }
 
     // Execute Setup Plan
@@ -526,8 +544,14 @@ pub async fn execute_changes(
     debug!("Ordered Setup plan: {:?}", setup_plan);
     for op in setup_plan {
         debug!("Setup operation: {:?}", op);
-        execute_atomic_operation(db_name, &op.to_minimal(), &client, !project.is_production)
-            .await?;
+        mutations::apply_operation_with_mutation_barrier(
+            &client,
+            &executor,
+            &op.to_minimal(),
+            db_name,
+            &mutation_wait,
+        )
+        .await?;
     }
 
     info!("OLAP Change execution complete");
