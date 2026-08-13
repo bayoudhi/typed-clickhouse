@@ -1,7 +1,7 @@
 {
   "name": "@typed-clickhouse/core",
   "version": "0.1.0",
-  "description": "Serverless-compatible ClickHouse SDK for AWS Lambda and edge runtimes. Provides OlapTable, View, MaterializedView and the other ClickHouse SDK classes, with no native dependencies. Includes a patched compiler plugin for type-driven schema injection.",
+  "description": "Type-safe, code-first ClickHouse schema, migrations and query layer for TypeScript. Declare tables and views as types (OlapTable, View, MaterializedView) and a compiler plugin derives the ClickHouse schema at build time. No native dependencies, so it also runs on AWS Lambda and edge runtimes.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
   "types": "./dist/index.d.ts",
@@ -35,19 +35,34 @@
     "access": "public"
   },
   "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/bayoudhi/typed-clickhouse/issues"
+  },
   "scripts": {
     "build": "tsup",
     "test": "mocha -r ts-node/register 'tests/**/*.test.ts'"
   },
   "keywords": [
-    "tch",
+    "clickhouse",
+    "typescript",
+    "type-safe",
+    "schema",
+    "schema-as-code",
+    "migration",
+    "migrations",
+    "database",
+    "sql",
+    "olap",
+    "analytics",
+    "ddl",
+    "materialized-view",
+    "orm",
+    "typia",
+    "compiler-plugin",
+    "data-engineering",
     "serverless",
     "lambda",
-    "aws",
-    "clickhouse",
-    "olap",
-    "data-engineering",
-    "compiler-plugin"
+    "tch"
   ],
   "dependencies": {
     "@clickhouse/client": "1.8.1",

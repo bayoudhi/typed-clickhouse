@@ -1,3 +1,5 @@
+[![npm (core)](https://img.shields.io/npm/v/@typed-clickhouse/core.svg?label=%40typed-clickhouse%2Fcore)](https://www.npmjs.com/package/@typed-clickhouse/core)
+[![npm (cli)](https://img.shields.io/npm/v/@typed-clickhouse/cli.svg?label=%40typed-clickhouse%2Fcli)](https://www.npmjs.com/package/@typed-clickhouse/cli)
 [![MIT license](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 # typed-clickhouse
