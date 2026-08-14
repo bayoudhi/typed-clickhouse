@@ -487,6 +487,11 @@ async fn execute_operations(
     )?;
 
     let is_dev = !project.is_production;
+    let db_name = client.config.db_name.clone();
+    // ClickHouse queues ALTER mutations asynchronously, so consecutive ALTERs on
+    // the same table would otherwise pile up and be rejected with
+    // CANNOT_ASSIGN_ALTER. The barrier that prevents this is applied around each
+    // individual ALTER statement inside `execute_atomic_operation`.
     for (idx, operation) in migration_plan.operations.iter().enumerate() {
         let description = crate::infrastructure::olap::clickhouse::describe_operation(operation);
         println!(
@@ -498,10 +503,7 @@ async fn execute_operations(
 
         // Execute operation and provide detailed error context on failure
         if let Err(e) = crate::infrastructure::olap::clickhouse::execute_atomic_operation(
-            &client.config.db_name,
-            operation,
-            client,
-            is_dev,
+            &db_name, operation, client, is_dev,
         )
         .await
         {
