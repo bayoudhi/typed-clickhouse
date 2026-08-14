@@ -81,6 +81,8 @@ pub mod inserter;
 pub mod mapper;
 pub mod model;
 pub mod mutations;
+#[cfg(test)]
+mod mutations_live;
 pub mod queries;
 pub mod remote;
 pub mod sql_parser;
