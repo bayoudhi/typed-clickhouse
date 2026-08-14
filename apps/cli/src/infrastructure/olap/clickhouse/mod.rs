@@ -80,6 +80,7 @@ pub mod errors;
 pub mod inserter;
 pub mod mapper;
 pub mod model;
+pub mod mutations;
 pub mod queries;
 pub mod remote;
 pub mod sql_parser;
@@ -512,6 +513,10 @@ pub async fn execute_changes(
         teardown_plan.len()
     );
     debug!("Ordered Teardown plan: {:?}", teardown_plan);
+    // ClickHouse queues ALTER mutations asynchronously, so consecutive ALTERs on
+    // the same table would otherwise pile up and be rejected with
+    // CANNOT_ASSIGN_ALTER. The barrier that prevents this lives around each
+    // individual ALTER statement, inside the `execute_*` helpers.
     for op in teardown_plan {
         debug!("Teardown operation: {:?}", op);
         execute_atomic_operation(db_name, &op.to_minimal(), &client, !project.is_production)
@@ -783,12 +788,14 @@ pub async fn execute_atomic_operation(
                     target_db, table, cluster_clause
                 )
             };
-            run_query(&sql, client).await.map_err(|e| {
-                ClickhouseChangesError::ClickhouseClient {
-                    error: e,
-                    resource: Some(table.clone()),
-                }
-            })?;
+            run_alter_query(
+                target_db,
+                table,
+                &sql,
+                mutations::AlterRetry::Allowed,
+                client,
+            )
+            .await?;
         }
         SerializableOlapOperation::AddTableIndex {
             table,
@@ -916,6 +923,42 @@ pub async fn execute_atomic_operation(
     Ok(())
 }
 
+/// Runs a single `ALTER TABLE` statement behind the mutation barrier.
+///
+/// ClickHouse queues ALTERs asynchronously and rejects the next one with
+/// `CANNOT_ASSIGN_ALTER` while earlier mutations are still running, so every
+/// ALTER waits for `db_name`.`table_name` to drain first and is retried on that
+/// conflict. Retrying is per-statement, so a statement that already succeeded is
+/// never re-executed.
+///
+/// # Arguments
+/// * `db_name` - Database of the table being altered
+/// * `table_name` - Table being altered
+/// * `statement` - The single `ALTER TABLE` statement to run
+/// * `retry` - Whether the statement may be re-issued after a retryable
+///   conflict. Statements that are not idempotent must not be re-issued to a
+///   cluster, because they may already have applied on some of its hosts.
+/// * `client` - The connection to run the statement on
+async fn run_alter_query(
+    db_name: &str,
+    table_name: &str,
+    statement: &str,
+    retry: mutations::AlterRetry,
+    client: &ConfiguredDBClient,
+) -> Result<(), ClickhouseChangesError> {
+    let runner = mutations::ClientStatementRunner::new(client, table_name);
+    mutations::run_alter_with_mutation_barrier(
+        client,
+        &runner,
+        statement,
+        db_name,
+        table_name,
+        &mutations::MutationWaitConfig::default(),
+        retry,
+    )
+    .await
+}
+
 #[instrument(
     name = "create_table",
     skip_all,
@@ -961,7 +1004,7 @@ async fn execute_add_table_index(
         .map(|c| format!(" ON CLUSTER `{}`", c))
         .unwrap_or_default();
     let sql = format!(
-        "ALTER TABLE `{}`.`{}`{} ADD INDEX `{}` {} TYPE {}{} GRANULARITY {}",
+        "ALTER TABLE `{}`.`{}`{} ADD INDEX IF NOT EXISTS `{}` {} TYPE {}{} GRANULARITY {}",
         db_name,
         table_name,
         cluster_clause,
@@ -971,12 +1014,14 @@ async fn execute_add_table_index(
         args,
         index.granularity
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(
+        db_name,
+        table_name,
+        &sql,
+        mutations::AlterRetry::Allowed,
+        client,
+    )
+    .await
 }
 
 async fn execute_drop_table_index(
@@ -990,15 +1035,17 @@ async fn execute_drop_table_index(
         .map(|c| format!(" ON CLUSTER `{}`", c))
         .unwrap_or_default();
     let sql = format!(
-        "ALTER TABLE `{}`.`{}`{} DROP INDEX `{}`",
+        "ALTER TABLE `{}`.`{}`{} DROP INDEX IF EXISTS `{}`",
         db_name, table_name, cluster_clause, index_name
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(
+        db_name,
+        table_name,
+        &sql,
+        mutations::AlterRetry::Allowed,
+        client,
+    )
+    .await
 }
 
 async fn execute_add_table_projection(
@@ -1021,12 +1068,14 @@ async fn execute_add_table_projection(
         "ALTER TABLE `{}`.`{}`{} ADD PROJECTION IF NOT EXISTS `{}` ({})",
         db_name, table_name, cluster_clause, projection.name, projection.body
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(
+        db_name,
+        table_name,
+        &sql,
+        mutations::AlterRetry::Allowed,
+        client,
+    )
+    .await
 }
 
 async fn execute_drop_table_projection(
@@ -1049,12 +1098,14 @@ async fn execute_drop_table_projection(
         "ALTER TABLE `{}`.`{}`{} DROP PROJECTION IF EXISTS `{}`",
         db_name, table_name, cluster_clause, projection_name
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(
+        db_name,
+        table_name,
+        &sql,
+        mutations::AlterRetry::Allowed,
+        client,
+    )
+    .await
 }
 
 async fn execute_modify_sample_by(
@@ -1071,12 +1122,14 @@ async fn execute_modify_sample_by(
         "ALTER TABLE `{}`.`{}`{} MODIFY SAMPLE BY {}",
         db_name, table_name, cluster_clause, expression
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(
+        db_name,
+        table_name,
+        &sql,
+        mutations::AlterRetry::Allowed,
+        client,
+    )
+    .await
 }
 
 async fn execute_remove_sample_by(
@@ -1092,12 +1145,14 @@ async fn execute_remove_sample_by(
         "ALTER TABLE `{}`.`{}`{} REMOVE SAMPLE BY",
         db_name, table_name, cluster_clause
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(
+        db_name,
+        table_name,
+        &sql,
+        mutations::AlterRetry::Allowed,
+        client,
+    )
+    .await
 }
 
 #[instrument(
@@ -1173,7 +1228,7 @@ async fn execute_add_table_column(
     };
 
     let add_column_query = format!(
-        "ALTER TABLE `{}`.`{}`{} ADD COLUMN `{}` {}{}  {}",
+        "ALTER TABLE `{}`.`{}`{} ADD COLUMN IF NOT EXISTS `{}` {}{}  {}",
         db_name,
         table_name,
         cluster_clause,
@@ -1183,12 +1238,14 @@ async fn execute_add_table_column(
         position_clause
     );
     tracing::debug!("Adding column: {}", add_column_query);
-    run_query(&add_column_query, client).await.map_err(|e| {
-        ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        }
-    })?;
+    run_alter_query(
+        db_name,
+        table_name,
+        &add_column_query,
+        mutations::AlterRetry::Allowed,
+        client,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1222,12 +1279,14 @@ async fn execute_drop_table_column(
         db_name, table_name, cluster_clause, column_name
     );
     tracing::debug!("Dropping column: {}", drop_column_query);
-    run_query(&drop_column_query, client).await.map_err(|e| {
-        ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        }
-    })?;
+    run_alter_query(
+        db_name,
+        table_name,
+        &drop_column_query,
+        mutations::AlterRetry::Allowed,
+        client,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1341,15 +1400,13 @@ data_type_changed: {data_type_changed}, default_changed: {default_changed}, mate
         cluster_name,
     )?;
 
-    // Execute all statements in order
-    for query in queries {
-        tracing::debug!("Modifying column: {}", query);
-        run_query(&query, client)
-            .await
-            .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-                error: e,
-                resource: Some(table_name.to_string()),
-            })?;
+    // Execute all statements in order. Each one goes through the mutation
+    // barrier: ClickHouse queues these ALTERs asynchronously, so issuing the
+    // next one before the previous has drained is rejected with
+    // CANNOT_ASSIGN_ALTER.
+    for statement in queries {
+        tracing::debug!("Modifying column: {}", statement.sql);
+        run_alter_query(db_name, table_name, &statement.sql, statement.retry, client).await?;
     }
 
     Ok(())
@@ -1377,12 +1434,14 @@ async fn execute_modify_column_comment(
         build_modify_column_comment_sql(db_name, table_name, &column.name, comment, cluster_name)?;
 
     tracing::debug!("Modifying column comment: {}", modify_comment_query);
-    run_query(&modify_comment_query, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })?;
+    run_alter_query(
+        db_name,
+        table_name,
+        &modify_comment_query,
+        mutations::AlterRetry::Allowed,
+        client,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1436,51 +1495,94 @@ fn build_column_property_clauses(col: &ClickHouseColumn) -> String {
     )
 }
 
+/// A generated `ALTER TABLE` statement together with its retry policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AlterStatement {
+    /// The statement to run.
+    sql: String,
+    /// Whether it may be re-issued after a retryable conflict.
+    retry: mutations::AlterRetry,
+}
+
+/// Builds the `ALTER TABLE ... MODIFY COLUMN` statements for a column change.
+///
+/// `MODIFY COLUMN ... REMOVE DEFAULT|TTL|CODEC` has no `IF EXISTS`-style guard,
+/// so it is not idempotent. On a cluster the statement can apply on some hosts
+/// and be rejected on others, which makes re-issuing it unsafe; those statements
+/// are therefore marked [`mutations::AlterRetry::Forbidden`] when a cluster is
+/// targeted. On a single node a `CANNOT_ASSIGN_ALTER` means the statement did
+/// not apply at all, so retrying stays safe.
+///
+/// # Arguments
+/// * `db_name` - Database of the table being altered
+/// * `table_name` - Table being altered
+/// * `ch_col` - The column in its desired, post-change shape
+/// * `removals` - Column properties that must be removed first
+/// * `cluster_name` - Cluster to run the statements on, if any
 fn build_modify_column_sql(
     db_name: &str,
     table_name: &str,
     ch_col: &ClickHouseColumn,
     removals: &ColumnPropertyRemovals,
     cluster_name: Option<&str>,
-) -> Result<Vec<String>, ClickhouseChangesError> {
+) -> Result<Vec<AlterStatement>, ClickhouseChangesError> {
     let column_type_string = basic_field_type_to_string(&ch_col.column_type)?;
 
     let cluster_clause = cluster_name
         .map(|c| format!(" ON CLUSTER `{}`", c))
         .unwrap_or_default();
 
+    // REMOVE statements cannot be made idempotent, so on a cluster they must be
+    // issued exactly once.
+    let removal_retry = if cluster_name.is_some() {
+        mutations::AlterRetry::Forbidden
+    } else {
+        mutations::AlterRetry::Allowed
+    };
+
     let mut statements = vec![];
 
     // ClickHouse doesn't allow mixing column properties with REMOVE clauses,
     // so REMOVE statements must be separate ALTER TABLE statements.
     if let Some(kind) = removals.default_expression {
-        statements.push(format!(
-            "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE {}",
-            db_name, table_name, cluster_clause, ch_col.name, kind
-        ));
+        statements.push(AlterStatement {
+            sql: format!(
+                "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE {}",
+                db_name, table_name, cluster_clause, ch_col.name, kind
+            ),
+            retry: removal_retry,
+        });
     }
 
     if removals.ttl {
-        statements.push(format!(
-            "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE TTL",
-            db_name, table_name, cluster_clause, ch_col.name
-        ));
+        statements.push(AlterStatement {
+            sql: format!(
+                "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE TTL",
+                db_name, table_name, cluster_clause, ch_col.name
+            ),
+            retry: removal_retry,
+        });
     }
 
     if removals.codec {
-        statements.push(format!(
-            "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE CODEC",
-            db_name, table_name, cluster_clause, ch_col.name
-        ));
+        statements.push(AlterStatement {
+            sql: format!(
+                "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN `{}` REMOVE CODEC",
+                db_name, table_name, cluster_clause, ch_col.name
+            ),
+            retry: removal_retry,
+        });
     }
 
     let property_clauses = build_column_property_clauses(ch_col);
 
-    let main_sql = format!(
-        "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN IF EXISTS `{}` {}{}",
-        db_name, table_name, cluster_clause, ch_col.name, column_type_string, property_clauses
-    );
-    statements.push(main_sql);
+    statements.push(AlterStatement {
+        sql: format!(
+            "ALTER TABLE `{}`.`{}`{} MODIFY COLUMN IF EXISTS `{}` {}{}",
+            db_name, table_name, cluster_clause, ch_col.name, column_type_string, property_clauses
+        ),
+        retry: mutations::AlterRetry::Allowed,
+    });
 
     Ok(statements)
 }
@@ -1550,12 +1652,14 @@ async fn execute_modify_table_settings(
         )?;
         tracing::debug!("Modifying table settings: {}", alter_settings_query);
 
-        run_query(&alter_settings_query, client)
-            .await
-            .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-                error: e,
-                resource: Some(table_name.to_string()),
-            })?;
+        run_alter_query(
+            db_name,
+            table_name,
+            &alter_settings_query,
+            mutations::AlterRetry::Allowed,
+            client,
+        )
+        .await?;
     }
 
     // Execute RESET SETTING if there are settings to reset
@@ -1568,12 +1672,14 @@ async fn execute_modify_table_settings(
         )?;
         tracing::debug!("Resetting table settings: {}", reset_settings_query);
 
-        run_query(&reset_settings_query, client)
-            .await
-            .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-                error: e,
-                resource: Some(table_name.to_string()),
-            })?;
+        run_alter_query(
+            db_name,
+            table_name,
+            &reset_settings_query,
+            mutations::AlterRetry::Allowed,
+            client,
+        )
+        .await?;
     }
 
     Ok(())
@@ -1598,15 +1704,17 @@ async fn execute_rename_table_column(
         .map(|c| format!(" ON CLUSTER `{}`", c))
         .unwrap_or_default();
     let rename_column_query = format!(
-        "ALTER TABLE `{db_name}`.`{table_name}`{cluster_clause} RENAME COLUMN `{before_column_name}` TO `{after_column_name}`"
+        "ALTER TABLE `{db_name}`.`{table_name}`{cluster_clause} RENAME COLUMN IF EXISTS `{before_column_name}` TO `{after_column_name}`"
     );
     tracing::debug!("Renaming column: {}", rename_column_query);
-    run_query(&rename_column_query, client).await.map_err(|e| {
-        ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        }
-    })?;
+    run_alter_query(
+        db_name,
+        table_name,
+        &rename_column_query,
+        mutations::AlterRetry::Allowed,
+        client,
+    )
+    .await?;
     Ok(())
 }
 
@@ -3853,7 +3961,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
 
         assert_eq!(sqls.len(), 1);
         assert_eq!(
-            sqls[0],
+            sqls[0].sql,
             "ALTER TABLE `db`.`table` MODIFY COLUMN IF EXISTS `count` Int32 DEFAULT 42 COMMENT 'Number of things'".to_string()
         );
     }
@@ -3926,7 +4034,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
 
         assert_eq!(sqls.len(), 1);
         assert_eq!(
-            sqls[0],
+            sqls[0].sql,
             "ALTER TABLE `test_db`.`users` MODIFY COLUMN IF EXISTS `description` Nullable(String) DEFAULT 'updated default' COMMENT 'Updated description field'"
         );
     }
@@ -3963,7 +4071,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
         assert_eq!(sqls.len(), 1);
         // The fix ensures xxHash64(_id) is NOT quoted - if it were quoted, ClickHouse would treat it as a string literal
         assert_eq!(
-            sqls[0],
+            sqls[0].sql,
             "ALTER TABLE `test_db`.`test_table` MODIFY COLUMN IF EXISTS `sample_hash` UInt64 DEFAULT xxHash64(_id) COMMENT 'Hash of the ID'"
         );
 
@@ -3994,7 +4102,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
         assert_eq!(sqls.len(), 1);
         // The fix ensures now() is NOT quoted
         assert_eq!(
-            sqls[0],
+            sqls[0].sql,
             "ALTER TABLE `test_db`.`test_table` MODIFY COLUMN IF EXISTS `created_at` DateTime64(3) DEFAULT now()"
         );
 
@@ -4025,7 +4133,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
         assert_eq!(sqls.len(), 1);
         // String literals should preserve their quotes
         assert_eq!(
-            sqls[0],
+            sqls[0].sql,
             "ALTER TABLE `test_db`.`test_table` MODIFY COLUMN IF EXISTS `status` String DEFAULT 'active'"
         );
     }
@@ -4471,7 +4579,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             .unwrap_or_default();
 
         let add_column_query = format!(
-            "ALTER TABLE `{}`.`{}`{} ADD COLUMN `{}` {}{}{}{}  {}",
+            "ALTER TABLE `{}`.`{}`{} ADD COLUMN IF NOT EXISTS `{}` {}{}{}{}  {}",
             "test_db",
             "test_table",
             "",
@@ -4485,7 +4593,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
 
         assert_eq!(
             add_column_query,
-            "ALTER TABLE `test_db`.`test_table` ADD COLUMN `count` Int32 DEFAULT 42  FIRST"
+            "ALTER TABLE `test_db`.`test_table` ADD COLUMN IF NOT EXISTS `count` Int32 DEFAULT 42  FIRST"
         );
     }
 
@@ -4536,7 +4644,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             .unwrap_or_default();
 
         let add_column_query = format!(
-            "ALTER TABLE `{}`.`{}`{} ADD COLUMN `{}` {}{}{}{}  {}",
+            "ALTER TABLE `{}`.`{}`{} ADD COLUMN IF NOT EXISTS `{}` {}{}{}{}  {}",
             "test_db",
             "test_table",
             "",
@@ -4550,7 +4658,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
 
         assert_eq!(
             add_column_query,
-            "ALTER TABLE `test_db`.`test_table` ADD COLUMN `description` Nullable(String) DEFAULT 'default text'  AFTER `id`"
+            "ALTER TABLE `test_db`.`test_table` ADD COLUMN IF NOT EXISTS `description` Nullable(String) DEFAULT 'default text'  AFTER `id`"
         );
     }
 
@@ -4979,7 +5087,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
 
         assert_eq!(sqls.len(), 1);
         assert_eq!(
-            sqls[0],
+            sqls[0].sql,
             "ALTER TABLE `test_db`.`test_table` MODIFY COLUMN IF EXISTS `event_date` Date MATERIALIZED toStartOfMonth(event_time)"
         );
     }
@@ -5019,7 +5127,7 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
         // Should have 2 statements: REMOVE DEFAULT + the main MODIFY COLUMN
         assert!(!sqls.is_empty());
         assert_eq!(
-            sqls[0],
+            sqls[0].sql,
             "ALTER TABLE `test_db`.`test_table` MODIFY COLUMN `status` REMOVE DEFAULT"
         );
     }
@@ -5056,9 +5164,62 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
 
         assert!(!sqls.is_empty());
         assert_eq!(
-            sqls[0],
+            sqls[0].sql,
             "ALTER TABLE `test_db`.`test_table` MODIFY COLUMN `user_hash` REMOVE MATERIALIZED"
         );
+    }
+
+    #[test]
+    fn test_remove_statements_are_not_retried_on_a_cluster() {
+        use crate::infrastructure::olap::clickhouse::model::ClickHouseColumn;
+
+        let ch_col = ClickHouseColumn {
+            name: "status".to_string(),
+            column_type: ClickHouseColumnType::String,
+            required: true,
+            primary_key: false,
+            unique: false,
+            default: None,
+            materialized: None,
+            alias: None,
+            comment: None,
+            ttl: None,
+            codec: None,
+        };
+        let removals = ColumnPropertyRemovals {
+            default_expression: Some(DefaultExpressionKind::Default),
+            ttl: true,
+            codec: true,
+        };
+
+        // On a cluster the REMOVE statements have no existence guard and may
+        // already have applied on some hosts, so they must not be re-issued.
+        let clustered = build_modify_column_sql(
+            "test_db",
+            "test_table",
+            &ch_col,
+            &removals,
+            Some("test_cluster"),
+        )
+        .unwrap();
+
+        assert_eq!(clustered.len(), 4);
+        for statement in &clustered[..3] {
+            assert!(statement.sql.contains("REMOVE"));
+            assert_eq!(statement.retry, mutations::AlterRetry::Forbidden);
+        }
+        // The main MODIFY COLUMN is guarded by IF EXISTS, so it stays retryable.
+        assert!(clustered[3].sql.contains("MODIFY COLUMN IF EXISTS"));
+        assert_eq!(clustered[3].retry, mutations::AlterRetry::Allowed);
+
+        // On a single node a rejected ALTER definitively did not apply.
+        let single_node =
+            build_modify_column_sql("test_db", "test_table", &ch_col, &removals, None).unwrap();
+
+        assert_eq!(single_node.len(), 4);
+        assert!(single_node
+            .iter()
+            .all(|statement| statement.retry == mutations::AlterRetry::Allowed));
     }
 
     #[test]
