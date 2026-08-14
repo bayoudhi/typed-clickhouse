@@ -12,17 +12,27 @@
 //! You can retry this error. (CANNOT_ASSIGN_ALTER)
 //! ```
 //!
-//! This module provides the barrier that prevents it: before issuing a
-//! mutation-producing operation, wait until the target table has no unfinished
-//! mutations, and retry the operation if ClickHouse still rejects it.
+//! This module provides the barrier that prevents it. The barrier is applied
+//! around **each individual `ALTER TABLE` statement**, not around a whole
+//! migration operation: a single operation can issue several back-to-back
+//! ALTERs against the same table (`ModifyTableColumn` emits up to four), and
+//! those need serialising against each other just as much as two separate
+//! operations do. Retrying at statement granularity also means a retry never
+//! re-executes a statement that already succeeded.
+//!
+//! The barrier is advisory. If `system.mutations` cannot be read — a transient
+//! blip, or a service account without `SELECT` on it — the wait is skipped with
+//! a warning rather than failing the migration, and the `CANNOT_ASSIGN_ALTER`
+//! retry provides the remaining protection.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::time::Instant;
 
-use super::{ClickhouseChangesError, ConfiguredDBClient, SerializableOlapOperation};
+use super::{ClickhouseChangesError, ConfiguredDBClient};
 
 /// Substring identifying the `CANNOT_ASSIGN_ALTER` error code in a ClickHouse
 /// server response.
@@ -39,11 +49,22 @@ pub const DEFAULT_MUTATION_WAIT_TIMEOUT: Duration = Duration::from_secs(30 * 60)
 /// How often to re-check `system.mutations` while waiting.
 pub const DEFAULT_MUTATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// How many times to re-issue an operation ClickHouse rejected with
+/// How many times to re-issue a statement ClickHouse rejected with
 /// `CANNOT_ASSIGN_ALTER`. Each retry re-runs the wait barrier first.
 pub const DEFAULT_ALTER_CONFLICT_RETRIES: u32 = 5;
 
-/// Tuning for the mutation barrier applied around each migration operation.
+/// How many consecutive polls a mutation must report a non-empty
+/// `latest_fail_reason` before the barrier gives up on it.
+///
+/// A permanently failing mutation never leaves `system.mutations` with
+/// `is_done = 0`, so without this the barrier would burn its entire timeout
+/// while holding the migration lock. A `latest_fail_reason` can also be set
+/// transiently and then clear once ClickHouse retries the mutation
+/// successfully, so a single observation must not abort the wait — three
+/// consecutive observations is roughly 6s at the default poll interval.
+pub const MUTATION_FAILURE_TOLERANCE: u32 = 3;
+
+/// Tuning for the mutation barrier applied around each ALTER statement.
 #[derive(Debug, Clone, Copy)]
 pub struct MutationWaitConfig {
     /// Maximum time to wait for a table's mutations to drain.
@@ -91,10 +112,6 @@ pub struct MutationQueryError {
 /// Error returned by [`wait_for_mutations`].
 #[derive(Debug, thiserror::Error)]
 pub enum MutationWaitError {
-    /// `system.mutations` could not be read.
-    #[error(transparent)]
-    Query(#[from] MutationQueryError),
-
     /// The table still had unfinished mutations when the timeout elapsed.
     #[error(
         "timed out after {}s waiting for in-flight mutation(s) on `{database}`.`{table}` to finish:\n{}",
@@ -111,16 +128,30 @@ pub enum MutationWaitError {
         /// The mutations still outstanding when we gave up.
         pending: Vec<PendingMutation>,
     },
+
+    /// A mutation kept reporting a failure and will never drain on its own.
+    #[error(
+        "in-flight mutation(s) on `{database}`.`{table}` are failing and will not finish:\n{}",
+        format_pending(.pending)
+    )]
+    Failed {
+        /// Database of the table whose mutations are failing.
+        database: String,
+        /// Table whose mutations are failing.
+        table: String,
+        /// The mutations that kept reporting a failure reason.
+        pending: Vec<PendingMutation>,
+    },
 }
 
-/// Error returned by [`apply_operation_with_mutation_barrier`].
+/// Error returned by [`run_alter_with_mutation_barrier`].
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyOperationError {
     /// Waiting for the table's mutations to drain failed.
     #[error(transparent)]
     Wait(#[from] MutationWaitError),
 
-    /// The operation itself failed.
+    /// The statement itself failed.
     #[error(transparent)]
     Execute(#[from] ClickhouseChangesError),
 }
@@ -163,14 +194,11 @@ pub trait MutationQuery: Send + Sync {
     ) -> Result<Vec<PendingMutation>, MutationQueryError>;
 }
 
-/// Executes a single migration operation.
+/// Executes a single SQL statement.
 #[async_trait]
-pub trait OperationExecutor: Send + Sync {
-    /// Applies `operation` to the database.
-    async fn execute(
-        &self,
-        operation: &SerializableOlapOperation,
-    ) -> Result<(), ClickhouseChangesError>;
+pub trait StatementRunner: Send + Sync {
+    /// Runs `statement` against the database.
+    async fn run(&self, statement: &str) -> Result<(), ClickhouseChangesError>;
 }
 
 /// Row shape returned by [`PENDING_MUTATIONS_QUERY`].
@@ -211,100 +239,34 @@ impl MutationQuery for ConfiguredDBClient {
     }
 }
 
-/// Runs migration operations against a live ClickHouse connection.
-pub struct AtomicOperationExecutor<'a> {
+/// Runs statements against a live ClickHouse connection, attributing failures
+/// to the table being altered.
+pub struct ClientStatementRunner<'a> {
     client: &'a ConfiguredDBClient,
-    db_name: &'a str,
-    is_dev: bool,
+    table: &'a str,
 }
 
-impl<'a> AtomicOperationExecutor<'a> {
-    /// Creates an executor bound to a connection.
+impl<'a> ClientStatementRunner<'a> {
+    /// Creates a runner bound to a connection and a target table.
     ///
     /// # Arguments
-    /// * `client` - The connection to run operations on
-    /// * `db_name` - Database used by operations that do not name one
-    /// * `is_dev` - Whether the project is running in development mode
-    pub fn new(client: &'a ConfiguredDBClient, db_name: &'a str, is_dev: bool) -> Self {
-        Self {
-            client,
-            db_name,
-            is_dev,
-        }
+    /// * `client` - The connection to run statements on
+    /// * `table` - Table reported as the failing resource on error
+    pub fn new(client: &'a ConfiguredDBClient, table: &'a str) -> Self {
+        Self { client, table }
     }
 }
 
 #[async_trait]
-impl OperationExecutor for AtomicOperationExecutor<'_> {
-    async fn execute(
-        &self,
-        operation: &SerializableOlapOperation,
-    ) -> Result<(), ClickhouseChangesError> {
-        super::execute_atomic_operation(self.db_name, operation, self.client, self.is_dev).await
+impl StatementRunner for ClientStatementRunner<'_> {
+    async fn run(&self, statement: &str) -> Result<(), ClickhouseChangesError> {
+        super::run_query(statement, self.client)
+            .await
+            .map_err(|error| ClickhouseChangesError::ClickhouseClient {
+                error,
+                resource: Some(self.table.to_string()),
+            })
     }
-}
-
-/// Returns the `(database, table)` an operation issues an `ALTER TABLE`
-/// against, or `None` for operations that cannot queue a mutation.
-///
-/// Every table-level ALTER is included, not only the ones that always produce a
-/// mutation: ClickHouse counts unfinished metadata alters towards the same
-/// limit, so metadata-only statements are rejected by the very conflict this
-/// barrier exists to avoid.
-///
-/// # Arguments
-/// * `operation` - The operation about to be executed
-/// * `default_database` - Database used by operations that do not name one
-pub fn mutation_target(
-    operation: &SerializableOlapOperation,
-    default_database: &str,
-) -> Option<(String, String)> {
-    let (table, database) = match operation {
-        SerializableOlapOperation::AddTableColumn {
-            table, database, ..
-        }
-        | SerializableOlapOperation::DropTableColumn {
-            table, database, ..
-        }
-        | SerializableOlapOperation::ModifyTableColumn {
-            table, database, ..
-        }
-        | SerializableOlapOperation::RenameTableColumn {
-            table, database, ..
-        }
-        | SerializableOlapOperation::ModifyTableSettings {
-            table, database, ..
-        }
-        | SerializableOlapOperation::ModifyTableTtl {
-            table, database, ..
-        }
-        | SerializableOlapOperation::AddTableIndex {
-            table, database, ..
-        }
-        | SerializableOlapOperation::DropTableIndex {
-            table, database, ..
-        }
-        | SerializableOlapOperation::AddTableProjection {
-            table, database, ..
-        }
-        | SerializableOlapOperation::DropTableProjection {
-            table, database, ..
-        }
-        | SerializableOlapOperation::ModifySampleBy {
-            table, database, ..
-        }
-        | SerializableOlapOperation::RemoveSampleBy {
-            table, database, ..
-        } => (table, database),
-        _ => return None,
-    };
-
-    Some((
-        database
-            .clone()
-            .unwrap_or_else(|| default_database.to_string()),
-        table.clone(),
-    ))
 }
 
 /// Lists a table's unfinished mutations. Binds the database and table names as
@@ -333,7 +295,15 @@ pub fn is_alter_conflict(error: &(dyn Error + 'static)) -> bool {
 
 /// Blocks until `database`.`table` has no unfinished mutations.
 ///
-/// Returns immediately when the table is already clear.
+/// Returns immediately when the table is already clear. The barrier is
+/// advisory: if `system.mutations` cannot be read the wait is skipped with a
+/// warning and `Ok(())` is returned, leaving the `CANNOT_ASSIGN_ALTER` retry as
+/// the remaining protection.
+///
+/// Waiting is abandoned early when a mutation reports a non-empty
+/// `latest_fail_reason` on [`MUTATION_FAILURE_TOLERANCE`] consecutive polls,
+/// because such a mutation never finishes and would otherwise consume the whole
+/// timeout.
 ///
 /// # Arguments
 /// * `query` - Source of `system.mutations` rows
@@ -348,14 +318,56 @@ pub async fn wait_for_mutations<Q: MutationQuery + ?Sized>(
 ) -> Result<(), MutationWaitError> {
     let started = Instant::now();
     let mut announced = false;
+    let mut failing_polls: HashMap<String, u32> = HashMap::new();
 
     loop {
-        let pending = query.pending_mutations(database, table).await?;
+        let pending = match query.pending_mutations(database, table).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(
+                    "could not read system.mutations for `{}`.`{}`; proceeding without the barrier: {}",
+                    database,
+                    table,
+                    error
+                );
+                return Ok(());
+            }
+        };
+
         if pending.is_empty() {
             if announced {
-                println!("      ✓ in-flight mutations on '{database}.{table}' finished");
+                tracing::info!("in-flight mutations on '{database}.{table}' finished");
             }
             return Ok(());
+        }
+
+        // Track, across polls, which mutations keep reporting a failure.
+        failing_polls.retain(|id, _| pending.iter().any(|m| &m.mutation_id == id));
+        for mutation in &pending {
+            if mutation.latest_fail_reason.is_empty() {
+                failing_polls.remove(&mutation.mutation_id);
+            } else {
+                *failing_polls
+                    .entry(mutation.mutation_id.clone())
+                    .or_insert(0) += 1;
+            }
+        }
+
+        let stuck: Vec<PendingMutation> = pending
+            .iter()
+            .filter(|m| {
+                failing_polls
+                    .get(&m.mutation_id)
+                    .is_some_and(|count| *count >= MUTATION_FAILURE_TOLERANCE)
+            })
+            .cloned()
+            .collect();
+        if !stuck.is_empty() {
+            return Err(MutationWaitError::Failed {
+                database: database.to_string(),
+                table: table.to_string(),
+                pending: stuck,
+            });
         }
 
         let waited = started.elapsed();
@@ -370,8 +382,8 @@ pub async fn wait_for_mutations<Q: MutationQuery + ?Sized>(
 
         if !announced {
             announced = true;
-            println!(
-                "      ⏳ waiting for {} in-flight mutation(s) on '{database}.{table}'...",
+            tracing::info!(
+                "waiting for {} in-flight mutation(s) on '{database}.{table}'...",
                 pending.len()
             );
         }
@@ -380,35 +392,37 @@ pub async fn wait_for_mutations<Q: MutationQuery + ?Sized>(
     }
 }
 
-/// Applies one migration operation, serialising it against the target table's
-/// in-flight mutations and retrying ClickHouse's retryable alter conflict.
+/// Runs a single `ALTER TABLE` statement, serialising it against the target
+/// table's in-flight mutations and retrying ClickHouse's retryable alter
+/// conflict.
+///
+/// Only the supplied statement is retried, so an operation that issues several
+/// statements never re-executes one that already succeeded.
 ///
 /// # Arguments
 /// * `query` - Source of `system.mutations` rows
-/// * `executor` - Runs the operation
-/// * `operation` - The operation to apply
-/// * `default_database` - Database used by operations that do not name one
+/// * `runner` - Runs the statement
+/// * `statement` - The single SQL statement to run
+/// * `database` - Database of the table being altered
+/// * `table` - Table being altered
 /// * `config` - Wait and retry tuning
-pub async fn apply_operation_with_mutation_barrier<Q, E>(
+pub async fn run_alter_with_mutation_barrier<Q, R>(
     query: &Q,
-    executor: &E,
-    operation: &SerializableOlapOperation,
-    default_database: &str,
+    runner: &R,
+    statement: &str,
+    database: &str,
+    table: &str,
     config: &MutationWaitConfig,
 ) -> Result<(), ApplyOperationError>
 where
     Q: MutationQuery + ?Sized,
-    E: OperationExecutor + ?Sized,
+    R: StatementRunner + ?Sized,
 {
-    let target = mutation_target(operation, default_database);
-
     let mut attempt = 0;
     loop {
-        if let Some((database, table)) = &target {
-            wait_for_mutations(query, database, table, config).await?;
-        }
+        wait_for_mutations(query, database, table, config).await?;
 
-        match executor.execute(operation).await {
+        match runner.run(statement).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 if attempt >= config.max_retries || !is_alter_conflict(&error) {
@@ -416,14 +430,10 @@ where
                 }
                 attempt += 1;
                 tracing::warn!(
-                    "ClickHouse rejected the operation with a retryable alter conflict; retrying ({}/{}): {}",
+                    "ClickHouse rejected the statement with a retryable alter conflict; retrying ({}/{}): {}",
                     attempt,
                     config.max_retries,
                     error
-                );
-                println!(
-                    "      ↻ ClickHouse is still applying earlier alters; retrying ({}/{})",
-                    attempt, config.max_retries
                 );
                 tokio::time::sleep(config.poll_interval).await;
             }
@@ -436,40 +446,23 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use crate::framework::core::infrastructure::table::{Column, ColumnType};
 
-    fn column(name: &str) -> Column {
-        Column {
-            name: name.to_string(),
-            data_type: ColumnType::String,
-            required: true,
-            unique: false,
-            primary_key: false,
-            default: None,
-            annotations: vec![],
-            comment: None,
-            materialized: None,
-            alias: None,
-            ttl: None,
-            codec: None,
-        }
-    }
-
-    fn modify_column_op(table: &str, database: Option<&str>) -> SerializableOlapOperation {
-        SerializableOlapOperation::ModifyTableColumn {
-            table: table.to_string(),
-            before_column: column("arrivalDate"),
-            after_column: column("arrivalDate"),
-            database: database.map(str::to_string),
-            cluster_name: None,
-        }
-    }
+    const ALTER: &str =
+        "ALTER TABLE `local`.`reservations` MODIFY COLUMN `arrivalDate` DateTime64(3)";
 
     fn pending(id: &str, command: &str) -> PendingMutation {
         PendingMutation {
             mutation_id: id.to_string(),
             command: command.to_string(),
             latest_fail_reason: String::new(),
+        }
+    }
+
+    fn failing(id: &str, command: &str, reason: &str) -> PendingMutation {
+        PendingMutation {
+            mutation_id: id.to_string(),
+            command: command.to_string(),
+            latest_fail_reason: reason.to_string(),
         }
     }
 
@@ -488,20 +481,7 @@ mod tests {
         }
 
         fn always_pending(mutation: PendingMutation) -> Self {
-            Self {
-                responses: Mutex::new(vec![]),
-                polls: Mutex::new(Vec::new()),
-            }
-            .with_fallback(mutation)
-        }
-
-        fn with_fallback(self, mutation: PendingMutation) -> Self {
-            let mut responses = self.responses.into_inner().unwrap();
-            responses.push(vec![mutation]);
-            Self {
-                responses: Mutex::new(responses),
-                polls: self.polls,
-            }
+            Self::new(vec![vec![mutation]])
         }
 
         fn poll_count(&self) -> usize {
@@ -543,32 +523,67 @@ mod tests {
         }
     }
 
-    /// Fails with a `CANNOT_ASSIGN_ALTER` response a fixed number of times.
-    struct ConflictingExecutor {
-        failures_remaining: Mutex<u32>,
-        attempts: Mutex<u32>,
+    /// `system.mutations` cannot be read at all, e.g. missing SELECT grant.
+    struct UnreadableMutations {
+        polls: Mutex<u32>,
     }
 
-    impl ConflictingExecutor {
-        fn new(failures: u32) -> Self {
+    impl UnreadableMutations {
+        fn new() -> Self {
             Self {
-                failures_remaining: Mutex::new(failures),
-                attempts: Mutex::new(0),
+                polls: Mutex::new(0),
             }
         }
 
-        fn attempts(&self) -> u32 {
-            *self.attempts.lock().unwrap()
+        fn polls(&self) -> u32 {
+            *self.polls.lock().unwrap()
         }
     }
 
     #[async_trait]
-    impl OperationExecutor for ConflictingExecutor {
-        async fn execute(
+    impl MutationQuery for UnreadableMutations {
+        async fn pending_mutations(
             &self,
-            _operation: &SerializableOlapOperation,
-        ) -> Result<(), ClickhouseChangesError> {
-            *self.attempts.lock().unwrap() += 1;
+            database: &str,
+            table: &str,
+        ) -> Result<Vec<PendingMutation>, MutationQueryError> {
+            *self.polls.lock().unwrap() += 1;
+            Err(MutationQueryError {
+                database: database.to_string(),
+                table: table.to_string(),
+                source: "Code: 497. DB::Exception: Not enough privileges".into(),
+            })
+        }
+    }
+
+    /// Fails with a `CANNOT_ASSIGN_ALTER` response a fixed number of times, and
+    /// records every statement it was asked to run.
+    struct ConflictingRunner {
+        failures_remaining: Mutex<u32>,
+        statements: Mutex<Vec<String>>,
+    }
+
+    impl ConflictingRunner {
+        fn new(failures: u32) -> Self {
+            Self {
+                failures_remaining: Mutex::new(failures),
+                statements: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn attempts(&self) -> u32 {
+            self.statements.lock().unwrap().len() as u32
+        }
+
+        fn statements(&self) -> Vec<String> {
+            self.statements.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl StatementRunner for ConflictingRunner {
+        async fn run(&self, statement: &str) -> Result<(), ClickhouseChangesError> {
+            self.statements.lock().unwrap().push(statement.to_string());
             let mut remaining = self.failures_remaining.lock().unwrap();
             if *remaining == 0 {
                 return Ok(());
@@ -584,11 +599,11 @@ mod tests {
     }
 
     /// Fails with an error unrelated to alter conflicts.
-    struct AlwaysFailingExecutor {
+    struct AlwaysFailingRunner {
         attempts: Mutex<u32>,
     }
 
-    impl AlwaysFailingExecutor {
+    impl AlwaysFailingRunner {
         fn new() -> Self {
             Self {
                 attempts: Mutex::new(0),
@@ -601,11 +616,8 @@ mod tests {
     }
 
     #[async_trait]
-    impl OperationExecutor for AlwaysFailingExecutor {
-        async fn execute(
-            &self,
-            _operation: &SerializableOlapOperation,
-        ) -> Result<(), ClickhouseChangesError> {
+    impl StatementRunner for AlwaysFailingRunner {
+        async fn run(&self, _statement: &str) -> Result<(), ClickhouseChangesError> {
             *self.attempts.lock().unwrap() += 1;
             Err(ClickhouseChangesError::NotSupported(
                 "Code: 47. DB::Exception: Unknown identifier".to_string(),
@@ -619,57 +631,6 @@ mod tests {
             poll_interval: Duration::from_millis(1),
             max_retries: 3,
         }
-    }
-
-    #[test]
-    fn modify_column_targets_its_own_table() {
-        let op = modify_column_op("reservations", Some("analytics"));
-        assert_eq!(
-            mutation_target(&op, "fallback"),
-            Some(("analytics".to_string(), "reservations".to_string()))
-        );
-    }
-
-    #[test]
-    fn operation_without_database_falls_back_to_the_default() {
-        let op = modify_column_op("reservations", None);
-        assert_eq!(
-            mutation_target(&op, "fallback"),
-            Some(("fallback".to_string(), "reservations".to_string()))
-        );
-    }
-
-    #[test]
-    fn drop_projection_is_a_mutation_target() {
-        let op = SerializableOlapOperation::DropTableProjection {
-            table: "reservations".to_string(),
-            projection_name: "p_by_unit".to_string(),
-            database: None,
-            cluster_name: None,
-        };
-        assert_eq!(
-            mutation_target(&op, "local"),
-            Some(("local".to_string(), "reservations".to_string()))
-        );
-    }
-
-    #[test]
-    fn view_operations_are_not_mutation_targets() {
-        let op = SerializableOlapOperation::DropView {
-            name: "v_reservations".to_string(),
-            database: None,
-        };
-        assert_eq!(mutation_target(&op, "local"), None);
-    }
-
-    #[test]
-    fn create_table_is_not_a_mutation_target() {
-        let op = SerializableOlapOperation::DropTable {
-            table: "reservations".to_string(),
-            database: None,
-            cluster_name: None,
-        };
-        assert_eq!(mutation_target(&op, "local"), None);
     }
 
     #[test]
@@ -691,6 +652,32 @@ mod tests {
                 .to_string(),
         );
         assert!(is_alter_conflict(&error));
+    }
+
+    #[test]
+    fn alter_conflict_is_detected_by_its_symbolic_name_alone() {
+        let error = ClickhouseChangesError::NotSupported(
+            "DB::Exception: (CANNOT_ASSIGN_ALTER)".to_string(),
+        );
+        assert!(is_alter_conflict(&error));
+    }
+
+    #[test]
+    fn alter_conflict_is_detected_through_a_nested_source() {
+        let inner = MutationQueryError {
+            database: "local".to_string(),
+            table: "reservations".to_string(),
+            source: "Code: 517. (CANNOT_ASSIGN_ALTER)".into(),
+        };
+        let outer = ApplyOperationError::Wait(MutationWaitError::Failed {
+            database: "local".to_string(),
+            table: "reservations".to_string(),
+            pending: vec![],
+        });
+
+        assert!(is_alter_conflict(&inner));
+        // The outer error's own message carries no conflict marker.
+        assert!(!is_alter_conflict(&outer));
     }
 
     #[test]
@@ -742,13 +729,120 @@ mod tests {
             .await
             .unwrap_err();
 
+        assert!(matches!(error, MutationWaitError::Timeout { .. }));
         let message = error.to_string();
         assert!(message.contains("0000002215"), "got: {message}");
         assert!(message.contains("`local`.`reservations`"), "got: {message}");
     }
 
     #[tokio::test]
-    async fn applying_a_mutating_operation_waits_for_the_table_first() {
+    async fn an_unreadable_system_mutations_does_not_abort_the_wait() {
+        let query = UnreadableMutations::new();
+
+        wait_for_mutations(&query, "local", "reservations", &fast_config())
+            .await
+            .unwrap();
+
+        assert_eq!(query.polls(), 1, "the barrier must not retry the read");
+    }
+
+    #[tokio::test]
+    async fn a_statement_still_runs_when_system_mutations_is_unreadable() {
+        let query = UnreadableMutations::new();
+        let runner = ConflictingRunner::new(0);
+
+        run_alter_with_mutation_barrier(
+            &query,
+            &runner,
+            ALTER,
+            "local",
+            "reservations",
+            &fast_config(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(runner.statements(), vec![ALTER.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_persistently_failing_mutation_stops_the_wait_early() {
+        let started = Instant::now();
+        let query = ScriptedMutations::always_pending(failing(
+            "0000002216",
+            "(MODIFY COLUMN `arrivalDate` DateTime64(3))",
+            "Cannot parse string as DateTime64",
+        ));
+        let config = MutationWaitConfig {
+            timeout: Duration::from_secs(60),
+            poll_interval: Duration::from_millis(1),
+            max_retries: 3,
+        };
+
+        let error = wait_for_mutations(&query, "local", "reservations", &config)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, MutationWaitError::Failed { .. }));
+        assert_eq!(
+            query.poll_count(),
+            MUTATION_FAILURE_TOLERANCE as usize,
+            "must give up on the poll that reaches the tolerance"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "must not wait out the full timeout"
+        );
+
+        let message = error.to_string();
+        assert!(message.contains("0000002216"), "got: {message}");
+        assert!(
+            message.contains("Cannot parse string as DateTime64"),
+            "got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_reason_does_not_abort_the_wait() {
+        let command = "(MODIFY COLUMN `arrivalDate` DateTime64(3))";
+        let query = ScriptedMutations::new(vec![
+            vec![failing("0000002217", command, "temporary hiccup")],
+            vec![failing("0000002217", command, "temporary hiccup")],
+            // The fail reason clears: ClickHouse retried the mutation.
+            vec![pending("0000002217", command)],
+            vec![failing("0000002217", command, "temporary hiccup")],
+            vec![],
+        ]);
+
+        wait_for_mutations(&query, "local", "reservations", &fast_config())
+            .await
+            .unwrap();
+
+        assert_eq!(query.poll_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_statement_runs_immediately_when_the_table_is_clear() {
+        let query = ScriptedMutations::new(vec![vec![]]);
+        let runner = ConflictingRunner::new(0);
+
+        run_alter_with_mutation_barrier(
+            &query,
+            &runner,
+            ALTER,
+            "local",
+            "reservations",
+            &fast_config(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(query.poll_count(), 1);
+        assert_eq!(runner.statements(), vec![ALTER.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_statement_waits_for_pending_mutations_to_drain_first() {
         let query = ScriptedMutations::new(vec![
             vec![pending(
                 "0000002214",
@@ -756,77 +850,108 @@ mod tests {
             )],
             vec![],
         ]);
-        let executor = ConflictingExecutor::new(0);
+        let runner = ConflictingRunner::new(0);
 
-        apply_operation_with_mutation_barrier(
+        run_alter_with_mutation_barrier(
             &query,
-            &executor,
-            &modify_column_op("reservations", None),
+            &runner,
+            ALTER,
             "local",
+            "reservations",
             &fast_config(),
         )
         .await
         .unwrap();
 
         assert_eq!(query.poll_count(), 2);
-        assert_eq!(executor.attempts(), 1);
+        assert_eq!(runner.attempts(), 1);
     }
 
     #[tokio::test]
-    async fn applying_a_non_mutating_operation_skips_the_wait() {
-        let query = ScriptedMutations::new(vec![vec![]]);
-        let executor = ConflictingExecutor::new(0);
+    async fn alter_conflicts_retry_only_the_failing_statement() {
+        let runner = ConflictingRunner::new(2);
 
-        apply_operation_with_mutation_barrier(
-            &query,
-            &executor,
-            &SerializableOlapOperation::DropView {
-                name: "v_reservations".to_string(),
-                database: None,
-            },
-            "local",
-            &fast_config(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(query.poll_count(), 0);
-        assert_eq!(executor.attempts(), 1);
-    }
-
-    #[tokio::test]
-    async fn alter_conflicts_are_retried_until_they_succeed() {
-        let executor = ConflictingExecutor::new(2);
-
-        apply_operation_with_mutation_barrier(
+        run_alter_with_mutation_barrier(
             &NoMutations,
-            &executor,
-            &modify_column_op("reservations", None),
+            &runner,
+            ALTER,
             "local",
+            "reservations",
             &fast_config(),
         )
         .await
         .unwrap();
 
-        assert_eq!(executor.attempts(), 3);
+        assert_eq!(
+            runner.statements(),
+            vec![ALTER.to_string(), ALTER.to_string(), ALTER.to_string()],
+            "the retry re-runs only the statement that was rejected"
+        );
     }
 
     #[tokio::test]
     async fn alter_conflicts_stop_after_the_retry_budget() {
-        let executor = ConflictingExecutor::new(u32::MAX);
+        let runner = ConflictingRunner::new(u32::MAX);
 
-        let error = apply_operation_with_mutation_barrier(
+        let error = run_alter_with_mutation_barrier(
             &NoMutations,
-            &executor,
-            &modify_column_op("reservations", None),
+            &runner,
+            ALTER,
             "local",
+            "reservations",
             &fast_config(),
         )
         .await
         .unwrap_err();
 
         assert!(matches!(error, ApplyOperationError::Execute(_)));
-        assert_eq!(executor.attempts(), 4, "one initial attempt plus 3 retries");
+        assert!(
+            is_alter_conflict(&error),
+            "the last error is returned unchanged"
+        );
+        assert_eq!(runner.attempts(), 4, "one initial attempt plus 3 retries");
+    }
+
+    #[tokio::test]
+    async fn unrelated_failures_are_not_retried() {
+        let runner = AlwaysFailingRunner::new();
+
+        let error = run_alter_with_mutation_barrier(
+            &NoMutations,
+            &runner,
+            ALTER,
+            "local",
+            "reservations",
+            &fast_config(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ApplyOperationError::Execute(_)));
+        assert_eq!(runner.attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_wait_failure_is_reported_without_running_the_statement() {
+        let query = ScriptedMutations::always_pending(pending("0000002215", "(MODIFY COLUMN `x`)"));
+        let runner = ConflictingRunner::new(0);
+
+        let error = run_alter_with_mutation_barrier(
+            &query,
+            &runner,
+            ALTER,
+            "local",
+            "reservations",
+            &fast_config(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ApplyOperationError::Wait(MutationWaitError::Timeout { .. })
+        ));
+        assert_eq!(runner.attempts(), 0);
     }
 
     #[test]
@@ -850,23 +975,5 @@ mod tests {
                 .into();
 
         assert!(matches!(converted, ClickhouseChangesError::NotSupported(_)));
-    }
-
-    #[tokio::test]
-    async fn unrelated_failures_are_not_retried() {
-        let executor = AlwaysFailingExecutor::new();
-
-        let error = apply_operation_with_mutation_barrier(
-            &NoMutations,
-            &executor,
-            &modify_column_op("reservations", None),
-            "local",
-            &fast_config(),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(matches!(error, ApplyOperationError::Execute(_)));
-        assert_eq!(executor.attempts(), 1);
     }
 }

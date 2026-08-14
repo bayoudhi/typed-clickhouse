@@ -517,23 +517,14 @@ pub async fn execute_changes(
         teardown_plan.len()
     );
     debug!("Ordered Teardown plan: {:?}", teardown_plan);
-    // ClickHouse queues ALTER mutations asynchronously, so consecutive operations
-    // on the same table would otherwise pile up and be rejected with
-    // CANNOT_ASSIGN_ALTER. Each operation waits for its table to drain first.
-    let executor =
-        mutations::AtomicOperationExecutor::new(&client, db_name, !project.is_production);
-    let mutation_wait = mutations::MutationWaitConfig::default();
-
+    // ClickHouse queues ALTER mutations asynchronously, so consecutive ALTERs on
+    // the same table would otherwise pile up and be rejected with
+    // CANNOT_ASSIGN_ALTER. The barrier that prevents this lives around each
+    // individual ALTER statement, inside the `execute_*` helpers.
     for op in teardown_plan {
         debug!("Teardown operation: {:?}", op);
-        mutations::apply_operation_with_mutation_barrier(
-            &client,
-            &executor,
-            &op.to_minimal(),
-            db_name,
-            &mutation_wait,
-        )
-        .await?;
+        execute_atomic_operation(db_name, &op.to_minimal(), &client, !project.is_production)
+            .await?;
     }
 
     // Execute Setup Plan
@@ -544,14 +535,8 @@ pub async fn execute_changes(
     debug!("Ordered Setup plan: {:?}", setup_plan);
     for op in setup_plan {
         debug!("Setup operation: {:?}", op);
-        mutations::apply_operation_with_mutation_barrier(
-            &client,
-            &executor,
-            &op.to_minimal(),
-            db_name,
-            &mutation_wait,
-        )
-        .await?;
+        execute_atomic_operation(db_name, &op.to_minimal(), &client, !project.is_production)
+            .await?;
     }
 
     info!("OLAP Change execution complete");
@@ -807,12 +792,7 @@ pub async fn execute_atomic_operation(
                     target_db, table, cluster_clause
                 )
             };
-            run_query(&sql, client).await.map_err(|e| {
-                ClickhouseChangesError::ClickhouseClient {
-                    error: e,
-                    resource: Some(table.clone()),
-                }
-            })?;
+            run_alter_query(target_db, table, &sql, client).await?;
         }
         SerializableOlapOperation::AddTableIndex {
             table,
@@ -940,6 +920,38 @@ pub async fn execute_atomic_operation(
     Ok(())
 }
 
+/// Runs a single `ALTER TABLE` statement behind the mutation barrier.
+///
+/// ClickHouse queues ALTERs asynchronously and rejects the next one with
+/// `CANNOT_ASSIGN_ALTER` while earlier mutations are still running, so every
+/// ALTER waits for `db_name`.`table_name` to drain first and is retried on that
+/// conflict. Retrying is per-statement, so a statement that already succeeded is
+/// never re-executed.
+///
+/// # Arguments
+/// * `db_name` - Database of the table being altered
+/// * `table_name` - Table being altered
+/// * `statement` - The single `ALTER TABLE` statement to run
+/// * `client` - The connection to run the statement on
+async fn run_alter_query(
+    db_name: &str,
+    table_name: &str,
+    statement: &str,
+    client: &ConfiguredDBClient,
+) -> Result<(), ClickhouseChangesError> {
+    let runner = mutations::ClientStatementRunner::new(client, table_name);
+    mutations::run_alter_with_mutation_barrier(
+        client,
+        &runner,
+        statement,
+        db_name,
+        table_name,
+        &mutations::MutationWaitConfig::default(),
+    )
+    .await
+    .map_err(ClickhouseChangesError::from)
+}
+
 #[instrument(
     name = "create_table",
     skip_all,
@@ -995,12 +1007,7 @@ async fn execute_add_table_index(
         args,
         index.granularity
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(db_name, table_name, &sql, client).await
 }
 
 async fn execute_drop_table_index(
@@ -1017,12 +1024,7 @@ async fn execute_drop_table_index(
         "ALTER TABLE `{}`.`{}`{} DROP INDEX `{}`",
         db_name, table_name, cluster_clause, index_name
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(db_name, table_name, &sql, client).await
 }
 
 async fn execute_add_table_projection(
@@ -1045,12 +1047,7 @@ async fn execute_add_table_projection(
         "ALTER TABLE `{}`.`{}`{} ADD PROJECTION IF NOT EXISTS `{}` ({})",
         db_name, table_name, cluster_clause, projection.name, projection.body
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(db_name, table_name, &sql, client).await
 }
 
 async fn execute_drop_table_projection(
@@ -1073,12 +1070,7 @@ async fn execute_drop_table_projection(
         "ALTER TABLE `{}`.`{}`{} DROP PROJECTION IF EXISTS `{}`",
         db_name, table_name, cluster_clause, projection_name
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(db_name, table_name, &sql, client).await
 }
 
 async fn execute_modify_sample_by(
@@ -1095,12 +1087,7 @@ async fn execute_modify_sample_by(
         "ALTER TABLE `{}`.`{}`{} MODIFY SAMPLE BY {}",
         db_name, table_name, cluster_clause, expression
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(db_name, table_name, &sql, client).await
 }
 
 async fn execute_remove_sample_by(
@@ -1116,12 +1103,7 @@ async fn execute_remove_sample_by(
         "ALTER TABLE `{}`.`{}`{} REMOVE SAMPLE BY",
         db_name, table_name, cluster_clause
     );
-    run_query(&sql, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })
+    run_alter_query(db_name, table_name, &sql, client).await
 }
 
 #[instrument(
@@ -1207,12 +1189,7 @@ async fn execute_add_table_column(
         position_clause
     );
     tracing::debug!("Adding column: {}", add_column_query);
-    run_query(&add_column_query, client).await.map_err(|e| {
-        ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        }
-    })?;
+    run_alter_query(db_name, table_name, &add_column_query, client).await?;
     Ok(())
 }
 
@@ -1246,12 +1223,7 @@ async fn execute_drop_table_column(
         db_name, table_name, cluster_clause, column_name
     );
     tracing::debug!("Dropping column: {}", drop_column_query);
-    run_query(&drop_column_query, client).await.map_err(|e| {
-        ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        }
-    })?;
+    run_alter_query(db_name, table_name, &drop_column_query, client).await?;
     Ok(())
 }
 
@@ -1365,15 +1337,13 @@ data_type_changed: {data_type_changed}, default_changed: {default_changed}, mate
         cluster_name,
     )?;
 
-    // Execute all statements in order
+    // Execute all statements in order. Each one goes through the mutation
+    // barrier: ClickHouse queues these ALTERs asynchronously, so issuing the
+    // next one before the previous has drained is rejected with
+    // CANNOT_ASSIGN_ALTER.
     for query in queries {
         tracing::debug!("Modifying column: {}", query);
-        run_query(&query, client)
-            .await
-            .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-                error: e,
-                resource: Some(table_name.to_string()),
-            })?;
+        run_alter_query(db_name, table_name, &query, client).await?;
     }
 
     Ok(())
@@ -1401,12 +1371,7 @@ async fn execute_modify_column_comment(
         build_modify_column_comment_sql(db_name, table_name, &column.name, comment, cluster_name)?;
 
     tracing::debug!("Modifying column comment: {}", modify_comment_query);
-    run_query(&modify_comment_query, client)
-        .await
-        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        })?;
+    run_alter_query(db_name, table_name, &modify_comment_query, client).await?;
     Ok(())
 }
 
@@ -1574,12 +1539,7 @@ async fn execute_modify_table_settings(
         )?;
         tracing::debug!("Modifying table settings: {}", alter_settings_query);
 
-        run_query(&alter_settings_query, client)
-            .await
-            .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-                error: e,
-                resource: Some(table_name.to_string()),
-            })?;
+        run_alter_query(db_name, table_name, &alter_settings_query, client).await?;
     }
 
     // Execute RESET SETTING if there are settings to reset
@@ -1592,12 +1552,7 @@ async fn execute_modify_table_settings(
         )?;
         tracing::debug!("Resetting table settings: {}", reset_settings_query);
 
-        run_query(&reset_settings_query, client)
-            .await
-            .map_err(|e| ClickhouseChangesError::ClickhouseClient {
-                error: e,
-                resource: Some(table_name.to_string()),
-            })?;
+        run_alter_query(db_name, table_name, &reset_settings_query, client).await?;
     }
 
     Ok(())
@@ -1625,12 +1580,7 @@ async fn execute_rename_table_column(
         "ALTER TABLE `{db_name}`.`{table_name}`{cluster_clause} RENAME COLUMN `{before_column_name}` TO `{after_column_name}`"
     );
     tracing::debug!("Renaming column: {}", rename_column_query);
-    run_query(&rename_column_query, client).await.map_err(|e| {
-        ClickhouseChangesError::ClickhouseClient {
-            error: e,
-            resource: Some(table_name.to_string()),
-        }
-    })?;
+    run_alter_query(db_name, table_name, &rename_column_query, client).await?;
     Ok(())
 }
 
