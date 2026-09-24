@@ -17,7 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.VERSION }}
+      npm-tag: ${{ steps.version.outputs.NPM_TAG }}
     steps:
+      - uses: actions/checkout@v4
+
       - name: Derive version from tag
         id: version
         run: |
@@ -33,7 +36,11 @@ jobs:
             VERSION="0.0.0"
           fi
           echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Releasing ${VERSION}"
+          # `latest` for X.Y.Z, `next` for a pre-release such as 0.2.0-alpha.1,
+          # so a pre-release never becomes what a plain `npm install` resolves.
+          NPM_TAG=$(scripts/npm-dist-tag.sh "${VERSION}")
+          echo "NPM_TAG=${NPM_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${VERSION} under the '${NPM_TAG}' dist-tag"
 
   release-guard:
     name: Release guard (state-compatibility test)
@@ -314,7 +321,7 @@ jobs:
       contents: "read"
       id-token: "write"
     env:
-      TAG_LATEST: "true"
+      NPM_TAG: ${{ needs.version.outputs.npm-tag }}
       # Provenance signs each package with a verifiable link back to the commit
       # and workflow that built it. It requires a public source repository --
       # npm rejects the attestation from a private one with "422 Unprocessable
@@ -340,6 +347,7 @@ jobs:
       - name: Publish platform packages
         run: |
           set -eo pipefail
+          : "${NPM_TAG:?NPM_TAG is empty; refusing to publish without a dist-tag}"
           shopt -s nullglob
           # The ./ prefix is load-bearing. npm reads a bare "dir/file.tgz" as a
           # GitHub shorthand "owner/repo" and tries to clone it:
@@ -355,12 +363,8 @@ jobs:
             exit 1
           fi
           for tarball in "${tarballs[@]}"; do
-            echo "Publishing ${tarball}"
-            if [ "${TAG_LATEST}" = "true" ]; then
-              npm publish "${tarball}" --access public
-            else
-              npm publish "${tarball}" --access public --tag dev
-            fi
+            echo "Publishing ${tarball} under '${NPM_TAG}'"
+            npm publish "${tarball}" --access public --tag "${NPM_TAG}"
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -402,7 +406,7 @@ jobs:
       - name: Publish wrapper
         run: ./apps/cli-npm/scripts/release-cli.sh "${{ needs.version.outputs.version }}"
         env:
-          TAG_LATEST: "true"
+          NPM_TAG: ${{ needs.version.outputs.npm-tag }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   publish-library:
@@ -484,13 +488,15 @@ jobs:
       - name: Publish
         run: |
           set -eo pipefail
+          : "${NPM_TAG:?NPM_TAG is empty; refusing to publish without a dist-tag}"
           name=$(node -p "require('./package.json').name")
           version="${{ needs.version.outputs.version }}"
           if npm view "${name}@${version}" version >/dev/null 2>&1; then
             echo "${name}@${version} is already published; skipping."
             exit 0
           fi
-          pnpm publish --access public --no-git-checks
+          pnpm publish --access public --no-git-checks --tag "${NPM_TAG}"
         working-directory: ./packages/core
         env:
+          NPM_TAG: ${{ needs.version.outputs.npm-tag }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

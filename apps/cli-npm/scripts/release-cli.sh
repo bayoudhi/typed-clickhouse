@@ -37,12 +37,8 @@ pnpm install --filter "@typed-clickhouse/cli" --no-frozen-lockfile # requires op
 pnpm build --filter @typed-clickhouse/cli
 
 cd apps/cli-npm
-# For CI builds (TAG_LATEST=false), publish with version-specific tag
-# For release builds (TAG_LATEST=true), publish and update the 'latest' tag
-if [ "${TAG_LATEST}" = "true" ]; then
-    # Release build - publish and update 'latest' tag
-    pnpm publish --access public --no-git-checks
-else
-    # CI build - publish with dev tag (doesn't update 'latest')
-    pnpm publish --access public --no-git-checks --tag dev
-fi
+# NPM_TAG is derived once in the release workflow's `version` job:
+# `latest` for X.Y.Z, `next` for a pre-release. It must match the tag the
+# platform packages and @typed-clickhouse/core were published under.
+: "${NPM_TAG:?NPM_TAG must be set to the dist-tag to publish under}"
+pnpm publish --access public --no-git-checks --tag "${NPM_TAG}"
