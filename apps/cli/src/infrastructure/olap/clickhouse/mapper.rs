@@ -9,6 +9,10 @@ use crate::infrastructure::olap::clickhouse::model::{
     ClickHouseInt, ClickHouseProjection, ClickHouseTable, DefaultExpressionKind,
 };
 
+use super::constants::{
+    AGGREGATION_FUNCTION_ANNOTATION, LOW_CARDINALITY_ANNOTATION,
+    SIMPLE_AGGREGATION_FUNCTION_ANNOTATION,
+};
 use super::errors::ClickhouseError;
 
 /// Generates a column comment, preserving any existing user comment and adding/updating metadata for enums
@@ -156,7 +160,7 @@ fn std_field_type_to_clickhouse_type_mapper(
 ) -> Result<ClickHouseColumnType, ClickhouseError> {
     if let Some((_, simple_agg_func)) = annotations
         .iter()
-        .find(|(k, _)| k == "simpleAggregationFunction")
+        .find(|(k, _)| k == SIMPLE_AGGREGATION_FUNCTION_ANNOTATION)
     {
         #[derive(serde::Deserialize)]
         #[serde(rename_all = "camelCase")]
@@ -177,7 +181,10 @@ fn std_field_type_to_clickhouse_type_mapper(
         });
     }
 
-    if let Some((_, agg_func)) = annotations.iter().find(|(k, _)| k == "aggregationFunction") {
+    if let Some((_, agg_func)) = annotations
+        .iter()
+        .find(|(k, _)| k == AGGREGATION_FUNCTION_ANNOTATION)
+    {
         let clickhouse_type = std_field_type_to_clickhouse_type_mapper(field_type, &[])?;
 
         let agg_func =
@@ -198,7 +205,7 @@ fn std_field_type_to_clickhouse_type_mapper(
 
     if annotations
         .iter()
-        .any(|(k, v)| k == "LowCardinality" && v == &serde_json::json!(true))
+        .any(|(k, v)| k == LOW_CARDINALITY_ANNOTATION && v == &serde_json::json!(true))
     {
         let clickhouse_type = std_field_type_to_clickhouse_type_mapper(field_type, &[])?;
         return Ok(ClickHouseColumnType::LowCardinality(Box::new(

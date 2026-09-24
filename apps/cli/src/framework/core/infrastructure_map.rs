@@ -2410,7 +2410,10 @@ fn columns_are_equivalent(
     ignore_ops: &[crate::infrastructure::olap::clickhouse::IgnorableOperation],
 ) -> bool {
     use crate::infrastructure::olap::clickhouse::{
-        diff_strategy::{column_types_are_equivalent, normalize_column_for_low_cardinality_ignore},
+        diff_strategy::{
+            column_types_are_equivalent, ddl_relevant_annotations,
+            normalize_column_for_low_cardinality_ignore,
+        },
         IgnorableOperation,
     };
 
@@ -2438,7 +2441,8 @@ fn columns_are_equivalent(
         || normalized_before.default != normalized_after.default
         || normalized_before.materialized != normalized_after.materialized
         || normalized_before.alias != normalized_after.alias
-        || normalized_before.annotations != normalized_after.annotations
+        || ddl_relevant_annotations(&normalized_before.annotations)
+            != ddl_relevant_annotations(&normalized_after.annotations)
         || normalized_before.comment != normalized_after.comment
     {
         return false;
@@ -3973,23 +3977,30 @@ mod diff_tests {
             alias: None,
         });
 
+        // None of these annotations reach the DDL, so swapping them changes
+        // nothing ClickHouse could store.
+        let diff = compute_table_columns_diff(&before, &after, &[]);
+        assert!(
+            diff.is_empty(),
+            "Annotations that do not affect DDL must not produce a change: {diff:?}"
+        );
+
+        // Adding one that does is a real change.
+        after
+            .columns
+            .last_mut()
+            .unwrap()
+            .annotations
+            .push(("LowCardinality".to_string(), JsonValue::Bool(true)));
         let diff = compute_table_columns_diff(&before, &after, &[]);
         assert_eq!(
             diff.len(),
             1,
-            "Expected one change for annotation modification"
+            "Expected one change for a DDL-relevant annotation"
         );
         match &diff[0] {
-            ColumnChange::Updated {
-                before: b,
-                after: a,
-            } => {
-                assert_eq!(b.annotations.len(), 2);
-                assert_eq!(a.annotations.len(), 2);
-                assert_eq!(b.annotations[0].0, "index");
-                assert_eq!(b.annotations[1].0, "deprecated");
-                assert_eq!(a.annotations[0].0, "index");
-                assert_eq!(a.annotations[1].0, "new_annotation");
+            ColumnChange::Updated { after: a, .. } => {
+                assert!(a.annotations.iter().any(|(k, _)| k == "LowCardinality"));
             }
             _ => panic!("Expected Updated change"),
         }
@@ -5001,6 +5012,77 @@ mod diff_tests {
             .filter(|c| matches!(c, OlapChange::Table(TableChange::TtlChanged { .. })))
             .count();
         assert_eq!(ttl_not_ignored, 1, "TTL should be detected");
+    }
+
+    fn date_column(required: bool, annotations: Vec<(String, JsonValue)>) -> Column {
+        Column {
+            name: "recordedAt".to_string(),
+            data_type: ColumnType::DateTime { precision: Some(3) },
+            required,
+            unique: false,
+            primary_key: false,
+            default: None,
+            annotations,
+            comment: None,
+            ttl: None,
+            codec: None,
+            materialized: None,
+            alias: None,
+        }
+    }
+
+    fn string_date() -> Vec<(String, JsonValue)> {
+        vec![("stringDate".to_string(), serde_json::json!(true))]
+    }
+
+    #[test]
+    fn string_date_annotation_alone_is_not_a_change() {
+        assert!(columns_are_equivalent(
+            &date_column(true, vec![]),
+            &date_column(true, string_date()),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn nullable_string_date_column_is_equivalent() {
+        assert!(columns_are_equivalent(
+            &date_column(false, vec![]),
+            &date_column(false, string_date()),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn low_cardinality_annotation_is_still_a_change() {
+        let plain = Column {
+            data_type: ColumnType::String,
+            ..date_column(true, vec![])
+        };
+        let low_cardinality = Column {
+            annotations: vec![("LowCardinality".to_string(), serde_json::json!(true))],
+            ..plain.clone()
+        };
+        assert!(!columns_are_equivalent(&plain, &low_cardinality, &[]));
+    }
+
+    #[test]
+    fn nested_string_date_field_is_equivalent() {
+        use crate::framework::core::infrastructure::table::Nested;
+
+        let nested = |annotations| Column {
+            data_type: ColumnType::Nested(Nested {
+                name: "events".to_string(),
+                columns: vec![date_column(true, annotations)],
+                jwt: false,
+            }),
+            ..date_column(true, vec![])
+        };
+        assert!(columns_are_equivalent(
+            &nested(vec![]),
+            &nested(string_date()),
+            &[]
+        ));
     }
 }
 

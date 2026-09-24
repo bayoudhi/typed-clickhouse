@@ -22,7 +22,7 @@
 
 use serde_json::json;
 
-use super::diff_strategy::ClickHouseTableDiffStrategy;
+use super::diff_strategy::{ddl_relevant_annotations, ClickHouseTableDiffStrategy};
 use super::queries::ClickhouseEngine;
 use super::{create_client, run_query, ClickHouseConfig};
 use crate::framework::core::infrastructure::table::{
@@ -306,11 +306,13 @@ fn describe(change: &OlapChange) -> String {
             .map(|c| match c {
                 ColumnChange::Updated { before, after } => {
                     let mut fields = Vec::new();
-                    if before.annotations != after.annotations {
-                        fields.push(format!(
-                            "annotations reality={:?} code={:?}",
-                            before.annotations, after.annotations
-                        ));
+                    // Only annotations that reach the DDL can drive a change.
+                    let (reality, code) = (
+                        ddl_relevant_annotations(&before.annotations),
+                        ddl_relevant_annotations(&after.annotations),
+                    );
+                    if reality != code {
+                        fields.push(format!("annotations reality={reality:?} code={code:?}"));
                     }
                     if before.codec != after.codec {
                         fields.push(format!(

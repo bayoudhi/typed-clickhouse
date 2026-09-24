@@ -216,7 +216,8 @@ pub fn nested_are_equivalent(
             || normalized_actual.required != normalized_target.required
             || normalized_actual.unique != normalized_target.unique
             || normalized_actual.default != normalized_target.default
-            || normalized_actual.annotations != normalized_target.annotations
+            || ddl_relevant_annotations(&normalized_actual.annotations)
+                != ddl_relevant_annotations(&normalized_target.annotations)
             || normalized_actual.comment != normalized_target.comment
             || normalized_actual.ttl != normalized_target.ttl
         {
@@ -313,6 +314,22 @@ pub fn column_types_are_equivalent(
         // For all other types, use standard equality
         _ => a == b,
     }
+}
+
+/// The annotations that influence generated DDL, in their original order.
+///
+/// Code-side metadata such as `stringDate` has no representation in
+/// ClickHouse, so it is always absent from a column read back from the
+/// database. Comparing it would report a change no DDL can make.
+pub fn ddl_relevant_annotations(
+    annotations: &[(String, serde_json::Value)],
+) -> Vec<&(String, serde_json::Value)> {
+    use super::constants::DDL_RELEVANT_ANNOTATIONS;
+
+    annotations
+        .iter()
+        .filter(|(key, _)| DDL_RELEVANT_ANNOTATIONS.contains(&key.as_str()))
+        .collect()
 }
 
 /// Normalizes a column for LowCardinality ignore comparisons.
@@ -3107,5 +3124,25 @@ mod tests {
             &nested_without_low_card,
             true
         ));
+    }
+
+    #[test]
+    fn ddl_relevant_annotations_ignore_code_side_metadata() {
+        use serde_json::json;
+
+        let code = vec![
+            ("LowCardinality".to_string(), json!(true)),
+            ("stringDate".to_string(), json!(true)),
+        ];
+        let reality = vec![("LowCardinality".to_string(), json!(true))];
+
+        assert_eq!(
+            ddl_relevant_annotations(&code),
+            ddl_relevant_annotations(&reality)
+        );
+        assert_ne!(
+            ddl_relevant_annotations(&code),
+            ddl_relevant_annotations(&[])
+        );
     }
 }
