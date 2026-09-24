@@ -49,6 +49,48 @@ jobs:
           $BIN generate migration --help
           $BIN migrate --help
 
+  reality-roundtrip:
+    name: Reality round-trip (live ClickHouse)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - uses: actions/checkout@v4
+
+      # No `toolchain:` input, for the same reason as the `rust` job.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+          cache-shared-key: ${{ runner.os }}-${{ runner.arch }}-rust
+          cache-on-failure: true
+          cache-all-crates: true
+
+      # The image tag lives only in docker-compose.test.yml, so local and CI
+      # runs use the same server.
+      - name: Start ClickHouse
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      # Plans against a schema this test just created, so any reported change
+      # is a phantom. Selects only this harness by its full path; mutations_live
+      # stays manual. A filter that matches nothing still exits 0, so the step
+      # also requires that exactly one test ran.
+      - name: Plan against a freshly created schema
+        shell: bash
+        env:
+          TC_LIVE_CLICKHOUSE: "1"
+        run: |
+          cargo test --locked -- --exact \
+            infrastructure::olap::clickhouse::reality_roundtrip_live::live_reality_roundtrip_plans_nothing \
+            --test-threads=1 | tee roundtrip.log
+          grep -q "test result: ok. 1 passed" roundtrip.log || {
+            echo "::error::expected exactly one round-trip test to run; was it renamed?"
+            exit 1
+          }
+
   typescript:
     name: TypeScript (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest

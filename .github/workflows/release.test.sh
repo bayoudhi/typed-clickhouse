@@ -132,4 +132,27 @@ echo "$publish_lib" | grep -q 'needs.version.outputs.version' \
 echo "$publish_lib" | grep -q "grep -rq '@514labs/moose-lib' dist/" \
   || fail "publish-library must verify no @514labs reference survives into dist"
 
+# Pre-releases. A version with a SemVer pre-release suffix (0.2.0-alpha.1) must
+# publish under the `next` dist-tag, never `latest`, or every plain
+# `npm install` would pick up untested code. The choice lives in one script so
+# it can be exercised here rather than only grepped for.
+tag_script=../../scripts/npm-dist-tag.sh
+[ -x "$tag_script" ] || fail "scripts/npm-dist-tag.sh is missing or not executable"
+for case in "0.1.3:latest" "1.0.0:latest" "0.2.0-alpha.1:next" "0.2.0-rc.2:next"; do
+  version="${case%%:*}"
+  expected="${case#*:}"
+  actual=$("$tag_script" "$version")
+  [ "$actual" = "$expected" ] || fail "npm-dist-tag.sh $version gave '$actual', expected '$expected'"
+done
+"$tag_script" "not-a-version" >/dev/null 2>&1 && fail "npm-dist-tag.sh must reject a malformed version"
+
+# Every publish must pass the tag the version job derived. A publish without
+# --tag defaults to `latest`, which is exactly what a pre-release must avoid.
+grep -q 'npm-tag: ${{ steps.version.outputs.NPM_TAG }}' "$W" \
+  || fail "the version job must export the npm dist-tag"
+unpinned=$(grep -nE '(npm|pnpm) publish' "$W" | grep -v -- '--tag' || true)
+[ -z "$unpinned" ] || fail "every publish in release.yaml must pass --tag: $unpinned"
+grep -q -- '--tag "${NPM_TAG}"' ../../apps/cli-npm/scripts/release-cli.sh \
+  || fail "release-cli.sh must publish the wrapper under NPM_TAG"
+
 echo "PASS: release workflow is correctly scoped"

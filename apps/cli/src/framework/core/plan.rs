@@ -26,7 +26,7 @@ use crate::project::Project;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Filter sets used by `reconcile_with_reality` to decide which unmapped database
 /// objects to adopt into the infrastructure map.
@@ -112,8 +112,9 @@ pub async fn normalize_infra_map_for_comparison<T: OlapOperations + Sync>(
                 mv.select_sql = normalized;
             }
             Err(e) => {
-                debug!(
-                    "Failed to normalize MV '{}' SQL, using original: {:?}",
+                warn!(
+                    "Failed to normalize MV '{}' SQL, comparing it as written; \
+                     this can report a change on every plan: {:?}",
                     name, e
                 );
             }
@@ -131,8 +132,9 @@ pub async fn normalize_infra_map_for_comparison<T: OlapOperations + Sync>(
                 view.select_sql = normalized;
             }
             Err(e) => {
-                debug!(
-                    "Failed to normalize View '{}' SQL, using original: {:?}",
+                warn!(
+                    "Failed to normalize View '{}' SQL, comparing it as written; \
+                     this can report a change on every plan: {:?}",
                     name, e
                 );
             }

@@ -57,8 +57,14 @@ Multi-language monorepo (Rust CLI + TypeScript library) using PNPM workspaces, T
 - **Library tests** (`packages/lib/tests/`): unit tests colocated with the library
 - **Golden gate** (`packages/core/tests/`): asserts the compiler
   plugin's emitted schema does not drift from the captured baseline
-- There are no E2E tests or templates in this repository. The downstream
-  consumer pins published versions.
+- **Live-server tests** (`apps/cli/src/infrastructure/olap/clickhouse/*_live.rs`):
+  run against a real ClickHouse and are skipped unless `TC_LIVE_CLICKHOUSE=1`.
+  Start one with `docker compose -f docker-compose.test.yml up -d --wait`, then
+  `TC_LIVE_CLICKHOUSE=1 cargo test live_ -- --test-threads=1`. CI runs
+  `live_reality` (the planner round-trip) on every PR; `mutations_live` is
+  manual.
+- There are no templates in this repository. The downstream consumer pins
+  published versions.
 
 ## Key Technologies
 

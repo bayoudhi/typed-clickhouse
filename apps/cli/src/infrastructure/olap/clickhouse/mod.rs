@@ -74,6 +74,7 @@ use crate::project::Project;
 pub mod client;
 pub mod config;
 pub mod config_resolver;
+pub mod constants;
 pub mod diagnostics;
 pub mod diff_strategy;
 pub mod errors;
@@ -84,6 +85,8 @@ pub mod mutations;
 #[cfg(test)]
 mod mutations_live;
 pub mod queries;
+#[cfg(test)]
+mod reality_roundtrip_live;
 pub mod remote;
 pub mod sql_parser;
 pub mod type_parser;
@@ -2240,6 +2243,12 @@ pub async fn run_query(
         .await
 }
 
+/// Row type for normalized SQL query result
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct NormalizedSqlRow {
+    normalized: String,
+}
+
 /// Normalizes SQL using ClickHouse's native formatQuerySingleLine function.
 ///
 /// This function sends the SQL to ClickHouse for normalization, which handles:
@@ -2251,6 +2260,11 @@ pub async fn run_query(
 /// The formatted SQL is then passed through the AST normalizer to strip the
 /// default database prefix in an identifier-aware way. This avoids unsafe
 /// string replacement inside literals or comments.
+///
+/// Finally, function-call names are rewritten the way ClickHouse stores them
+/// (see [`canonicalize_call_names`]). `formatQuerySingleLine` keeps `COUNT(`
+/// as written while a stored view holds `count(`, so without this step the
+/// two never compare equal whenever the AST normalizer cannot parse the SQL.
 ///
 /// # Arguments
 /// * `configured_client` - The configured ClickHouse client
@@ -2266,12 +2280,6 @@ pub async fn run_query(
 /// let normalized = normalize_sql_via_clickhouse(&client, "SELECT a * 100.0 FROM t", "local").await?;
 /// // Returns: "SELECT (a * 100.) FROM t"
 /// ```
-/// Row type for normalized SQL query result
-#[derive(clickhouse::Row, serde::Deserialize)]
-struct NormalizedSqlRow {
-    normalized: String,
-}
-
 pub async fn normalize_sql_via_clickhouse(
     configured_client: &ConfiguredDBClient,
     sql: &str,
@@ -2293,10 +2301,15 @@ pub async fn normalize_sql_via_clickhouse(
         })?;
 
     match cursor.next().await {
-        Ok(Some(row)) => Ok(normalize_sql_for_comparison(
-            row.normalized.trim(),
-            default_database,
-        )),
+        Ok(Some(row)) => {
+            let normalized = normalize_sql_for_comparison(row.normalized.trim(), default_database);
+            Ok(
+                match case_insensitive_function_names(configured_client).await {
+                    Some(names) => canonicalize_call_names(&normalized, names),
+                    None => normalized,
+                },
+            )
+        }
         Ok(None) => Err(OlapChangesError::DatabaseError(
             "No result from formatQuerySingleLine".to_string(),
         )),
@@ -2308,6 +2321,131 @@ pub async fn normalize_sql_via_clickhouse(
             )))
         }
     }
+}
+
+/// Canonical spellings of ClickHouse's case-insensitive functions, keyed by
+/// their lower-cased name. Read once from the server, so the list always
+/// matches the version being compared against.
+static CASE_INSENSITIVE_FUNCTIONS: std::sync::OnceLock<HashMap<String, String>> =
+    std::sync::OnceLock::new();
+
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct FunctionNameRow {
+    name: String,
+}
+
+/// Returns the server's case-insensitive function names, fetching them on
+/// first use. `None` if they cannot be read, in which case call names are
+/// compared as written, as before.
+async fn case_insensitive_function_names(
+    configured_client: &ConfiguredDBClient,
+) -> Option<&'static HashMap<String, String>> {
+    if let Some(names) = CASE_INSENSITIVE_FUNCTIONS.get() {
+        return Some(names);
+    }
+    match configured_client
+        .client
+        .query("SELECT name FROM system.functions WHERE case_insensitive = 1")
+        .fetch_all::<FunctionNameRow>()
+        .await
+    {
+        Ok(rows) => {
+            let names = rows
+                .into_iter()
+                .map(|row| (row.name.to_ascii_lowercase(), row.name))
+                .collect();
+            Some(CASE_INSENSITIVE_FUNCTIONS.get_or_init(|| names))
+        }
+        Err(e) => {
+            warn!(
+                "Could not read case-insensitive function names; comparing SQL \
+                 function names as written: {}",
+                e
+            );
+            None
+        }
+    }
+}
+
+fn is_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Rewrites function-call names in formatted SQL the way ClickHouse stores
+/// them in a view definition.
+///
+/// - A call to a case-insensitive function takes its canonical spelling from
+///   `case_insensitive` (lower-cased name to canonical name): `COUNT(x)`
+///   becomes `count(x)`, while `cast(x, 'T')` becomes `CAST(x, 'T')`.
+/// - A backtick-quoted call name that does not need quoting is unquoted:
+///   `` `v_window`(from = 'x') `` becomes `v_window(from = 'x')`, as a
+///   parameterized view used as a table function is stored.
+///
+/// String literals are copied untouched, and so are names that are not
+/// immediately followed by `(` or that are qualified (`db.name(`), since
+/// those are columns or tables rather than functions.
+pub fn canonicalize_call_names(sql: &str, case_insensitive: &HashMap<String, String>) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                // Copy the literal verbatim, honouring '' and \' escapes.
+                let start = i;
+                i += 1;
+                while i < chars.len() {
+                    match chars[i] {
+                        '\\' => i += 2,
+                        '\'' if chars.get(i + 1) == Some(&'\'') => i += 2,
+                        '\'' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                let end = i.min(chars.len());
+                out.extend(&chars[start..end]);
+                i = end;
+            }
+            '`' => {
+                let start = i;
+                let mut close = i + 1;
+                while close < chars.len() && chars[close] != '`' {
+                    close += 1;
+                }
+                let end = (close + 1).min(chars.len());
+                let inner: String = chars[start + 1..close.min(chars.len())].iter().collect();
+                if chars.get(end) == Some(&'(') && is_plain_identifier(&inner) {
+                    out.push_str(&inner);
+                } else {
+                    out.extend(&chars[start..end]);
+                }
+                i = end;
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                let is_call = chars.get(i) == Some(&'(');
+                let qualified = start > 0 && chars[start - 1] == '.';
+                match case_insensitive.get(&word.to_ascii_lowercase()) {
+                    Some(canonical) if is_call && !qualified => out.push_str(canonical),
+                    _ => out.push_str(&word),
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Checks if the ClickHouse database is ready for operations
@@ -3495,6 +3633,78 @@ pub fn extract_table_ttl_from_create_query(create_query: &str) -> Option<String>
     }
 }
 
+/// Byte width ClickHouse substitutes for a bare `Delta` or `Gorilla`: the size
+/// of the stored value, or of the element for arrays. `None` when that is not
+/// known to be a fixed 1, 2, 4 or 8 bytes.
+fn codec_default_width(data_type: &ColumnType) -> Option<u8> {
+    use crate::framework::core::infrastructure::table::{FloatType, IntType};
+
+    match data_type {
+        ColumnType::Nullable(inner) => codec_default_width(inner),
+        ColumnType::Array { element_type, .. } => codec_default_width(element_type),
+        ColumnType::Boolean | ColumnType::Int(IntType::Int8 | IntType::UInt8) => Some(1),
+        ColumnType::Date16 | ColumnType::Int(IntType::Int16 | IntType::UInt16) => Some(2),
+        ColumnType::Date
+        | ColumnType::DateTime { precision: None }
+        | ColumnType::Float(FloatType::Float32)
+        | ColumnType::IpV4
+        | ColumnType::Int(IntType::Int32 | IntType::UInt32) => Some(4),
+        // A DateTime with a precision is stored as DateTime64.
+        ColumnType::DateTime { precision: Some(_) }
+        | ColumnType::Float(FloatType::Float64)
+        | ColumnType::Int(IntType::Int64 | IntType::UInt64) => Some(8),
+        // Decimal32 up to precision 9, Decimal64 up to 18.
+        ColumnType::Decimal { precision, .. } if *precision <= 9 => Some(4),
+        ColumnType::Decimal { precision, .. } if *precision <= 18 => Some(8),
+        _ => None,
+    }
+}
+
+/// Expands bare codec names to the parameters ClickHouse stores for them.
+///
+/// `Delta` and `Gorilla` default to the byte width of the column's type, so
+/// the same codec reads back as `Delta(4)` on a `UInt32` and `Delta(8)` on a
+/// `UInt64`. When the width is unknown they fall back to the fixed defaults
+/// used before widths were type-aware (`Delta(4)`, `Gorilla(8)`), so such a
+/// column compares exactly as it did before.
+pub fn normalize_codec_expression(expr: &str, data_type: &ColumnType) -> String {
+    let width = codec_default_width(data_type);
+    expr.split(',')
+        .map(|codec| {
+            let trimmed = codec.trim();
+            match (trimmed, width) {
+                ("Delta" | "Gorilla", Some(width)) => format!("{trimmed}({width})"),
+                ("Delta", None) => "Delta(4)".to_string(),
+                ("Gorilla", None) => "Gorilla(8)".to_string(),
+                ("ZSTD", _) => "ZSTD(1)".to_string(),
+                // DoubleDelta, LZ4, NONE and codecs with explicit params stay
+                // as written.
+                _ => trimmed.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Checks if two codec expressions on a column of `data_type` are
+/// semantically equivalent after normalization.
+///
+/// For example, `Delta, LZ4` from user code is equivalent to `Delta(8), LZ4`
+/// from ClickHouse on a `UInt64` column.
+pub fn codec_expressions_are_equivalent(
+    before: &Option<String>,
+    after: &Option<String>,
+    data_type: &ColumnType,
+) -> bool {
+    match (before, after) {
+        (None, None) => true,
+        (Some(b), Some(a)) => {
+            normalize_codec_expression(b, data_type) == normalize_codec_expression(a, data_type)
+        }
+        _ => false,
+    }
+}
+
 /// Normalize a TTL expression to match ClickHouse's canonical form.
 /// Converts SQL INTERVAL syntax to toInterval* function calls that ClickHouse uses internally.
 /// Also removes trailing DELETE since it's the default action and ClickHouse may delete it implicitly.
@@ -3504,34 +3714,6 @@ pub fn extract_table_ttl_from_create_query(create_query: &str) -> Option<String>
 /// - "timestamp + INTERVAL 1 MONTH" → "timestamp + toIntervalMonth(1)"
 /// - "timestamp + INTERVAL 90 DAY DELETE" → "timestamp + toIntervalDay(90)"
 /// - "timestamp + toIntervalDay(90) DELETE" → "timestamp + toIntervalDay(90)"
-pub fn normalize_codec_expression(expr: &str) -> String {
-    expr.split(',')
-        .map(|codec| {
-            let trimmed = codec.trim();
-            match trimmed {
-                "Delta" => "Delta(4)",
-                "Gorilla" => "Gorilla(8)",
-                "ZSTD" => "ZSTD(1)",
-                // DoubleDelta, LZ4, NONE, and any codec with params stay as-is
-                _ => trimmed,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Checks if two codec expressions are semantically equivalent after normalization.
-///
-/// This handles cases where ClickHouse normalizes codecs by adding default parameters.
-/// For example, "Delta, LZ4" from user code is equivalent to "Delta(4), LZ4" from ClickHouse.
-pub fn codec_expressions_are_equivalent(before: &Option<String>, after: &Option<String>) -> bool {
-    match (before, after) {
-        (None, None) => true,
-        (Some(b), Some(a)) => normalize_codec_expression(b) == normalize_codec_expression(a),
-        _ => false,
-    }
-}
-
 pub fn normalize_ttl_expression(expr: &str) -> String {
     use regex::Regex;
 
@@ -3687,6 +3869,7 @@ pub fn extract_column_ttls_from_create_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framework::core::infrastructure::table::{FloatType, IntType};
     use crate::infrastructure::olap::clickhouse::model::{ClickHouseColumnType, ClickHouseInt};
     use crate::infrastructure::olap::clickhouse::sql_parser::tests::NESTED_OBJECTS_SQL;
 
@@ -4258,105 +4441,343 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
         assert_eq!(normalize("(` id `)"), "id");
     }
 
+    fn uint32() -> ColumnType {
+        ColumnType::Int(IntType::UInt32)
+    }
+
+    fn float64() -> ColumnType {
+        ColumnType::Float(FloatType::Float64)
+    }
+
+    fn call_names() -> HashMap<String, String> {
+        // As read from system.functions: lower-case key, canonical spelling.
+        [
+            ("count", "count"),
+            ("sum", "sum"),
+            ("cast", "CAST"),
+            ("datediff", "dateDiff"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn call_names_take_their_canonical_spelling() {
+        assert_eq!(
+            canonicalize_call_names(
+                "SELECT COUNT(x), Sum(y), cast(z, 'Float64'), DATEDIFF('day', a, b)",
+                &call_names()
+            ),
+            "SELECT count(x), sum(y), CAST(z, 'Float64'), dateDiff('day', a, b)"
+        );
+    }
+
+    #[test]
+    fn call_name_canonicalization_leaves_literals_and_columns_alone() {
+        let names = call_names();
+        // A string literal is data: its case is a real difference.
+        assert_eq!(
+            canonicalize_call_names("SELECT 'COUNT(' AS s, COUNT(x) = 'SUM(y)'", &names),
+            "SELECT 'COUNT(' AS s, count(x) = 'SUM(y)'"
+        );
+        assert_eq!(
+            canonicalize_call_names(r"SELECT 'it''s COUNT(', 'a\'SUM(', COUNT(1)", &names),
+            r"SELECT 'it''s COUNT(', 'a\'SUM(', count(1)"
+        );
+        // Not a call: a column that happens to share a function's name.
+        assert_eq!(
+            canonicalize_call_names("SELECT SUM FROM t", &names),
+            "SELECT SUM FROM t"
+        );
+        // A qualified name is a table or column, not a function.
+        assert_eq!(
+            canonicalize_call_names("SELECT db.COUNT(x)", &names),
+            "SELECT db.COUNT(x)"
+        );
+        // Unknown functions keep the author's spelling.
+        assert_eq!(
+            canonicalize_call_names("SELECT toDate(x), MyUdf(y)", &names),
+            "SELECT toDate(x), MyUdf(y)"
+        );
+    }
+
+    #[test]
+    fn quoted_call_names_are_unquoted_when_plain() {
+        let names = call_names();
+        assert_eq!(
+            canonicalize_call_names("JOIN `v_window`(from = 'x') AS w", &names),
+            "JOIN v_window(from = 'x') AS w"
+        );
+        // A name that needs its quotes keeps them.
+        assert_eq!(
+            canonicalize_call_names("JOIN `my view`(a = 1)", &names),
+            "JOIN `my view`(a = 1)"
+        );
+        // A quoted identifier that is not a call is left as is.
+        assert_eq!(
+            canonicalize_call_names("SELECT `COUNT` FROM t", &names),
+            "SELECT `COUNT` FROM t"
+        );
+    }
+
     #[test]
     fn test_normalize_codec_expression() {
-        // Test single codec without params - should add defaults
-        assert_eq!(normalize_codec_expression("Delta"), "Delta(4)");
-        assert_eq!(normalize_codec_expression("Gorilla"), "Gorilla(8)");
-        assert_eq!(normalize_codec_expression("ZSTD"), "ZSTD(1)");
-
-        // Test codecs with params - should stay as-is
-        assert_eq!(normalize_codec_expression("Delta(4)"), "Delta(4)");
-        assert_eq!(normalize_codec_expression("Gorilla(8)"), "Gorilla(8)");
-        assert_eq!(normalize_codec_expression("ZSTD(3)"), "ZSTD(3)");
-        assert_eq!(normalize_codec_expression("ZSTD(9)"), "ZSTD(9)");
-
-        // Test codecs that don't have default params
-        assert_eq!(normalize_codec_expression("DoubleDelta"), "DoubleDelta");
-        assert_eq!(normalize_codec_expression("LZ4"), "LZ4");
-        assert_eq!(normalize_codec_expression("NONE"), "NONE");
-
-        // Test codec chains
-        assert_eq!(normalize_codec_expression("Delta, LZ4"), "Delta(4), LZ4");
+        // Bare codecs gain ClickHouse's defaults
+        assert_eq!(normalize_codec_expression("Delta", &uint32()), "Delta(4)");
         assert_eq!(
-            normalize_codec_expression("Gorilla, ZSTD"),
+            normalize_codec_expression("Gorilla", &float64()),
+            "Gorilla(8)"
+        );
+        assert_eq!(normalize_codec_expression("ZSTD", &uint32()), "ZSTD(1)");
+
+        // Codecs with params stay as-is
+        assert_eq!(
+            normalize_codec_expression("Delta(4)", &uint32()),
+            "Delta(4)"
+        );
+        assert_eq!(
+            normalize_codec_expression("Gorilla(8)", &float64()),
+            "Gorilla(8)"
+        );
+        assert_eq!(normalize_codec_expression("ZSTD(3)", &uint32()), "ZSTD(3)");
+        assert_eq!(normalize_codec_expression("ZSTD(9)", &uint32()), "ZSTD(9)");
+
+        // Codecs without default params
+        assert_eq!(
+            normalize_codec_expression("DoubleDelta", &uint32()),
+            "DoubleDelta"
+        );
+        assert_eq!(normalize_codec_expression("LZ4", &uint32()), "LZ4");
+        assert_eq!(normalize_codec_expression("NONE", &uint32()), "NONE");
+
+        // Chains
+        assert_eq!(
+            normalize_codec_expression("Delta, LZ4", &uint32()),
+            "Delta(4), LZ4"
+        );
+        assert_eq!(
+            normalize_codec_expression("Gorilla, ZSTD", &float64()),
             "Gorilla(8), ZSTD(1)"
         );
         assert_eq!(
-            normalize_codec_expression("Delta, ZSTD(3)"),
+            normalize_codec_expression("Delta, ZSTD(3)", &uint32()),
             "Delta(4), ZSTD(3)"
         );
         assert_eq!(
-            normalize_codec_expression("DoubleDelta, LZ4"),
+            normalize_codec_expression("DoubleDelta, LZ4", &uint32()),
             "DoubleDelta, LZ4"
         );
 
-        // Test whitespace handling
-        assert_eq!(normalize_codec_expression("Delta,LZ4"), "Delta(4), LZ4");
+        // Whitespace
         assert_eq!(
-            normalize_codec_expression("  Delta  ,  LZ4  "),
+            normalize_codec_expression("Delta,LZ4", &uint32()),
+            "Delta(4), LZ4"
+        );
+        assert_eq!(
+            normalize_codec_expression("  Delta  ,  LZ4  ", &uint32()),
             "Delta(4), LZ4"
         );
 
-        // Test already normalized expressions
-        assert_eq!(normalize_codec_expression("Delta(4), LZ4"), "Delta(4), LZ4");
+        // Already normalized
         assert_eq!(
-            normalize_codec_expression("Gorilla(8), ZSTD(3)"),
+            normalize_codec_expression("Delta(4), LZ4", &uint32()),
+            "Delta(4), LZ4"
+        );
+        assert_eq!(
+            normalize_codec_expression("Gorilla(8), ZSTD(3)", &float64()),
             "Gorilla(8), ZSTD(3)"
         );
     }
 
     #[test]
     fn test_codec_expressions_are_equivalent() {
-        // Test None vs None
-        assert!(codec_expressions_are_equivalent(&None, &None));
+        let t = uint32();
+        let some = |s: &str| Some(s.to_string());
 
-        // Test Some vs None
+        assert!(codec_expressions_are_equivalent(&None, &None, &t));
         assert!(!codec_expressions_are_equivalent(
-            &Some("ZSTD(3)".to_string()),
-            &None
+            &some("ZSTD(3)"),
+            &None,
+            &t
         ));
-
-        // Test same codec
         assert!(codec_expressions_are_equivalent(
-            &Some("ZSTD(3)".to_string()),
-            &Some("ZSTD(3)".to_string())
+            &some("ZSTD(3)"),
+            &some("ZSTD(3)"),
+            &t
         ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(4)"),
+            &t
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Gorilla"),
+            &some("Gorilla(8)"),
+            &float64()
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("ZSTD"),
+            &some("ZSTD(1)"),
+            &t
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta, LZ4"),
+            &some("Delta(4), LZ4"),
+            &t
+        ));
+        assert!(!codec_expressions_are_equivalent(
+            &some("ZSTD(3)"),
+            &some("ZSTD(9)"),
+            &t
+        ));
+        assert!(!codec_expressions_are_equivalent(
+            &some("Delta, LZ4"),
+            &some("Delta, ZSTD"),
+            &t
+        ));
+    }
 
-        // Test normalization: user writes "Delta", ClickHouse returns "Delta(4)"
+    #[test]
+    fn codec_width_follows_the_stored_type() {
+        let some = |s: &str| Some(s.to_string());
+        let uint64 = ColumnType::Int(IntType::UInt64);
+        // DateTime with a precision is stored as the 8-byte DateTime64.
+        let datetime64 = ColumnType::DateTime { precision: Some(3) };
+        let datetime = ColumnType::DateTime { precision: None };
+
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta, ZSTD(1)"),
+            &some("Delta(8), ZSTD(1)"),
+            &uint64
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta,ZSTD(1)"),
+            &some("Delta(8), ZSTD(1)"),
+            &datetime64
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(4)"),
+            &datetime
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(2)"),
+            &ColumnType::Date16
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Gorilla"),
+            &some("Gorilla(4)"),
+            &ColumnType::Float(FloatType::Float32)
+        ));
+        // A width the type does not have is a real difference.
+        assert!(!codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(4)"),
+            &uint64
+        ));
+        // Unknown width: the pre-existing default, not a guess at the type.
+        assert_eq!(
+            normalize_codec_expression("Delta", &ColumnType::Uuid),
+            "Delta(4)"
+        );
+        assert!(!codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(8)"),
+            &ColumnType::Uuid
+        ));
+    }
+
+    #[test]
+    fn codec_width_covers_arrays_ipv4_and_decimals() {
+        let some = |s: &str| Some(s.to_string());
+        let array_of = |t: ColumnType| ColumnType::Array {
+            element_type: Box::new(t),
+            element_nullable: false,
+        };
+
+        // Widths ClickHouse 25.8 stores for these types.
+        let cases = [
+            (
+                array_of(ColumnType::Int(IntType::UInt32)),
+                "Delta",
+                "Delta(4)",
+            ),
+            (
+                array_of(ColumnType::Int(IntType::UInt64)),
+                "Delta",
+                "Delta(8)",
+            ),
+            (
+                array_of(ColumnType::DateTime { precision: Some(3) }),
+                "Delta",
+                "Delta(8)",
+            ),
+            (
+                array_of(ColumnType::Float(FloatType::Float64)),
+                "Gorilla",
+                "Gorilla(8)",
+            ),
+            (ColumnType::IpV4, "Delta", "Delta(4)"),
+            (
+                ColumnType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                },
+                "Delta",
+                "Delta(4)",
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                },
+                "Gorilla",
+                "Gorilla(4)",
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 18,
+                    scale: 2,
+                },
+                "Delta",
+                "Delta(8)",
+            ),
+        ];
+        for (data_type, code, stored) in cases {
+            assert!(
+                codec_expressions_are_equivalent(&some(code), &some(stored), &data_type),
+                "{code} on {data_type:?} should equal {stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_width_falls_back_to_previous_defaults() {
+        // A type without a known width keeps the defaults normalization used
+        // before widths were type-aware, so it is never worse than before.
+        let some = |s: &str| Some(s.to_string());
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(4)"),
+            &ColumnType::Uuid
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Gorilla"),
+            &some("Gorilla(8)"),
+            &ColumnType::Uuid
+        ));
+    }
+
+    #[test]
+    fn codec_width_sees_through_nullable() {
+        let nullable_datetime64 =
+            ColumnType::Nullable(Box::new(ColumnType::DateTime { precision: Some(3) }));
         assert!(codec_expressions_are_equivalent(
             &Some("Delta".to_string()),
-            &Some("Delta(4)".to_string())
-        ));
-
-        // Test normalization: user writes "Gorilla", ClickHouse returns "Gorilla(8)"
-        assert!(codec_expressions_are_equivalent(
-            &Some("Gorilla".to_string()),
-            &Some("Gorilla(8)".to_string())
-        ));
-
-        // Test normalization: user writes "ZSTD", ClickHouse returns "ZSTD(1)"
-        assert!(codec_expressions_are_equivalent(
-            &Some("ZSTD".to_string()),
-            &Some("ZSTD(1)".to_string())
-        ));
-
-        // Test chain normalization
-        assert!(codec_expressions_are_equivalent(
-            &Some("Delta, LZ4".to_string()),
-            &Some("Delta(4), LZ4".to_string())
-        ));
-
-        // Test different codecs
-        assert!(!codec_expressions_are_equivalent(
-            &Some("ZSTD(3)".to_string()),
-            &Some("ZSTD(9)".to_string())
-        ));
-
-        // Test different chains
-        assert!(!codec_expressions_are_equivalent(
-            &Some("Delta, LZ4".to_string()),
-            &Some("Delta, ZSTD".to_string())
+            &Some("Delta(8)".to_string()),
+            &nullable_datetime64
         ));
     }
 
