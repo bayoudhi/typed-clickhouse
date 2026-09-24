@@ -33,13 +33,14 @@ against the same unchanged database:
 | 86 | `ModifyTableColumn` | `annotations` |
 | 22 | `ModifyTableColumn` | `codec` (`Delta` vs `Delta(8)`) |
 | 2 | `ModifyTableColumn` | `data_type` (nullability inside a named tuple) |
-| 12 + 12 | `DropView` + `CreateView` | view SELECT SQL |
-| 1 + 1 | `DropTableProjection` + `AddTableProjection` | projection body |
+| 12 + 12 | `DropView` + `CreateView` | view `source_tables` |
+| 1 + 1 | `DropTableProjection` + `AddTableProjection` | none — cascade from the column modifications above |
 
 ## Root causes
 
-Four distinct defects, three confirmed by reading the code, one carrying an open
-probe.
+Four distinct defects, each confirmed by reading the code and probing a real
+ClickHouse 25.8 server. The projection churn in the table above is not a fifth
+defect; see "Projection churn is a cascade" below.
 
 ### 1. Non-DDL annotations drive the column diff
 
@@ -75,10 +76,11 @@ expands bare codec names to their defaults with a fixed table:
 "ZSTD"     => "ZSTD(1)",
 ```
 
-ClickHouse's actual default for `Delta` is `sizeof(type)`, not a constant. A
-`UInt64` column declared `CODEC(Delta, ZSTD(1))` is stored as
-`Delta(8), ZSTD(1)`, which never equals the normalized `Delta(4), ZSTD(1)`.
-`Gorilla` has the same defect in the other direction.
+ClickHouse's actual default for `Delta` is `sizeof(type)`, not a constant.
+Probed on 25.8: a `UInt64` column declared `CODEC(Delta, ZSTD(1))` is stored as
+`Delta(8), ZSTD(1)`, and so is a `DateTime(3)` column, which ClickHouse stores as
+the 8-byte `DateTime64(3)`. Neither ever equals the normalized
+`Delta(4), ZSTD(1)`. `Gorilla` has the same defect in the other direction.
 
 ### 3. Nullability is discarded inside named tuples
 
@@ -105,53 +107,51 @@ the type in `ColumnType::Nullable`. The tuple branch is the outlier.
 This is a read-back correctness bug independent of the churn. It causes the tool
 to misreport the schema of a live table.
 
-### 4a. Projection comparison reads the un-normalized map
+### 4. View comparison checks a user-declared list against a parsed one
 
-`InfrastructureMap::diff_with_table_strategy`
-(`apps/cli/src/framework/core/infrastructure_map.rs:1217`):
+`views_are_equivalent` (`apps/cli/src/framework/core/infra_reality_checker.rs:199-222`)
+compares two things: the normalized `select_sql`, and `source_tables` as a set.
+The two sides of `source_tables` are different kinds of information:
 
-```rust
-let projections_changed = table.projections != target_table.projections;
-```
+- Code side: the `baseTables` array the user passes to the TypeScript `View`
+  constructor (`packages/lib/src/dmv2/sdk/view.ts:57`). Its documented purpose
+  is dependency tracking. Nothing checks it against the SQL.
+- Reality side: whatever `extract_source_tables_from_query` can recover from the
+  stored SELECT (`apps/cli/src/infrastructure/olap/clickhouse/mod.rs:3323-3337`),
+  falling back to a regex extractor when sqlparser rejects the query.
 
-`table` and `target_table` are the original tables. `normalize_infra_map_for_comparison`
-(`apps/cli/src/framework/core/plan.rs:142-156`) deliberately whitespace-collapses
-every projection body for exactly this comparison, but writes the result into
-the normalized map — which this line does not consult, while its immediate
-neighbours (`partition_by`, table TTL) correctly use the normalized pair. The
-normalization is computed and then discarded, so ClickHouse's multi-line stored
-DDL never matches a single-line authored body.
+Probing the extractor showed where the two disagree. sqlparser rejects a JOIN
+whose tables carry `FINAL` (`Expected: end of statement, found: FINAL`), so those
+views go through the regex fallback; and on a single-table `FINAL` query it
+parses `FINAL` as a table alias. Any view whose declared `baseTables` does not
+exactly equal the extractor's output — a joined table left undeclared, a view
+listed as a base, a subquery — is reported as changed on every run.
 
-`indexes_changed` on line 1214 has the same shape and must be checked in the
-same pass.
+The SQL comparison itself is sound. The probe ran `normalize_sql_for_comparison`
+over plain, parameterized (`{from:String}`), `FINAL`, JOIN-with-`FINAL`, and
+subquery views; in every case the authored and read-back forms normalized to
+identical text. `formatQuerySingleLine` also accepts query-parameter
+placeholders. An earlier hypothesis that parameterized views break
+normalization is therefore ruled out.
 
-### 4b. View SQL normalization fails silently (open probe)
+A view's DDL is its SELECT and nothing else. `source_tables` drives dependency
+ordering; it has no representation in ClickHouse, so it must not decide whether
+a view is recreated.
 
-Both sides of a view comparison are normalized through ClickHouse's
-`formatQuerySingleLine` before `views_are_equivalent` runs — in the plan path
-(`apps/cli/src/framework/core/plan.rs:97-140`) and in the reality checker
-(`apps/cli/src/framework/core/infra_reality_checker.rs:751-787`). Every one of
-those calls handles failure by falling back to the raw string:
+### Projection churn is a cascade
 
-```rust
-.unwrap_or_else(|_| actual.select_sql.clone())
-```
+`drop_column_dependents` (`apps/cli/src/infrastructure/olap/ddl_ordering.rs:1148-1175`)
+drops every projection that references a column being modified, and
+`readd_column_dependents` re-adds it afterwards. That is correct behavior for a
+real column change. Here the projection referenced columns that were being
+phantom-modified by defects 1 and 2, so it was torn down and rebuilt as a side
+effect.
 
-When normalization fails, both sides revert to raw text, and authored SQL is
-compared against ClickHouse-formatted SQL. That never matches, so the view is
-dropped and recreated on every deploy, with a single `debug!` line as the only
-evidence.
-
-Two candidate causes, not yet distinguished:
-
-- `formatQuerySingleLine` rejecting unbound `{name:Type}` query-parameter
-  placeholders, which parameterized views contain by definition.
-- `source_tables` differing between the authored and read-back forms — the sets
-  are compared independently of the SQL, and alias-heavy or subquery-heavy
-  views extract differently on each side.
-
-The reproduction harness settles this. Both candidates are in scope; the
-silent-fallback behavior changes regardless of which one is responsible.
+Probing confirmed the projection itself round-trips: an authored body and the
+body ClickHouse stores are identical after the existing whitespace collapse in
+`normalize_infra_map_for_comparison`, including with keyword-like identifiers.
+No projection-specific fix is needed. The harness still asserts that no
+projection operation appears, so the cascade is covered.
 
 ## Goals
 
@@ -180,8 +180,12 @@ silent-fallback behavior changes regardless of which one is responsible.
 
 ### Reproduction harness
 
-A Rust integration test at `apps/cli/tests/reality_roundtrip.rs`, gated on the
-`TCH_TEST_CLICKHOUSE_URL` environment variable. When the variable is absent the
+An inline `#[cfg(test)]` module at
+`apps/cli/src/infrastructure/olap/clickhouse/reality_roundtrip_tests.rs`, gated
+on the `TCH_TEST_CLICKHOUSE_URL` environment variable. It has to be inline: the
+CLI crate is binary-only, so a test under `apps/cli/tests/` cannot reach its
+internals. That also matches the repository's convention of inline test
+modules. When the variable is absent the
 test skips with a printed reason, so `cargo test` stays container-free for
 contributors without Docker. A `docker-compose.test.yml` at the repository root
 pins the ClickHouse image for local use.
@@ -189,11 +193,12 @@ pins the ClickHouse image for local use.
 The loop:
 
 1. Build a fixture `InfrastructureMap` in Rust.
-2. Render it to DDL through the production path (`std_column_to_clickhouse_column`
-   into `CREATE TABLE` / `CREATE VIEW` / `ADD PROJECTION`) and execute it
-   against the container.
-3. Read reality back with the production reader — `ConfiguredDBClient`'s
-   `OlapOperations` implementation — with no test double.
+2. Apply it through the production path: diff an empty map against the
+   fixture, then hand the resulting changes to `olap::execute_changes` — the
+   same executor `migrate` uses.
+3. Reconcile with reality exactly as `plan_changes` does, through
+   `reconcile_with_reality` and the real `ConfiguredDBClient`, with no test
+   double.
 4. Run the production comparison: `normalize_infra_map_for_comparison` on both
    maps, then `diff_with_table_strategy`.
 5. Assert the change set is empty.
@@ -212,11 +217,16 @@ Synthetic, with one carrier per defect class:
 
 | Fixture | Carries |
 |---|---|
-| `sensor_readings.recordedAt`, `.ingestedAt` — `DateTime(3)` with the `stringDate` annotation | class 1 |
-| `sensor_readings._version` — `UInt64 CODEC(Delta, ZSTD(1))` | class 2 |
-| `sensor_readings.samples` — `Array(Nested(...))` with a nullable member, which ClickHouse reports back as `Array(Tuple(...))` and so exercises the tuple branch | class 3 |
-| `sensor_readings.p_by_device` — projection with an `ORDER BY` | class 4a |
-| `v_daily_totals` — plain view; `v_readings_in_window` — parameterized view using `{from:String}` | class 4b |
+| `sensor_readings.recordedAt`, `.ingestedAt` — `DateTime(3)` with the `stringDate` annotation | defect 1 |
+| `sensor_readings._version` — `UInt64 CODEC(Delta, ZSTD(1))`; `recordedAt` also carries `CODEC(Delta, ZSTD(1))` | defect 2 |
+| `sensor_readings.samples` — `Array(Tuple(label String, ok Nullable(Bool)))` | defect 3 |
+| `v_device_activity` — JOIN of `sensor_readings` and `devices`, both with `FINAL`, declaring only `sensor_readings` as a source table | defect 4 |
+| `v_readings_in_window` — parameterized view using `{from:String}`, declaring its one source table correctly | control: must stay unchanged before and after |
+| `sensor_readings.p_by_device` — projection over `deviceId`, `recordedAt`, `_version` | the projection cascade |
+
+The defect-3 carrier is an explicit `Array(Tuple(...))`, not `Nested`: the
+production client sets `flatten_nested = 0`, so a `Nested` column reads back as
+`Nested` and never reaches the tuple branch.
 
 The fixture is constructed in Rust rather than compiled from TypeScript, so it
 cannot drift silently from what the compiler plugin emits. A companion assertion
@@ -252,8 +262,8 @@ the type:
 
 | Width | Types |
 |---|---|
-| 8 | `Int64`, `UInt64`, `Float64`, `DateTime64`, `Decimal64` |
-| 4 | `Int32`, `UInt32`, `Float32`, `DateTime`, `Date32` |
+| 8 | `Int64`, `UInt64`, `Float64`, `DateTime` with a precision (stored as `DateTime64`) |
+| 4 | `Int32`, `UInt32`, `Float32`, `DateTime` without a precision, `Date32` |
 | 2 | `Int16`, `UInt16`, `Date` |
 | 1 | `Int8`, `UInt8`, `Bool` |
 
@@ -275,23 +285,22 @@ let field_type = if nullable && !matches!(field_type, ColumnType::Nullable(_)) {
 };
 ```
 
-### Fix 4a — compare normalized projections and indexes
+### Fix 4 — views compare their DDL only
 
-In `diff_with_table_strategy`, read `normalized_table` / `normalized_target` for
-the projection and index comparisons, matching how `partition_by` and table TTL
-are already handled.
+Remove the `source_tables` comparison from `views_are_equivalent`. The view's
+name, its database, and its normalized `select_sql` fully determine the DDL.
+`source_tables` keeps its job — dependency ordering in `ddl_ordering` — but no
+longer decides whether a view is recreated.
 
-### Fix 4b — resolve and expose view normalization failure
+Materialized views keep their `source_tables` comparison. None churned, and an
+MV's target and source wiring is part of what makes it behave, so changing it is
+out of scope here.
 
-Ordered by the probe, which runs first:
-
-1. Determine why `formatQuerySingleLine` fails or produces divergent output for
-   the harness's parameterized view, and fix that specific cause — either
-   normalizing around parameter placeholders, or correcting `source_tables`
-   extraction so the two sides agree.
-2. Independently of the cause, change the fallback: normalization failure logs
-   at `warn!` with the view name and the underlying error. A silent fallback
-   that guarantees a drop-and-recreate must never again be invisible.
+Separately, the normalization fallbacks in `normalize_infra_map_for_comparison`
+(`apps/cli/src/framework/core/plan.rs:97-140`) and in the reality checker log at
+`debug!`. They are raised to `warn!` with the object name and the error. The
+fallback did not cause this churn, but a silent fallback that would guarantee a
+drop-and-recreate should not be invisible if it ever does.
 
 ## Testing
 
@@ -302,7 +311,7 @@ Fast tier, no container, inside the existing `cargo test`:
 | annotation filter | columns differing only by `stringDate` are equivalent; differing by `LowCardinality` are not |
 | codec width | `Delta` ≡ `Delta(8)` for `UInt64`; `Delta` ≡ `Delta(4)` for `UInt32`; unknown-width type leaves `Delta` unexpanded and unequal to `Delta(8)` |
 | tuple nullability | `Tuple(a Nullable(Bool))` round-trips to a field equal to the code-side nullable field |
-| projection comparison | a table differing only in projection-body whitespace yields no change |
+| view equivalence | two views with identical SQL and different `source_tables` are equivalent; different SQL is not |
 | TS guard (`packages/lib`) | a `Format<"date-time">` field still emits the `stringDate` annotation |
 
 Container tier, env-gated: the create → read back → diff loop, asserting an
@@ -313,7 +322,7 @@ empty change set and naming the carrier on failure.
 A new `reality-roundtrip` job in `.github/workflows/test.yaml` using a GitHub
 service container. The image tag lives in `docker-compose.test.yml` and the
 workflow reads it from there, so the local and CI versions cannot drift. The job
-sets `TCH_TEST_CLICKHOUSE_URL` and runs `cargo test --test reality_roundtrip`.
+sets `TCH_TEST_CLICKHOUSE_URL` and runs `cargo test reality_roundtrip`.
 
 The existing `rust` job is unchanged, so contributors without Docker see no
 difference. `AGENTS.md` currently states the repository has no end-to-end tests;
@@ -332,17 +341,22 @@ is derived from the renderer's actual reads rather than from inspection, and the
 round-trip test fails if a DDL-affecting annotation is ever added without being
 registered.
 
-**Fix 3 changes what the reader reports for existing deployments.** Where a live
-table genuinely has non-nullable tuple fields while code declares them nullable,
-that mismatch is currently invisible; after the fix it becomes a real and
-correct `MODIFY COLUMN`. Users will see a one-time `ALTER` that looks new but is
-the tool finally reporting the truth. This needs a `MIGRATION.md` note, and it
-means the change ships as a minor version rather than a patch.
+**Fix 3 changes what the reader reports for existing deployments.** Today the
+reader reports every tuple field as non-nullable. So where a live table has a
+`Nullable` tuple field but code declares it non-nullable, the two currently look
+equal and the mismatch is invisible. After the fix it becomes a real and correct
+`MODIFY COLUMN`. Users will see a one-time `ALTER` that looks new but is the tool
+finally reporting the truth. This needs a `MIGRATION.md` note, and it means the
+change ships as a minor version rather than a patch.
+
+**Fix 4 stops recreating views whose declared dependencies change.** If a user
+edits only a view's `baseTables`, no DDL is emitted. That is correct, since the
+view's definition is unchanged, and the new list still reaches the stored state
+and dependency ordering.
 
 ## Sequencing
 
 1. Harness, fixtures, and CI job — landing a failing reproduction before any
    fix.
-2. Probe for class 4b, the only fix whose shape is still open.
-3. The four fixes, each with its fast-tier test, each independently revertable.
-4. `MIGRATION.md` note and the `AGENTS.md` amendment.
+2. The four fixes, each with its fast-tier test, each independently revertable.
+3. `MIGRATION.md` note and the `AGENTS.md` amendment.
