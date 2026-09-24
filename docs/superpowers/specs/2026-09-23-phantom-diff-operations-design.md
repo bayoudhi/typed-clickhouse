@@ -138,6 +138,26 @@ A view's DDL is its SELECT and nothing else. `source_tables` drives dependency
 ordering; it has no representation in ClickHouse, so it must not decide whether
 a view is recreated.
 
+### 5. Function-name case and call-name quoting in view SQL
+
+Found by trying the first pre-release against a real deployment: with defects
+1–4 fixed, views whose SQL sqlparser cannot parse (for example a qualified
+table with an alias and `FINAL`) still churned. Such SQL takes the
+text-only fallback in `normalize_sql_for_comparison`, so only
+`formatQuerySingleLine` normalizes it, and two differences survive:
+
+- **Function-name case.** When ClickHouse stores a view it writes each
+  case-insensitive function under its canonical name: `COUNT(` becomes
+  `count(`, `SUM(` becomes `sum(`, `IF(` becomes `if(`, while `CAST` stays
+  `CAST`. `formatQuerySingleLine` keeps the spelling as written. For one
+  affected view this was the only difference: 7 of 178 tokens.
+- **Quoting of a parameterized view used as a table function.** The authored
+  side normalizes to `` `v_name`(param = …) ``, the stored side to
+  `v_name(param = …)`.
+
+When sqlparser can parse the SQL it rewrites both sides the same way, so
+neither difference shows; that is why the first harness fixture missed them.
+
 ### Projection churn is a cascade
 
 `drop_column_dependents` (`apps/cli/src/infrastructure/olap/ddl_ordering.rs:1148-1175`)
@@ -317,6 +337,26 @@ Separately, the normalization fallbacks in `normalize_infra_map_for_comparison`
 `debug!`. They are raised to `warn!` with the object name and the error. The
 fallback did not cause this churn, but a silent fallback that would guarantee a
 drop-and-recreate should not be invisible if it ever does.
+
+### Fix 5 — canonical call names
+
+After `formatQuerySingleLine` and the AST normalizer, `normalize_sql_via_clickhouse`
+rewrites function-call names on both sides:
+
+- a call to a case-insensitive function takes its canonical spelling, read
+  once per run from `system.functions WHERE case_insensitive = 1`, so the list
+  always matches the server;
+- a backtick-quoted call name that is a plain identifier is unquoted.
+
+String literals, names not immediately followed by `(`, and qualified names
+(`db.name(`) are left untouched, so a changed literal or column still shows as
+a change. If the function list cannot be read, names are compared as written,
+which is the previous behavior.
+
+The harness gains two carriers: `v_device_totals` (upper-case calls over an
+`alias FINAL` join) and `v_window_devices` (a parameterized view joined as a
+table function), built in a third fixture stage because ClickHouse requires a
+view's sources to exist.
 
 ## Testing
 

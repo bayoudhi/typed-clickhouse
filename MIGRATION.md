@@ -16,7 +16,8 @@ capability listed there, it cannot migrate to 0.1.0 at all.
 
 Plans used to report changes that applying never removed: date-time string
 columns, `Delta`/`Gorilla` codecs on 8-byte types, nullable named-tuple fields,
-and views whose declared `baseTables` differ from their SQL. After upgrading,
+views whose declared `baseTables` differ from their SQL, and views that call
+functions in upper case (`COUNT(`, `SUM(`) or join a parameterized view. After upgrading,
 those disappear, and a plan against an unchanged deployment is empty.
 
 One change can appear once. The CLI now reads nullability inside named tuples
