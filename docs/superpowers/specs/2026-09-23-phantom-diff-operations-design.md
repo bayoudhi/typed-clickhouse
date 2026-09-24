@@ -147,11 +147,19 @@ real column change. Here the projection referenced columns that were being
 phantom-modified by defects 1 and 2, so it was torn down and rebuilt as a side
 effect.
 
-Probing confirmed the projection itself round-trips: an authored body and the
-body ClickHouse stores are identical after the existing whitespace collapse in
+A projection body written in ClickHouse's canonical form round-trips: it is
+identical to the stored body after the existing whitespace collapse in
 `normalize_infra_map_for_comparison`, including with keyword-like identifiers.
-No projection-specific fix is needed. The harness still asserts that no
+No projection-specific fix is made here, and the harness asserts that no
 projection operation appears, so the cascade is covered.
+
+A body written any other way does not round-trip. ClickHouse stores its own
+formatting, so lower-case keywords or `ORDER BY (a, b)` never match the
+authored text, and the projection is dropped and re-added on every plan. That
+defect predates this work and is out of scope: a safe fix has to compare a
+normalized body while still emitting the authored one, because ClickHouse's
+formatter produces DDL that projection syntax rejects (see the comment in
+`normalize_infra_map_for_comparison`). It is tracked as a follow-up.
 
 ## Goals
 
@@ -270,8 +278,13 @@ the type:
 | 2 | `Int16`, `UInt16`, `Date` |
 | 1 | `Int8`, `UInt8`, `Bool` |
 
-For any type whose width is not known, leave the codec unexpanded rather than
-substituting a guess.
+`Nullable` and `Array` take the width of their inner type, `IPv4` is 4, and
+`Decimal` is 4 up to precision 9 and 8 up to 18.
+
+For any type whose width is still not known, fall back to the fixed defaults
+used before this change (`Delta(4)`, `Gorilla(8)`). Leaving the codec
+unexpanded instead would break types that converged under those defaults by
+coincidence; the fallback keeps every such column comparing exactly as before.
 
 ### Fix 3 — preserve tuple field nullability
 
@@ -312,7 +325,7 @@ Fast tier, no container, inside the existing `cargo test`:
 | Test | Asserts |
 |---|---|
 | annotation filter | columns differing only by `stringDate` are equivalent; differing by `LowCardinality` are not |
-| codec width | `Delta` ≡ `Delta(8)` for `UInt64`; `Delta` ≡ `Delta(4)` for `UInt32`; unknown-width type leaves `Delta` unexpanded and unequal to `Delta(8)` |
+| codec width | `Delta` ≡ `Delta(8)` for `UInt64`; `Delta` ≡ `Delta(4)` for `UInt32`; arrays, `IPv4` and decimals resolve their widths; an unknown-width type falls back to `Delta(4)` / `Gorilla(8)` |
 | tuple nullability | `Tuple(a Nullable(Bool))` round-trips to a field equal to the code-side nullable field |
 | view equivalence | two views with identical SQL and different `source_tables` are equivalent; different SQL is not |
 | TS guard (`packages/lib`) | a `Format<"date-time">` field still emits the `stringDate` annotation |
@@ -336,10 +349,10 @@ describe the live-server test modules and how to run them.
 
 ## Risks
 
-**Failure direction is deliberate.** A wrong codec-width entry, or a type whose
-width is unknown, leaves the codec unexpanded — worst case a phantom operation
-survives, which is today's behavior. No fix here can cause a real change to go
-missing, with one exception.
+**Failure direction is deliberate.** A type whose width is unknown falls back to
+the previous fixed defaults, so it compares exactly as it did before; a wrong
+width-table entry can at worst leave a phantom operation that already existed.
+No fix here can cause a real change to go missing, with one exception.
 
 **The exception is the annotation filter.** Filtering annotations out of the
 comparison could in principle mask a real change. Two mitigations: the registry
