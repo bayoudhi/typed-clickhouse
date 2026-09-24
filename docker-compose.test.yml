@@ -1,0 +1,31 @@
+# ClickHouse for the live-server test modules (`*_live.rs` under
+# apps/cli/src/infrastructure/olap/clickhouse). Port and password match
+# their defaults.
+#
+#   docker compose -f docker-compose.test.yml up -d --wait
+#   TC_LIVE_CLICKHOUSE=1 cargo test live_reality -- --test-threads=1
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    ports:
+      - "18123:8123"
+      - "19000:9000"
+    environment:
+      CLICKHOUSE_PASSWORD: test123
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "clickhouse-client",
+          "--password",
+          "test123",
+          "--query",
+          "SELECT 1",
+        ]
+      interval: 2s
+      timeout: 5s
+      retries: 30

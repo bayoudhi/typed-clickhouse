@@ -84,6 +84,8 @@ pub mod mutations;
 #[cfg(test)]
 mod mutations_live;
 pub mod queries;
+#[cfg(test)]
+mod reality_roundtrip_live;
 pub mod remote;
 pub mod sql_parser;
 pub mod type_parser;

@@ -47,6 +47,26 @@ function createProgramWithSource(tempDir: string, sourceText: string) {
 describe("typeConvert mappings for helper types", function () {
   this.timeout(20000); // Increase timeout for TypeScript compilation
 
+  it("marks DateTime64String fields with the stringDate annotation", function () {
+    // The CLI's live round-trip harness builds its date columns in this
+    // shape. If the plugin stops emitting it, update that fixture too.
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
+
+    const source = `
+      import { DateTime64String } from "@514labs/moose-lib";
+
+      export interface TestModel {
+        recordedAt: DateTime64String<3>;
+      }
+    `;
+
+    const { checker, type } = createProgramWithSource(tempDir, source);
+    const [recordedAt] = toColumns(type, checker);
+
+    expect(recordedAt.data_type).to.equal("DateTime(3)");
+    expect(recordedAt.annotations).to.deep.include(["stringDate", true]);
+  });
+
   it("maps DateTime, DateTime64, numeric aliases, Decimal and LowCardinality", function () {
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tch-typeconv-"));
 
