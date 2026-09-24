@@ -143,6 +143,14 @@ fn table(name: &str, columns: Vec<Column>, order_by: &[&str], engine: Clickhouse
     }
 }
 
+/// How much of the fixture exists; see [`fixture`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Stage {
+    Tables,
+    Views,
+    DependentViews,
+}
+
 fn empty_map() -> InfrastructureMap {
     InfrastructureMap {
         default_database: DB.to_string(),
@@ -158,11 +166,15 @@ fn empty_map() -> InfrastructureMap {
 /// - `samples`: nullable field inside a named tuple (defect 3)
 /// - `v_device_activity`: declared source tables differ from the SQL (defect 4)
 /// - `v_readings_in_window`: control; must never appear
+/// - `v_device_totals`: upper-case function calls in SQL sqlparser cannot
+///   parse; ClickHouse stores the canonical lower-case names (defect 5)
+/// - `v_window_devices`: reads a parameterized view as a table function,
+///   whose name the formatter quotes on one side only (defect 6)
 /// - `p_by_device`: references modified columns, so it cascades from 1 and 2
 ///
-/// Views are left out when `with_views` is false so tables can be created
-/// before anything that reads from them.
-fn fixture(with_views: bool) -> InfrastructureMap {
+/// ClickHouse checks that a view's sources exist, so the schema is built in
+/// stages: tables, then views over tables, then views over views.
+fn fixture(stage: Stage) -> InfrastructureMap {
     let mut map = empty_map();
 
     let mut readings = table(
@@ -231,7 +243,7 @@ fn fixture(with_views: bool) -> InfrastructureMap {
         map.tables.insert(t.id(DB), t);
     }
 
-    if with_views {
+    if stage >= Stage::Views {
         let views = [
             View {
                 name: "v_device_activity".to_string(),
@@ -255,10 +267,51 @@ fn fixture(with_views: bool) -> InfrastructureMap {
                 source_tables: vec!["`sensor_readings`".to_string()],
                 metadata: None,
             },
+            View {
+                name: "v_device_totals".to_string(),
+                database: None,
+                // A qualified table with an alias and FINAL is valid
+                // ClickHouse that sqlparser rejects, so this SQL takes the
+                // text-only normalization path.
+                select_sql: format!(
+                    "SELECT
+  d.id,
+  COUNT(r.deviceId) AS readings,
+  SUM(r._version) AS versions,
+  AVG(r._version) AS meanVersion,
+  IF(COUNT(r.deviceId) > 0, 'active', 'idle') AS state,
+  COALESCE(d.label, '') AS label,
+  CAST(SUM(r._version), 'Float64') AS versionsFloat
+FROM {DB}.devices d FINAL
+LEFT JOIN {DB}.sensor_readings r ON d.id = r.deviceId
+GROUP BY d.id, d.label"
+                ),
+                source_tables: vec!["`devices`".to_string(), "`sensor_readings`".to_string()],
+                metadata: None,
+            },
         ];
         for v in views {
             map.views.insert(v.name.clone(), v);
         }
+    }
+
+    if stage >= Stage::DependentViews {
+        let view = View {
+            name: "v_window_devices".to_string(),
+            database: None,
+            select_sql: format!(
+                "SELECT d.id, d.label, count() AS readings
+FROM {DB}.devices d FINAL
+JOIN {DB}.v_readings_in_window(from = {{from:String}}) AS w ON d.id = w.deviceId
+GROUP BY d.id, d.label"
+            ),
+            source_tables: vec![
+                "`devices`".to_string(),
+                "`v_readings_in_window`".to_string(),
+            ],
+            metadata: None,
+        };
+        map.views.insert(view.name.clone(), view);
     }
 
     map
@@ -373,10 +426,12 @@ async fn live_reality_roundtrip_plans_nothing() {
 
     reset_database().await;
     let project = project();
-    let tables_only = fixture(false);
-    let full = fixture(true);
-    apply(&project, &empty_map(), &tables_only).await;
-    apply(&project, &tables_only, &full).await;
+    let tables = fixture(Stage::Tables);
+    let views = fixture(Stage::Views);
+    let full = fixture(Stage::DependentViews);
+    apply(&project, &empty_map(), &tables).await;
+    apply(&project, &tables, &views).await;
+    apply(&project, &views, &full).await;
 
     let changes = plan_against_reality(&project, &full).await;
     let phantoms: Vec<String> = changes.olap_changes.iter().map(describe).collect();

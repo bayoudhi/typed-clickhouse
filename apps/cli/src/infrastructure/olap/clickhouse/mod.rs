@@ -2243,6 +2243,12 @@ pub async fn run_query(
         .await
 }
 
+/// Row type for normalized SQL query result
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct NormalizedSqlRow {
+    normalized: String,
+}
+
 /// Normalizes SQL using ClickHouse's native formatQuerySingleLine function.
 ///
 /// This function sends the SQL to ClickHouse for normalization, which handles:
@@ -2254,6 +2260,11 @@ pub async fn run_query(
 /// The formatted SQL is then passed through the AST normalizer to strip the
 /// default database prefix in an identifier-aware way. This avoids unsafe
 /// string replacement inside literals or comments.
+///
+/// Finally, function-call names are rewritten the way ClickHouse stores them
+/// (see [`canonicalize_call_names`]). `formatQuerySingleLine` keeps `COUNT(`
+/// as written while a stored view holds `count(`, so without this step the
+/// two never compare equal whenever the AST normalizer cannot parse the SQL.
 ///
 /// # Arguments
 /// * `configured_client` - The configured ClickHouse client
@@ -2269,12 +2280,6 @@ pub async fn run_query(
 /// let normalized = normalize_sql_via_clickhouse(&client, "SELECT a * 100.0 FROM t", "local").await?;
 /// // Returns: "SELECT (a * 100.) FROM t"
 /// ```
-/// Row type for normalized SQL query result
-#[derive(clickhouse::Row, serde::Deserialize)]
-struct NormalizedSqlRow {
-    normalized: String,
-}
-
 pub async fn normalize_sql_via_clickhouse(
     configured_client: &ConfiguredDBClient,
     sql: &str,
@@ -2296,10 +2301,15 @@ pub async fn normalize_sql_via_clickhouse(
         })?;
 
     match cursor.next().await {
-        Ok(Some(row)) => Ok(normalize_sql_for_comparison(
-            row.normalized.trim(),
-            default_database,
-        )),
+        Ok(Some(row)) => {
+            let normalized = normalize_sql_for_comparison(row.normalized.trim(), default_database);
+            Ok(
+                match case_insensitive_function_names(configured_client).await {
+                    Some(names) => canonicalize_call_names(&normalized, names),
+                    None => normalized,
+                },
+            )
+        }
         Ok(None) => Err(OlapChangesError::DatabaseError(
             "No result from formatQuerySingleLine".to_string(),
         )),
@@ -2311,6 +2321,131 @@ pub async fn normalize_sql_via_clickhouse(
             )))
         }
     }
+}
+
+/// Canonical spellings of ClickHouse's case-insensitive functions, keyed by
+/// their lower-cased name. Read once from the server, so the list always
+/// matches the version being compared against.
+static CASE_INSENSITIVE_FUNCTIONS: std::sync::OnceLock<HashMap<String, String>> =
+    std::sync::OnceLock::new();
+
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct FunctionNameRow {
+    name: String,
+}
+
+/// Returns the server's case-insensitive function names, fetching them on
+/// first use. `None` if they cannot be read, in which case call names are
+/// compared as written, as before.
+async fn case_insensitive_function_names(
+    configured_client: &ConfiguredDBClient,
+) -> Option<&'static HashMap<String, String>> {
+    if let Some(names) = CASE_INSENSITIVE_FUNCTIONS.get() {
+        return Some(names);
+    }
+    match configured_client
+        .client
+        .query("SELECT name FROM system.functions WHERE case_insensitive = 1")
+        .fetch_all::<FunctionNameRow>()
+        .await
+    {
+        Ok(rows) => {
+            let names = rows
+                .into_iter()
+                .map(|row| (row.name.to_ascii_lowercase(), row.name))
+                .collect();
+            Some(CASE_INSENSITIVE_FUNCTIONS.get_or_init(|| names))
+        }
+        Err(e) => {
+            warn!(
+                "Could not read case-insensitive function names; comparing SQL \
+                 function names as written: {}",
+                e
+            );
+            None
+        }
+    }
+}
+
+fn is_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Rewrites function-call names in formatted SQL the way ClickHouse stores
+/// them in a view definition.
+///
+/// - A call to a case-insensitive function takes its canonical spelling from
+///   `case_insensitive` (lower-cased name to canonical name): `COUNT(x)`
+///   becomes `count(x)`, while `cast(x, 'T')` becomes `CAST(x, 'T')`.
+/// - A backtick-quoted call name that does not need quoting is unquoted:
+///   `` `v_window`(from = 'x') `` becomes `v_window(from = 'x')`, as a
+///   parameterized view used as a table function is stored.
+///
+/// String literals are copied untouched, and so are names that are not
+/// immediately followed by `(` or that are qualified (`db.name(`), since
+/// those are columns or tables rather than functions.
+pub fn canonicalize_call_names(sql: &str, case_insensitive: &HashMap<String, String>) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\'' => {
+                // Copy the literal verbatim, honouring '' and \' escapes.
+                let start = i;
+                i += 1;
+                while i < chars.len() {
+                    match chars[i] {
+                        '\\' => i += 2,
+                        '\'' if chars.get(i + 1) == Some(&'\'') => i += 2,
+                        '\'' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                let end = i.min(chars.len());
+                out.extend(&chars[start..end]);
+                i = end;
+            }
+            '`' => {
+                let start = i;
+                let mut close = i + 1;
+                while close < chars.len() && chars[close] != '`' {
+                    close += 1;
+                }
+                let end = (close + 1).min(chars.len());
+                let inner: String = chars[start + 1..close.min(chars.len())].iter().collect();
+                if chars.get(end) == Some(&'(') && is_plain_identifier(&inner) {
+                    out.push_str(&inner);
+                } else {
+                    out.extend(&chars[start..end]);
+                }
+                i = end;
+            }
+            c if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                let is_call = chars.get(i) == Some(&'(');
+                let qualified = start > 0 && chars[start - 1] == '.';
+                match case_insensitive.get(&word.to_ascii_lowercase()) {
+                    Some(canonical) if is_call && !qualified => out.push_str(canonical),
+                    _ => out.push_str(&word),
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Checks if the ClickHouse database is ready for operations
@@ -4312,6 +4447,78 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
 
     fn float64() -> ColumnType {
         ColumnType::Float(FloatType::Float64)
+    }
+
+    fn call_names() -> HashMap<String, String> {
+        // As read from system.functions: lower-case key, canonical spelling.
+        [
+            ("count", "count"),
+            ("sum", "sum"),
+            ("cast", "CAST"),
+            ("datediff", "dateDiff"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn call_names_take_their_canonical_spelling() {
+        assert_eq!(
+            canonicalize_call_names(
+                "SELECT COUNT(x), Sum(y), cast(z, 'Float64'), DATEDIFF('day', a, b)",
+                &call_names()
+            ),
+            "SELECT count(x), sum(y), CAST(z, 'Float64'), dateDiff('day', a, b)"
+        );
+    }
+
+    #[test]
+    fn call_name_canonicalization_leaves_literals_and_columns_alone() {
+        let names = call_names();
+        // A string literal is data: its case is a real difference.
+        assert_eq!(
+            canonicalize_call_names("SELECT 'COUNT(' AS s, COUNT(x) = 'SUM(y)'", &names),
+            "SELECT 'COUNT(' AS s, count(x) = 'SUM(y)'"
+        );
+        assert_eq!(
+            canonicalize_call_names(r"SELECT 'it''s COUNT(', 'a\'SUM(', COUNT(1)", &names),
+            r"SELECT 'it''s COUNT(', 'a\'SUM(', count(1)"
+        );
+        // Not a call: a column that happens to share a function's name.
+        assert_eq!(
+            canonicalize_call_names("SELECT SUM FROM t", &names),
+            "SELECT SUM FROM t"
+        );
+        // A qualified name is a table or column, not a function.
+        assert_eq!(
+            canonicalize_call_names("SELECT db.COUNT(x)", &names),
+            "SELECT db.COUNT(x)"
+        );
+        // Unknown functions keep the author's spelling.
+        assert_eq!(
+            canonicalize_call_names("SELECT toDate(x), MyUdf(y)", &names),
+            "SELECT toDate(x), MyUdf(y)"
+        );
+    }
+
+    #[test]
+    fn quoted_call_names_are_unquoted_when_plain() {
+        let names = call_names();
+        assert_eq!(
+            canonicalize_call_names("JOIN `v_window`(from = 'x') AS w", &names),
+            "JOIN v_window(from = 'x') AS w"
+        );
+        // A name that needs its quotes keeps them.
+        assert_eq!(
+            canonicalize_call_names("JOIN `my view`(a = 1)", &names),
+            "JOIN `my view`(a = 1)"
+        );
+        // A quoted identifier that is not a call is left as is.
+        assert_eq!(
+            canonicalize_call_names("SELECT `COUNT` FROM t", &names),
+            "SELECT `COUNT` FROM t"
+        );
     }
 
     #[test]
