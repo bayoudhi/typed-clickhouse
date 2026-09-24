@@ -3499,22 +3499,28 @@ pub fn extract_table_ttl_from_create_query(create_query: &str) -> Option<String>
 }
 
 /// Byte width ClickHouse substitutes for a bare `Delta` or `Gorilla`: the size
-/// of the stored value. `None` when that is not a fixed 1, 2, 4 or 8 bytes.
+/// of the stored value, or of the element for arrays. `None` when that is not
+/// known to be a fixed 1, 2, 4 or 8 bytes.
 fn codec_default_width(data_type: &ColumnType) -> Option<u8> {
     use crate::framework::core::infrastructure::table::{FloatType, IntType};
 
     match data_type {
         ColumnType::Nullable(inner) => codec_default_width(inner),
+        ColumnType::Array { element_type, .. } => codec_default_width(element_type),
         ColumnType::Boolean | ColumnType::Int(IntType::Int8 | IntType::UInt8) => Some(1),
         ColumnType::Date16 | ColumnType::Int(IntType::Int16 | IntType::UInt16) => Some(2),
         ColumnType::Date
         | ColumnType::DateTime { precision: None }
         | ColumnType::Float(FloatType::Float32)
+        | ColumnType::IpV4
         | ColumnType::Int(IntType::Int32 | IntType::UInt32) => Some(4),
         // A DateTime with a precision is stored as DateTime64.
         ColumnType::DateTime { precision: Some(_) }
         | ColumnType::Float(FloatType::Float64)
         | ColumnType::Int(IntType::Int64 | IntType::UInt64) => Some(8),
+        // Decimal32 up to precision 9, Decimal64 up to 18.
+        ColumnType::Decimal { precision, .. } if *precision <= 9 => Some(4),
+        ColumnType::Decimal { precision, .. } if *precision <= 18 => Some(8),
         _ => None,
     }
 }
@@ -3523,8 +3529,9 @@ fn codec_default_width(data_type: &ColumnType) -> Option<u8> {
 ///
 /// `Delta` and `Gorilla` default to the byte width of the column's type, so
 /// the same codec reads back as `Delta(4)` on a `UInt32` and `Delta(8)` on a
-/// `UInt64`. When the width is unknown the codec is left as written: at worst
-/// a difference survives, never a real one hidden.
+/// `UInt64`. When the width is unknown they fall back to the fixed defaults
+/// used before widths were type-aware (`Delta(4)`, `Gorilla(8)`), so such a
+/// column compares exactly as it did before.
 pub fn normalize_codec_expression(expr: &str, data_type: &ColumnType) -> String {
     let width = codec_default_width(data_type);
     expr.split(',')
@@ -3532,9 +3539,11 @@ pub fn normalize_codec_expression(expr: &str, data_type: &ColumnType) -> String 
             let trimmed = codec.trim();
             match (trimmed, width) {
                 ("Delta" | "Gorilla", Some(width)) => format!("{trimmed}({width})"),
+                ("Delta", None) => "Delta(4)".to_string(),
+                ("Gorilla", None) => "Gorilla(8)".to_string(),
                 ("ZSTD", _) => "ZSTD(1)".to_string(),
-                // DoubleDelta, LZ4, NONE, codecs with explicit params, and
-                // Delta/Gorilla on a type of unknown width stay as written.
+                // DoubleDelta, LZ4, NONE and codecs with explicit params stay
+                // as written.
                 _ => trimmed.to_string(),
             }
         })
@@ -4461,15 +4470,96 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             &some("Delta(4)"),
             &uint64
         ));
-        // Unknown width: leave the codec as written rather than guess.
+        // Unknown width: the pre-existing default, not a guess at the type.
         assert_eq!(
-            normalize_codec_expression("Delta", &ColumnType::String),
-            "Delta"
+            normalize_codec_expression("Delta", &ColumnType::Uuid),
+            "Delta(4)"
         );
         assert!(!codec_expressions_are_equivalent(
             &some("Delta"),
             &some("Delta(8)"),
-            &ColumnType::String
+            &ColumnType::Uuid
+        ));
+    }
+
+    #[test]
+    fn codec_width_covers_arrays_ipv4_and_decimals() {
+        let some = |s: &str| Some(s.to_string());
+        let array_of = |t: ColumnType| ColumnType::Array {
+            element_type: Box::new(t),
+            element_nullable: false,
+        };
+
+        // Widths ClickHouse 25.8 stores for these types.
+        let cases = [
+            (
+                array_of(ColumnType::Int(IntType::UInt32)),
+                "Delta",
+                "Delta(4)",
+            ),
+            (
+                array_of(ColumnType::Int(IntType::UInt64)),
+                "Delta",
+                "Delta(8)",
+            ),
+            (
+                array_of(ColumnType::DateTime { precision: Some(3) }),
+                "Delta",
+                "Delta(8)",
+            ),
+            (
+                array_of(ColumnType::Float(FloatType::Float64)),
+                "Gorilla",
+                "Gorilla(8)",
+            ),
+            (ColumnType::IpV4, "Delta", "Delta(4)"),
+            (
+                ColumnType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                },
+                "Delta",
+                "Delta(4)",
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 9,
+                    scale: 2,
+                },
+                "Gorilla",
+                "Gorilla(4)",
+            ),
+            (
+                ColumnType::Decimal {
+                    precision: 18,
+                    scale: 2,
+                },
+                "Delta",
+                "Delta(8)",
+            ),
+        ];
+        for (data_type, code, stored) in cases {
+            assert!(
+                codec_expressions_are_equivalent(&some(code), &some(stored), &data_type),
+                "{code} on {data_type:?} should equal {stored}"
+            );
+        }
+    }
+
+    #[test]
+    fn codec_width_falls_back_to_previous_defaults() {
+        // A type without a known width keeps the defaults normalization used
+        // before widths were type-aware, so it is never worse than before.
+        let some = |s: &str| Some(s.to_string());
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(4)"),
+            &ColumnType::Uuid
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Gorilla"),
+            &some("Gorilla(8)"),
+            &ColumnType::Uuid
         ));
     }
 

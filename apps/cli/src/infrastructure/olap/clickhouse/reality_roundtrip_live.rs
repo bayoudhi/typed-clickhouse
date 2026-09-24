@@ -153,7 +153,8 @@ fn empty_map() -> InfrastructureMap {
 /// The synthetic schema. Each carrier triggers exactly one defect:
 ///
 /// - `recordedAt`, `ingestedAt`: `stringDate` annotation (defect 1)
-/// - `recordedAt`, `_version`: bare `Delta` codec on 8-byte types (defect 2)
+/// - `recordedAt`, `_version`, `sampleTimes`: bare `Delta` codec whose
+///   width ClickHouse takes from the stored type, arrays included (defect 2)
 /// - `samples`: nullable field inside a named tuple (defect 3)
 /// - `v_device_activity`: declared source tables differ from the SQL (defect 4)
 /// - `v_readings_in_window`: control; must never appear
@@ -179,6 +180,16 @@ fn fixture(with_views: bool) -> InfrastructureMap {
             Column {
                 codec: Some("Delta, ZSTD(1)".to_string()),
                 ..column("_version", ColumnType::Int(IntType::UInt64))
+            },
+            Column {
+                codec: Some("Delta, ZSTD(1)".to_string()),
+                ..column(
+                    "sampleTimes",
+                    ColumnType::Array {
+                        element_type: Box::new(ColumnType::DateTime { precision: Some(3) }),
+                        element_nullable: false,
+                    },
+                )
             },
             column(
                 "samples",
