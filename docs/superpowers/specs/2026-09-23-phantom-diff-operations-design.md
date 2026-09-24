@@ -181,14 +181,17 @@ projection operation appears, so the cascade is covered.
 ### Reproduction harness
 
 An inline `#[cfg(test)]` module at
-`apps/cli/src/infrastructure/olap/clickhouse/reality_roundtrip_tests.rs`, gated
-on the `TCH_TEST_CLICKHOUSE_URL` environment variable. It has to be inline: the
-CLI crate is binary-only, so a test under `apps/cli/tests/` cannot reach its
-internals. That also matches the repository's convention of inline test
-modules. When the variable is absent the
-test skips with a printed reason, so `cargo test` stays container-free for
-contributors without Docker. A `docker-compose.test.yml` at the repository root
-pins the ClickHouse image for local use.
+`apps/cli/src/infrastructure/olap/clickhouse/reality_roundtrip_live.rs`. It has to
+be inline: the CLI crate is binary-only, so a test under `apps/cli/tests/`
+cannot reach its internals.
+
+It follows the convention `mutations_live.rs` already established for
+live-server tests: skipped unless `TC_LIVE_CLICKHOUSE=1` is set, connection
+details overridable through `TC_LIVE_CH_HOST`, `TC_LIVE_CH_PORT`,
+`TC_LIVE_CH_USER` and `TC_LIVE_CH_PASSWORD`, test names prefixed `live_`. So
+`cargo test` stays hermetic for contributors without Docker. A
+`docker-compose.test.yml` at the repository root pins the ClickHouse image and
+matches those defaults.
 
 The loop:
 
@@ -319,14 +322,17 @@ empty change set and naming the carrier on failure.
 
 ### CI
 
-A new `reality-roundtrip` job in `.github/workflows/test.yaml` using a GitHub
-service container. The image tag lives in `docker-compose.test.yml` and the
-workflow reads it from there, so the local and CI versions cannot drift. The job
-sets `TCH_TEST_CLICKHOUSE_URL` and runs `cargo test reality_roundtrip`.
+A new `reality-roundtrip` job in `.github/workflows/test.yaml` that starts
+ClickHouse with `docker compose -f docker-compose.test.yml up -d --wait`, so the
+image tag lives in one file and local and CI runs cannot drift. The job sets
+`TC_LIVE_CLICKHOUSE=1` and runs `cargo test live_reality -- --test-threads=1`,
+which selects only this harness; the heavier `mutations_live` tests stay
+manual.
 
 The existing `rust` job is unchanged, so contributors without Docker see no
-difference. `AGENTS.md` currently states the repository has no end-to-end tests;
-that line is amended rather than left inaccurate.
+difference. `AGENTS.md` states the repository has no end-to-end tests, which was
+already inaccurate once `mutations_live.rs` landed; the line is amended to
+describe the live-server test modules and how to run them.
 
 ## Risks
 
