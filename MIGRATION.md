@@ -12,6 +12,25 @@ capability listed there, it cannot migrate to 0.1.0 at all.
 
 ---
 
+## Upgrading within 0.x: plans stop repeating no-op changes
+
+Plans used to report changes that applying never removed: date-time string
+columns, `Delta`/`Gorilla` codecs on 8-byte types, nullable named-tuple fields,
+and views whose declared `baseTables` differ from their SQL. After upgrading,
+those disappear, and a plan against an unchanged deployment is empty.
+
+One change can appear once. The CLI now reads nullability inside named tuples
+correctly. If a live column has a `Nullable` tuple field that your code declares
+non-nullable, that mismatch was previously invisible and now shows as a
+`MODIFY COLUMN`. It is real: either apply it, or declare the field nullable to
+match the table.
+
+Editing only a view's `baseTables` no longer recreates the view, since its
+definition is unchanged. The new list still takes effect for dependency
+ordering.
+
+---
+
 ## Before you start
 
 `typed-clickhouse` is a ClickHouse schema-migration tool. It is a deliberately

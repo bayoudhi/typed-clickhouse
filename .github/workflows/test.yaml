@@ -49,6 +49,38 @@ jobs:
           $BIN generate migration --help
           $BIN migrate --help
 
+  reality-roundtrip:
+    name: Reality round-trip (live ClickHouse)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          version: "23.x"
+
+      - uses: actions/checkout@v4
+
+      # No `toolchain:` input, for the same reason as the `rust` job.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: true
+          cache-shared-key: ${{ runner.os }}-${{ runner.arch }}-rust
+          cache-on-failure: true
+          cache-all-crates: true
+
+      # The image tag lives only in docker-compose.test.yml, so local and CI
+      # runs use the same server.
+      - name: Start ClickHouse
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      # Plans against a schema this test just created, so any reported change
+      # is a phantom. Selects only this harness; mutations_live stays manual.
+      - name: Plan against a freshly created schema
+        env:
+          TC_LIVE_CLICKHOUSE: "1"
+        run: cargo test live_reality -- --test-threads=1
+
   typescript:
     name: TypeScript (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
