@@ -194,30 +194,18 @@ pub fn materialized_views_are_equivalent(
 }
 
 /// Checks if two Views are semantically equivalent.
-/// Compares source tables (order-independent) and normalized SELECT SQL.
-/// Uses default_database to normalize table references.
+///
+/// A view's DDL is its name, its database and its SELECT, so those are all
+/// that is compared; `select_sql` must already be normalized. `source_tables`
+/// is deliberately ignored: on the code side it is the dependency list the
+/// user declares, on the read-back side it is whatever the parser recovers
+/// from the SQL, and the two routinely disagree for joins and subqueries
+/// without the view differing at all. It still drives dependency ordering.
 pub fn views_are_equivalent(v1: &View, v2: &View, default_database: &str) -> bool {
-    // Compare names
-    if v1.name != v2.name {
-        return false;
-    }
-
-    // Compare view databases (where the view itself is created)
-    if normalize_database(&v1.database, default_database)
-        != normalize_database(&v2.database, default_database)
-    {
-        return false;
-    }
-
-    // Compare source tables (order-independent via HashSet)
-    let sources1 = normalize_source_tables(&v1.source_tables, default_database);
-    let sources2 = normalize_source_tables(&v2.source_tables, default_database);
-    if sources1 != sources2 {
-        return false;
-    }
-
-    // Compare SELECT SQL (must be pre-normalized via ClickHouse + Rust db prefix stripping)
-    v1.select_sql == v2.select_sql
+    v1.name == v2.name
+        && normalize_database(&v1.database, default_database)
+            == normalize_database(&v2.database, default_database)
+        && v1.select_sql == v2.select_sql
 }
 
 /// The Infrastructure Reality Checker compares actual infrastructure state with the infrastructure map.
@@ -661,7 +649,7 @@ impl<T: OlapOperations + Sync> InfraRealityChecker<T> {
                     .normalize_sql(&actual.select_sql, &infra_map.default_database)
                     .await
                     .unwrap_or_else(|e| {
-                        debug!("Failed to normalize actual SQL for MV '{}': {:?}", id, e);
+                        warn!("Failed to normalize actual SQL for MV '{}': {:?}", id, e);
                         actual.select_sql.clone()
                     });
                 let desired_sql_normalized = self
@@ -669,7 +657,7 @@ impl<T: OlapOperations + Sync> InfraRealityChecker<T> {
                     .normalize_sql(&desired.select_sql, &infra_map.default_database)
                     .await
                     .unwrap_or_else(|e| {
-                        debug!("Failed to normalize desired SQL for MV '{}': {:?}", id, e);
+                        warn!("Failed to normalize desired SQL for MV '{}': {:?}", id, e);
                         desired.select_sql.clone()
                     });
                 debug!(
@@ -754,12 +742,18 @@ impl<T: OlapOperations + Sync> InfraRealityChecker<T> {
                     .olap_client
                     .normalize_sql(&actual.select_sql, &infra_map.default_database)
                     .await
-                    .unwrap_or_else(|_| actual.select_sql.clone());
+                    .unwrap_or_else(|e| {
+                        warn!("Failed to normalize actual SQL for view '{}': {:?}", id, e);
+                        actual.select_sql.clone()
+                    });
                 let desired_sql_normalized = self
                     .olap_client
                     .normalize_sql(&desired.select_sql, &infra_map.default_database)
                     .await
-                    .unwrap_or_else(|_| desired.select_sql.clone());
+                    .unwrap_or_else(|e| {
+                        warn!("Failed to normalize desired SQL for view '{}': {:?}", id, e);
+                        desired.select_sql.clone()
+                    });
 
                 // Create copies with normalized SQL for comparison
                 let actual_normalized = View {
@@ -1822,5 +1816,42 @@ mod tests {
             views_are_equivalent(&view1, &view2, default_db),
             "Pre-normalized Views should be equivalent"
         );
+    }
+    #[test]
+    fn test_views_ignore_declared_source_tables() {
+        use crate::framework::core::infrastructure::view::View;
+
+        let default_db = "mydb";
+        // As declared in code: the user listed only the primary table.
+        let declared = View {
+            name: "v_device_activity".to_string(),
+            database: None,
+            select_sql: "SELECT r.id FROM readings AS r INNER JOIN devices AS d ON r.id = d.id"
+                .to_string(),
+            source_tables: vec!["`readings`".to_string()],
+            metadata: None,
+        };
+        // As read back: the parser found both tables.
+        let read_back = View {
+            database: Some(default_db.to_string()),
+            source_tables: vec!["readings".to_string(), "devices".to_string()],
+            ..declared.clone()
+        };
+        assert!(
+            views_are_equivalent(&declared, &read_back, default_db),
+            "identical SQL must not be recreated because the declared dependencies differ"
+        );
+
+        let changed_sql = View {
+            select_sql: "SELECT r.id FROM readings AS r".to_string(),
+            ..read_back.clone()
+        };
+        assert!(!views_are_equivalent(&declared, &changed_sql, default_db));
+
+        let moved = View {
+            database: Some("otherdb".to_string()),
+            ..read_back.clone()
+        };
+        assert!(!views_are_equivalent(&declared, &moved, default_db));
     }
 }
