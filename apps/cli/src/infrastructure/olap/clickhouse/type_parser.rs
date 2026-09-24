@@ -1714,7 +1714,16 @@ pub fn convert_ast_to_column_type(
             for element in elements.iter() {
                 match element {
                     TupleElement::Named { name, type_node } => {
-                        let (field_type, _) = convert_ast_to_column_type(type_node)?;
+                        // Tuple fields have no `required` flag like Nested
+                        // columns do, so nullability lives in the type,
+                        // as for JSON typed paths above.
+                        let (field_type, nullable) = convert_ast_to_column_type(type_node)?;
+                        let field_type =
+                            if nullable && !matches!(field_type, ColumnType::Nullable(_)) {
+                                ColumnType::Nullable(Box::new(field_type))
+                            } else {
+                                field_type
+                            };
                         fields.push((name.clone(), field_type));
                     }
                     TupleElement::Unnamed(_) => {
@@ -3251,6 +3260,45 @@ mod tests {
                 assert!(message.contains("out of range"));
             }
             _ => panic!("Expected InvalidParameters error"),
+        }
+    }
+    #[test]
+    fn named_tuple_fields_keep_nullability() {
+        let (column_type, is_nullable) =
+            convert_clickhouse_type_to_column_type("Array(Tuple(label String, ok Nullable(Bool)))")
+                .unwrap();
+
+        assert!(!is_nullable);
+        assert_eq!(
+            column_type,
+            ColumnType::Array {
+                element_type: Box::new(ColumnType::NamedTuple(vec![
+                    ("label".to_string(), ColumnType::String),
+                    (
+                        "ok".to_string(),
+                        ColumnType::Nullable(Box::new(ColumnType::Boolean))
+                    ),
+                ])),
+                element_nullable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn map_value_tuple_fields_keep_nullability() {
+        let (column_type, _) =
+            convert_clickhouse_type_to_column_type("Map(String, Tuple(score Nullable(Float64)))")
+                .unwrap();
+
+        match column_type {
+            ColumnType::Map { value_type, .. } => assert_eq!(
+                *value_type,
+                ColumnType::NamedTuple(vec![(
+                    "score".to_string(),
+                    ColumnType::Nullable(Box::new(ColumnType::Float(FloatType::Float64)))
+                )])
+            ),
+            other => panic!("expected Map, got {other:?}"),
         }
     }
 }
