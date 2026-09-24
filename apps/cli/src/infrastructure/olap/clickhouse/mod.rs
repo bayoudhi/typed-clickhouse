@@ -3498,6 +3498,69 @@ pub fn extract_table_ttl_from_create_query(create_query: &str) -> Option<String>
     }
 }
 
+/// Byte width ClickHouse substitutes for a bare `Delta` or `Gorilla`: the size
+/// of the stored value. `None` when that is not a fixed 1, 2, 4 or 8 bytes.
+fn codec_default_width(data_type: &ColumnType) -> Option<u8> {
+    use crate::framework::core::infrastructure::table::{FloatType, IntType};
+
+    match data_type {
+        ColumnType::Nullable(inner) => codec_default_width(inner),
+        ColumnType::Boolean | ColumnType::Int(IntType::Int8 | IntType::UInt8) => Some(1),
+        ColumnType::Date16 | ColumnType::Int(IntType::Int16 | IntType::UInt16) => Some(2),
+        ColumnType::Date
+        | ColumnType::DateTime { precision: None }
+        | ColumnType::Float(FloatType::Float32)
+        | ColumnType::Int(IntType::Int32 | IntType::UInt32) => Some(4),
+        // A DateTime with a precision is stored as DateTime64.
+        ColumnType::DateTime { precision: Some(_) }
+        | ColumnType::Float(FloatType::Float64)
+        | ColumnType::Int(IntType::Int64 | IntType::UInt64) => Some(8),
+        _ => None,
+    }
+}
+
+/// Expands bare codec names to the parameters ClickHouse stores for them.
+///
+/// `Delta` and `Gorilla` default to the byte width of the column's type, so
+/// the same codec reads back as `Delta(4)` on a `UInt32` and `Delta(8)` on a
+/// `UInt64`. When the width is unknown the codec is left as written: at worst
+/// a difference survives, never a real one hidden.
+pub fn normalize_codec_expression(expr: &str, data_type: &ColumnType) -> String {
+    let width = codec_default_width(data_type);
+    expr.split(',')
+        .map(|codec| {
+            let trimmed = codec.trim();
+            match (trimmed, width) {
+                ("Delta" | "Gorilla", Some(width)) => format!("{trimmed}({width})"),
+                ("ZSTD", _) => "ZSTD(1)".to_string(),
+                // DoubleDelta, LZ4, NONE, codecs with explicit params, and
+                // Delta/Gorilla on a type of unknown width stay as written.
+                _ => trimmed.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Checks if two codec expressions on a column of `data_type` are
+/// semantically equivalent after normalization.
+///
+/// For example, `Delta, LZ4` from user code is equivalent to `Delta(8), LZ4`
+/// from ClickHouse on a `UInt64` column.
+pub fn codec_expressions_are_equivalent(
+    before: &Option<String>,
+    after: &Option<String>,
+    data_type: &ColumnType,
+) -> bool {
+    match (before, after) {
+        (None, None) => true,
+        (Some(b), Some(a)) => {
+            normalize_codec_expression(b, data_type) == normalize_codec_expression(a, data_type)
+        }
+        _ => false,
+    }
+}
+
 /// Normalize a TTL expression to match ClickHouse's canonical form.
 /// Converts SQL INTERVAL syntax to toInterval* function calls that ClickHouse uses internally.
 /// Also removes trailing DELETE since it's the default action and ClickHouse may delete it implicitly.
@@ -3507,34 +3570,6 @@ pub fn extract_table_ttl_from_create_query(create_query: &str) -> Option<String>
 /// - "timestamp + INTERVAL 1 MONTH" → "timestamp + toIntervalMonth(1)"
 /// - "timestamp + INTERVAL 90 DAY DELETE" → "timestamp + toIntervalDay(90)"
 /// - "timestamp + toIntervalDay(90) DELETE" → "timestamp + toIntervalDay(90)"
-pub fn normalize_codec_expression(expr: &str) -> String {
-    expr.split(',')
-        .map(|codec| {
-            let trimmed = codec.trim();
-            match trimmed {
-                "Delta" => "Delta(4)",
-                "Gorilla" => "Gorilla(8)",
-                "ZSTD" => "ZSTD(1)",
-                // DoubleDelta, LZ4, NONE, and any codec with params stay as-is
-                _ => trimmed,
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Checks if two codec expressions are semantically equivalent after normalization.
-///
-/// This handles cases where ClickHouse normalizes codecs by adding default parameters.
-/// For example, "Delta, LZ4" from user code is equivalent to "Delta(4), LZ4" from ClickHouse.
-pub fn codec_expressions_are_equivalent(before: &Option<String>, after: &Option<String>) -> bool {
-    match (before, after) {
-        (None, None) => true,
-        (Some(b), Some(a)) => normalize_codec_expression(b) == normalize_codec_expression(a),
-        _ => false,
-    }
-}
-
 pub fn normalize_ttl_expression(expr: &str) -> String {
     use regex::Regex;
 
@@ -3690,6 +3725,7 @@ pub fn extract_column_ttls_from_create_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framework::core::infrastructure::table::{FloatType, IntType};
     use crate::infrastructure::olap::clickhouse::model::{ClickHouseColumnType, ClickHouseInt};
     use crate::infrastructure::olap::clickhouse::sql_parser::tests::NESTED_OBJECTS_SQL;
 
@@ -4261,105 +4297,190 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
         assert_eq!(normalize("(` id `)"), "id");
     }
 
+    fn uint32() -> ColumnType {
+        ColumnType::Int(IntType::UInt32)
+    }
+
+    fn float64() -> ColumnType {
+        ColumnType::Float(FloatType::Float64)
+    }
+
     #[test]
     fn test_normalize_codec_expression() {
-        // Test single codec without params - should add defaults
-        assert_eq!(normalize_codec_expression("Delta"), "Delta(4)");
-        assert_eq!(normalize_codec_expression("Gorilla"), "Gorilla(8)");
-        assert_eq!(normalize_codec_expression("ZSTD"), "ZSTD(1)");
-
-        // Test codecs with params - should stay as-is
-        assert_eq!(normalize_codec_expression("Delta(4)"), "Delta(4)");
-        assert_eq!(normalize_codec_expression("Gorilla(8)"), "Gorilla(8)");
-        assert_eq!(normalize_codec_expression("ZSTD(3)"), "ZSTD(3)");
-        assert_eq!(normalize_codec_expression("ZSTD(9)"), "ZSTD(9)");
-
-        // Test codecs that don't have default params
-        assert_eq!(normalize_codec_expression("DoubleDelta"), "DoubleDelta");
-        assert_eq!(normalize_codec_expression("LZ4"), "LZ4");
-        assert_eq!(normalize_codec_expression("NONE"), "NONE");
-
-        // Test codec chains
-        assert_eq!(normalize_codec_expression("Delta, LZ4"), "Delta(4), LZ4");
+        // Bare codecs gain ClickHouse's defaults
+        assert_eq!(normalize_codec_expression("Delta", &uint32()), "Delta(4)");
         assert_eq!(
-            normalize_codec_expression("Gorilla, ZSTD"),
+            normalize_codec_expression("Gorilla", &float64()),
+            "Gorilla(8)"
+        );
+        assert_eq!(normalize_codec_expression("ZSTD", &uint32()), "ZSTD(1)");
+
+        // Codecs with params stay as-is
+        assert_eq!(
+            normalize_codec_expression("Delta(4)", &uint32()),
+            "Delta(4)"
+        );
+        assert_eq!(
+            normalize_codec_expression("Gorilla(8)", &float64()),
+            "Gorilla(8)"
+        );
+        assert_eq!(normalize_codec_expression("ZSTD(3)", &uint32()), "ZSTD(3)");
+        assert_eq!(normalize_codec_expression("ZSTD(9)", &uint32()), "ZSTD(9)");
+
+        // Codecs without default params
+        assert_eq!(
+            normalize_codec_expression("DoubleDelta", &uint32()),
+            "DoubleDelta"
+        );
+        assert_eq!(normalize_codec_expression("LZ4", &uint32()), "LZ4");
+        assert_eq!(normalize_codec_expression("NONE", &uint32()), "NONE");
+
+        // Chains
+        assert_eq!(
+            normalize_codec_expression("Delta, LZ4", &uint32()),
+            "Delta(4), LZ4"
+        );
+        assert_eq!(
+            normalize_codec_expression("Gorilla, ZSTD", &float64()),
             "Gorilla(8), ZSTD(1)"
         );
         assert_eq!(
-            normalize_codec_expression("Delta, ZSTD(3)"),
+            normalize_codec_expression("Delta, ZSTD(3)", &uint32()),
             "Delta(4), ZSTD(3)"
         );
         assert_eq!(
-            normalize_codec_expression("DoubleDelta, LZ4"),
+            normalize_codec_expression("DoubleDelta, LZ4", &uint32()),
             "DoubleDelta, LZ4"
         );
 
-        // Test whitespace handling
-        assert_eq!(normalize_codec_expression("Delta,LZ4"), "Delta(4), LZ4");
+        // Whitespace
         assert_eq!(
-            normalize_codec_expression("  Delta  ,  LZ4  "),
+            normalize_codec_expression("Delta,LZ4", &uint32()),
+            "Delta(4), LZ4"
+        );
+        assert_eq!(
+            normalize_codec_expression("  Delta  ,  LZ4  ", &uint32()),
             "Delta(4), LZ4"
         );
 
-        // Test already normalized expressions
-        assert_eq!(normalize_codec_expression("Delta(4), LZ4"), "Delta(4), LZ4");
+        // Already normalized
         assert_eq!(
-            normalize_codec_expression("Gorilla(8), ZSTD(3)"),
+            normalize_codec_expression("Delta(4), LZ4", &uint32()),
+            "Delta(4), LZ4"
+        );
+        assert_eq!(
+            normalize_codec_expression("Gorilla(8), ZSTD(3)", &float64()),
             "Gorilla(8), ZSTD(3)"
         );
     }
 
     #[test]
     fn test_codec_expressions_are_equivalent() {
-        // Test None vs None
-        assert!(codec_expressions_are_equivalent(&None, &None));
+        let t = uint32();
+        let some = |s: &str| Some(s.to_string());
 
-        // Test Some vs None
+        assert!(codec_expressions_are_equivalent(&None, &None, &t));
         assert!(!codec_expressions_are_equivalent(
-            &Some("ZSTD(3)".to_string()),
-            &None
+            &some("ZSTD(3)"),
+            &None,
+            &t
         ));
-
-        // Test same codec
         assert!(codec_expressions_are_equivalent(
-            &Some("ZSTD(3)".to_string()),
-            &Some("ZSTD(3)".to_string())
+            &some("ZSTD(3)"),
+            &some("ZSTD(3)"),
+            &t
         ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(4)"),
+            &t
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Gorilla"),
+            &some("Gorilla(8)"),
+            &float64()
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("ZSTD"),
+            &some("ZSTD(1)"),
+            &t
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta, LZ4"),
+            &some("Delta(4), LZ4"),
+            &t
+        ));
+        assert!(!codec_expressions_are_equivalent(
+            &some("ZSTD(3)"),
+            &some("ZSTD(9)"),
+            &t
+        ));
+        assert!(!codec_expressions_are_equivalent(
+            &some("Delta, LZ4"),
+            &some("Delta, ZSTD"),
+            &t
+        ));
+    }
 
-        // Test normalization: user writes "Delta", ClickHouse returns "Delta(4)"
+    #[test]
+    fn codec_width_follows_the_stored_type() {
+        let some = |s: &str| Some(s.to_string());
+        let uint64 = ColumnType::Int(IntType::UInt64);
+        // DateTime with a precision is stored as the 8-byte DateTime64.
+        let datetime64 = ColumnType::DateTime { precision: Some(3) };
+        let datetime = ColumnType::DateTime { precision: None };
+
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta, ZSTD(1)"),
+            &some("Delta(8), ZSTD(1)"),
+            &uint64
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta,ZSTD(1)"),
+            &some("Delta(8), ZSTD(1)"),
+            &datetime64
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(4)"),
+            &datetime
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(2)"),
+            &ColumnType::Date16
+        ));
+        assert!(codec_expressions_are_equivalent(
+            &some("Gorilla"),
+            &some("Gorilla(4)"),
+            &ColumnType::Float(FloatType::Float32)
+        ));
+        // A width the type does not have is a real difference.
+        assert!(!codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(4)"),
+            &uint64
+        ));
+        // Unknown width: leave the codec as written rather than guess.
+        assert_eq!(
+            normalize_codec_expression("Delta", &ColumnType::String),
+            "Delta"
+        );
+        assert!(!codec_expressions_are_equivalent(
+            &some("Delta"),
+            &some("Delta(8)"),
+            &ColumnType::String
+        ));
+    }
+
+    #[test]
+    fn codec_width_sees_through_nullable() {
+        let nullable_datetime64 =
+            ColumnType::Nullable(Box::new(ColumnType::DateTime { precision: Some(3) }));
         assert!(codec_expressions_are_equivalent(
             &Some("Delta".to_string()),
-            &Some("Delta(4)".to_string())
-        ));
-
-        // Test normalization: user writes "Gorilla", ClickHouse returns "Gorilla(8)"
-        assert!(codec_expressions_are_equivalent(
-            &Some("Gorilla".to_string()),
-            &Some("Gorilla(8)".to_string())
-        ));
-
-        // Test normalization: user writes "ZSTD", ClickHouse returns "ZSTD(1)"
-        assert!(codec_expressions_are_equivalent(
-            &Some("ZSTD".to_string()),
-            &Some("ZSTD(1)".to_string())
-        ));
-
-        // Test chain normalization
-        assert!(codec_expressions_are_equivalent(
-            &Some("Delta, LZ4".to_string()),
-            &Some("Delta(4), LZ4".to_string())
-        ));
-
-        // Test different codecs
-        assert!(!codec_expressions_are_equivalent(
-            &Some("ZSTD(3)".to_string()),
-            &Some("ZSTD(9)".to_string())
-        ));
-
-        // Test different chains
-        assert!(!codec_expressions_are_equivalent(
-            &Some("Delta, LZ4".to_string()),
-            &Some("Delta, ZSTD".to_string())
+            &Some("Delta(8)".to_string()),
+            &nullable_datetime64
         ));
     }
 

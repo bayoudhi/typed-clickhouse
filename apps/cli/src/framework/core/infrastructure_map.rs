@@ -2455,7 +2455,9 @@ fn columns_are_equivalent(
 
     // Special handling for codec comparison: normalize both expressions before comparing
     // This handles cases where ClickHouse adds default parameters (e.g., Delta → Delta(4))
-    if !codec_expressions_are_equivalent(&before.codec, &after.codec) {
+    // The codec width depends on the column type. If the types differ, the
+    // type comparison below reports the change regardless of this result.
+    if !codec_expressions_are_equivalent(&before.codec, &after.codec, &after.data_type) {
         return false;
     }
 
@@ -4843,25 +4845,38 @@ mod diff_tests {
         };
         assert!(!columns_are_equivalent(&col_zstd3, &col_zstd9, &[]));
 
+        // Tests 6-8: bare Delta and Gorilla take their width from the column
+        // type, so they need a numeric column (ClickHouse rejects them on String).
+        let uint32_col = Column {
+            data_type: ColumnType::Int(
+                crate::framework::core::infrastructure::table::IntType::UInt32,
+            ),
+            ..base_col.clone()
+        };
+        let float64_col = Column {
+            data_type: ColumnType::Float(FloatType::Float64),
+            ..base_col.clone()
+        };
+
         // Test 6: Normalized codec comparison - user "Delta" vs ClickHouse "Delta(4)"
         let col_user_delta = Column {
             codec: Some("Delta".to_string()),
-            ..base_col.clone()
+            ..uint32_col.clone()
         };
         let col_ch_delta = Column {
             codec: Some("Delta(4)".to_string()),
-            ..base_col.clone()
+            ..uint32_col.clone()
         };
         assert!(columns_are_equivalent(&col_user_delta, &col_ch_delta, &[]));
 
         // Test 7: Normalized codec comparison - user "Gorilla" vs ClickHouse "Gorilla(8)"
         let col_user_gorilla = Column {
             codec: Some("Gorilla".to_string()),
-            ..base_col.clone()
+            ..float64_col.clone()
         };
         let col_ch_gorilla = Column {
             codec: Some("Gorilla(8)".to_string()),
-            ..base_col.clone()
+            ..float64_col.clone()
         };
         assert!(columns_are_equivalent(
             &col_user_gorilla,
@@ -4872,11 +4887,11 @@ mod diff_tests {
         // Test 8: Normalized chain comparison - "Delta, LZ4" vs "Delta(4), LZ4"
         let col_user_chain = Column {
             codec: Some("Delta, LZ4".to_string()),
-            ..base_col.clone()
+            ..uint32_col.clone()
         };
         let col_ch_chain = Column {
             codec: Some("Delta(4), LZ4".to_string()),
-            ..base_col.clone()
+            ..uint32_col.clone()
         };
         assert!(columns_are_equivalent(&col_user_chain, &col_ch_chain, &[]));
     }
