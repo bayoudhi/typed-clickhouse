@@ -14,6 +14,29 @@ const shared: Partial<Options> = {
   define: { __TCH_VERSION__: JSON.stringify(version) },
 };
 
+// The lineage analyzer imports `typescript`, but it is build tooling and
+// tree-shakes out of this entry. esbuild still keeps an external import that
+// nothing uses, which leaves a top-level `require("typescript")`, so anyone
+// bundling this package ships the whole compiler. Resolving it to a local
+// side-effect-free module lets esbuild drop it. If code on this path ever does
+// use `typescript`, the module stays in the bundle and throws on load.
+const dropUnusedTypescriptImport: NonNullable<
+  Options["esbuildPlugins"]
+>[number] = {
+  name: "drop-unused-typescript-import",
+  setup(build) {
+    build.onResolve({ filter: /^typescript$/ }, () => ({
+      path: "typescript",
+      namespace: "unused-typescript",
+      sideEffects: false,
+    }));
+    build.onLoad({ filter: /.*/, namespace: "unused-typescript" }, () => ({
+      contents:
+        'export default undefined; throw new Error("The main entry must not use typescript");',
+    }));
+  },
+};
+
 const libraryConfig: Options = {
   ...shared,
   entry: ["src/index.ts"],
@@ -29,7 +52,10 @@ const libraryConfig: Options = {
   dts: true,
   sourcemap: true,
   clean: true,
-  noExternal: ["@typed-clickhouse/lib"],
+  // `typescript` is listed here so tsup's external plugin leaves it for
+  // `dropUnusedTypescriptImport`, which would otherwise never see it.
+  noExternal: ["@typed-clickhouse/lib", "typescript"],
+  esbuildPlugins: [dropUnusedTypescriptImport],
   external: [
     "@clickhouse/client",
     "@clickhouse/client-web",
@@ -37,7 +63,6 @@ const libraryConfig: Options = {
     "jose",
     "toml",
     "typia",
-    "typescript",
     "fs",
     "path",
     "process",
