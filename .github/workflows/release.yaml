@@ -141,6 +141,16 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: ${{ matrix.build.TARGET }}
+          # Release binaries always build from scratch. The action's rust-cache
+          # key is job-based and leaves out the matrix target, so linux-x64 and
+          # linux-arm64 share one entry, and whichever leg saves first wins. The
+          # arm64 leg compiles its build scripts in the Debian-based rust-cross
+          # image (newer glibc); the x64 leg runs in manylinux_2_28 (glibc
+          # 2.28). v0.2.1's x64 leg restored an arm64-saved target/ from a dry
+          # run on main and died with "version `GLIBC_2.34' not found" from
+          # libc's build script. A per-target key would still reuse a target/
+          # across changes to the `:latest` manylinux images, so no cache at all.
+          cache: false
 
       # No sccache. maturin compiles inside its own manylinux container, so the
       # wrapper never saw a single compile request on any leg ("compile_requests":0,
