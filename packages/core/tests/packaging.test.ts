@@ -25,6 +25,13 @@ describe("packaging", () => {
     assert.deepEqual(offenders, []);
   });
 
+  it("does not load the TypeScript compiler from the main entry", () => {
+    for (const file of ["index.js", "index.mjs"]) {
+      const source = readFileSync(join(root, "dist", file), "utf-8");
+      assert.doesNotMatch(source, /require\("typescript"\)|from "typescript"/);
+    }
+  });
+
   it("is published as @typed-clickhouse/core", () => {
     assert.equal(pkg.name, "@typed-clickhouse/core");
   });
