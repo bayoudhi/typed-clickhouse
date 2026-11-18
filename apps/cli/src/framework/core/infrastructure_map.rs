@@ -1981,6 +1981,7 @@ impl InfrastructureMap {
             target_database: parsed.target_database,
             metadata,
             life_cycle: crate::framework::core::partial_infrastructure_map::LifeCycle::FullyManaged,
+            refresh: None,
         })
     }
 

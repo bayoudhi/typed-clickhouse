@@ -3,7 +3,13 @@
 //! The forked `sqlparser` has no ClickHouse `REFRESH` grammar, so this module
 //! models the schedule, renders it, and hand-parses it out of SQL text.
 
+use protobuf::MessageField;
 use serde::{Deserialize, Serialize};
+
+use crate::proto::infrastructure_map::{
+    refresh_schedule, RefreshInterval as ProtoRefreshInterval,
+    RefreshSchedule as ProtoRefreshSchedule,
+};
 
 /// Unit of a refresh interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -87,7 +93,90 @@ pub struct RefreshSchedule {
     pub unmodelled: Option<String>,
 }
 
+impl IntervalUnit {
+    fn from_proto_str(unit: &str) -> Option<Self> {
+        Some(match unit {
+            "SECOND" => IntervalUnit::Second,
+            "MINUTE" => IntervalUnit::Minute,
+            "HOUR" => IntervalUnit::Hour,
+            "DAY" => IntervalUnit::Day,
+            "WEEK" => IntervalUnit::Week,
+            "MONTH" => IntervalUnit::Month,
+            "YEAR" => IntervalUnit::Year,
+            _ => return None,
+        })
+    }
+}
+
+impl RefreshInterval {
+    fn to_proto(&self) -> ProtoRefreshInterval {
+        ProtoRefreshInterval {
+            value: self.value,
+            unit: self.unit.as_sql().to_string(),
+            special_fields: Default::default(),
+        }
+    }
+
+    /// `None` when the stored unit is not a known one.
+    fn from_proto(proto: &ProtoRefreshInterval) -> Option<Self> {
+        Some(RefreshInterval {
+            value: proto.value,
+            unit: IntervalUnit::from_proto_str(&proto.unit)?,
+        })
+    }
+}
+
 impl RefreshSchedule {
+    /// Convert to proto representation.
+    pub fn to_proto(&self) -> ProtoRefreshSchedule {
+        let interval = self.interval.to_proto();
+        let kind = match self.kind {
+            RefreshKind::Every => refresh_schedule::Kind::Every(interval),
+            RefreshKind::After => refresh_schedule::Kind::After(interval),
+        };
+        ProtoRefreshSchedule {
+            kind: Some(kind),
+            offset: MessageField::from_option(self.offset.as_ref().map(|o| o.to_proto())),
+            randomize_for: MessageField::from_option(
+                self.randomize_for.as_ref().map(|o| o.to_proto()),
+            ),
+            append: self.append,
+            unmodelled: self.unmodelled.clone(),
+            special_fields: Default::default(),
+        }
+    }
+
+    /// Create from proto representation.
+    ///
+    /// A missing kind or an unknown unit yields [`RefreshSchedule::unparsed`],
+    /// so a damaged stored schedule never equals a code-side one.
+    pub fn from_proto(proto: ProtoRefreshSchedule) -> Self {
+        let (kind, interval) = match &proto.kind {
+            Some(refresh_schedule::Kind::Every(i)) => (RefreshKind::Every, i),
+            Some(refresh_schedule::Kind::After(i)) => (RefreshKind::After, i),
+            None => return Self::unparsed("stored refresh schedule has no kind"),
+        };
+        let optional = |field: &MessageField<ProtoRefreshInterval>| match field.as_ref() {
+            Some(i) => RefreshInterval::from_proto(i).map(Some),
+            None => Some(None),
+        };
+        match (
+            RefreshInterval::from_proto(interval),
+            optional(&proto.offset),
+            optional(&proto.randomize_for),
+        ) {
+            (Some(interval), Some(offset), Some(randomize_for)) => RefreshSchedule {
+                kind,
+                interval,
+                offset,
+                randomize_for,
+                append: proto.append,
+                unmodelled: proto.unmodelled,
+            },
+            _ => Self::unparsed("stored refresh schedule has an unknown interval unit"),
+        }
+    }
+
     /// The clause without APPEND: `REFRESH EVERY 1 DAY OFFSET 10 HOUR`.
     pub fn schedule_sql(&self) -> String {
         let kind = match self.kind {

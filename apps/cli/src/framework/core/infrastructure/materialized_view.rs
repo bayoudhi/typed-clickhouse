@@ -23,6 +23,7 @@ use crate::proto::infrastructure_map::{
     TableReference as ProtoTableReference,
 };
 
+use super::refresh::RefreshSchedule;
 use super::table::Metadata;
 use super::{DataLineage, InfrastructureSignature};
 
@@ -130,6 +131,10 @@ pub struct MaterializedView {
     /// Controls whether the CLI can drop or modify the MV automatically.
     #[serde(default, deserialize_with = "deserialize_nullable_as_default")]
     pub life_cycle: LifeCycle,
+
+    /// Refresh schedule; `Some` makes this a refreshable materialized view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<RefreshSchedule>,
 }
 
 impl MaterializedView {
@@ -149,6 +154,7 @@ impl MaterializedView {
             target_database: None,
             metadata: None,
             life_cycle: LifeCycle::FullyManaged,
+            refresh: None,
         }
     }
 
@@ -178,9 +184,15 @@ impl MaterializedView {
 
     /// Generates the CREATE MATERIALIZED VIEW SQL statement
     pub fn to_create_sql(&self) -> String {
+        let refresh = self
+            .refresh
+            .as_ref()
+            .map(|r| format!(" {}", r.to_create_clause()))
+            .unwrap_or_default();
         format!(
-            "CREATE MATERIALIZED VIEW IF NOT EXISTS {} TO {} AS {}",
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS {}{} TO {} AS {}",
             self.quoted_name(),
+            refresh,
             self.quoted_target_table(),
             self.select_sql
         )
@@ -248,6 +260,7 @@ impl MaterializedView {
                 LifeCycle::DeletionProtected => ProtoLifeCycle::DELETION_PROTECTED.into(),
                 LifeCycle::ExternallyManaged => ProtoLifeCycle::EXTERNALLY_MANAGED.into(),
             },
+            refresh: MessageField::from_option(self.refresh.as_ref().map(|r| r.to_proto())),
             special_fields: Default::default(),
         }
     }
@@ -296,6 +309,7 @@ impl MaterializedView {
             target_database,
             metadata,
             life_cycle,
+            refresh: proto.refresh.into_option().map(RefreshSchedule::from_proto),
         }
     }
 }
@@ -351,6 +365,127 @@ impl DataLineage for MaterializedView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::framework::core::infrastructure::refresh::{
+        IntervalUnit, RefreshInterval, RefreshKind,
+    };
+
+    fn full_schedule() -> RefreshSchedule {
+        RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: 1,
+                unit: IntervalUnit::Day,
+            },
+            offset: Some(RefreshInterval {
+                value: 10,
+                unit: IntervalUnit::Hour,
+            }),
+            randomize_for: Some(RefreshInterval {
+                value: 5,
+                unit: IntervalUnit::Minute,
+            }),
+            append: true,
+            unmodelled: Some("DEPENDS ON x".to_string()),
+        }
+    }
+
+    #[test]
+    fn create_sql_with_refresh() {
+        let mut mv = MaterializedView::new("mv", "SELECT 1", vec![], "t");
+        mv.refresh = Some(RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: 1,
+                unit: IntervalUnit::Day,
+            },
+            offset: Some(RefreshInterval {
+                value: 10,
+                unit: IntervalUnit::Hour,
+            }),
+            randomize_for: None,
+            append: false,
+            unmodelled: None,
+        });
+        assert_eq!(
+            mv.to_create_sql(),
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS `mv` REFRESH EVERY 1 DAY OFFSET 10 HOUR TO `t` AS SELECT 1"
+        );
+    }
+
+    #[test]
+    fn create_sql_without_refresh_unchanged() {
+        let mv = MaterializedView::new("mv", "SELECT 1", vec![], "t");
+        assert_eq!(
+            mv.to_create_sql(),
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS `mv` TO `t` AS SELECT 1"
+        );
+    }
+
+    #[test]
+    fn proto_round_trip_with_refresh() {
+        let mut mv = MaterializedView::new("mv", "SELECT 1", vec![], "t");
+        mv.refresh = Some(full_schedule());
+        assert_eq!(MaterializedView::from_proto(mv.to_proto()), mv);
+    }
+
+    #[test]
+    fn proto_round_trip_after_kind() {
+        let mut schedule = full_schedule();
+        schedule.kind = RefreshKind::After;
+        let restored = RefreshSchedule::from_proto(schedule.to_proto());
+        assert_eq!(restored, schedule);
+    }
+
+    #[test]
+    fn proto_without_field_7_loads_none() {
+        let proto = ProtoMaterializedView {
+            name: "mv".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(MaterializedView::from_proto(proto).refresh, None);
+    }
+
+    #[test]
+    fn proto_with_unknown_unit_or_missing_kind_is_unparsed() {
+        let mut proto = full_schedule().to_proto();
+        proto.offset.as_mut().unwrap().unit = "FORTNIGHT".to_string();
+        let restored = RefreshSchedule::from_proto(proto);
+        assert!(restored.unmodelled.is_some());
+        assert_ne!(restored, full_schedule());
+
+        let mut proto = full_schedule().to_proto();
+        proto.kind = None;
+        assert!(RefreshSchedule::from_proto(proto).unmodelled.is_some());
+    }
+
+    #[test]
+    fn deserializes_ts_json() {
+        let json = r#"{"name":"mv","selectSql":"SELECT 1","sourceTables":[],"targetTable":"t","refresh":{"kind":"every","interval":{"value":1,"unit":"DAY"},"offset":{"value":10,"unit":"HOUR"},"append":false}}"#;
+        let mv: MaterializedView = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            mv.refresh,
+            Some(RefreshSchedule {
+                kind: RefreshKind::Every,
+                interval: RefreshInterval {
+                    value: 1,
+                    unit: IntervalUnit::Day
+                },
+                offset: Some(RefreshInterval {
+                    value: 10,
+                    unit: IntervalUnit::Hour
+                }),
+                randomize_for: None,
+                append: false,
+                unmodelled: None,
+            })
+        );
+    }
+
+    #[test]
+    fn json_without_refresh_omits_key() {
+        let mv = MaterializedView::new("mv", "SELECT 1", vec![], "t");
+        assert!(!serde_json::to_string(&mv).unwrap().contains("refresh"));
+    }
 
     #[test]
     fn test_table_reference_qualified_name() {

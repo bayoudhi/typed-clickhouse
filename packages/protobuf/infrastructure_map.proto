@@ -287,6 +287,30 @@ message MaterializedView {
   optional Metadata metadata = 5;
   // Lifecycle management policy for the materialized view
   LifeCycle life_cycle = 6;
+  // Refresh schedule; present only for refreshable materialized views
+  optional RefreshSchedule refresh = 7;
+}
+
+// A length of time such as `10 HOUR`.
+message RefreshInterval {
+  uint64 value = 1;
+  // Upper-case singular unit: SECOND, MINUTE, HOUR, DAY, WEEK, MONTH, YEAR
+  string unit = 2;
+}
+
+// The REFRESH clause of a refreshable materialized view.
+message RefreshSchedule {
+  oneof kind {
+    // REFRESH EVERY: wall-clock schedule
+    RefreshInterval every = 1;
+    // REFRESH AFTER: relative to the previous refresh
+    RefreshInterval after = 2;
+  }
+  optional RefreshInterval offset = 3;
+  optional RefreshInterval randomize_for = 4;
+  bool append = 5;
+  // Reality-only: clause text the CLI does not model
+  optional string unmodelled = 6;
 }
 
 message TopicToTableSyncProcess {
