@@ -37,6 +37,20 @@ impl IntervalUnit {
         }
     }
 
+    /// The unit's length in its base: seconds for SECOND..WEEK, months for
+    /// MONTH and YEAR. The two bases do not convert into each other.
+    fn base_factor(self) -> (IntervalBase, u64) {
+        match self {
+            IntervalUnit::Second => (IntervalBase::Seconds, 1),
+            IntervalUnit::Minute => (IntervalBase::Seconds, 60),
+            IntervalUnit::Hour => (IntervalBase::Seconds, 3_600),
+            IntervalUnit::Day => (IntervalBase::Seconds, 86_400),
+            IntervalUnit::Week => (IntervalBase::Seconds, 604_800),
+            IntervalUnit::Month => (IntervalBase::Months, 1),
+            IntervalUnit::Year => (IntervalBase::Months, 12),
+        }
+    }
+
     fn parse(word: &str) -> Option<Self> {
         let upper = word.to_ascii_uppercase();
         let singular = upper.strip_suffix('S').unwrap_or(&upper);
@@ -53,6 +67,12 @@ impl IntervalUnit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntervalBase {
+    Seconds,
+    Months,
+}
+
 /// A length of time such as `10 HOUR`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RefreshInterval {
@@ -61,6 +81,14 @@ pub struct RefreshInterval {
 }
 
 impl RefreshInterval {
+    /// The length in a unit-independent form. The server rewrites intervals
+    /// (`24 HOUR` is stored as `1 DAY`, `90 SECOND` as `1 MINUTE 30 SECOND`),
+    /// so two intervals mean the same schedule when this is equal.
+    fn canonical(&self) -> (IntervalBase, u64) {
+        let (base, factor) = self.unit.base_factor();
+        (base, self.value.saturating_mul(factor))
+    }
+
     fn sql(&self) -> String {
         format!("{} {}", self.value, self.unit.as_sql())
     }
@@ -217,6 +245,28 @@ impl RefreshSchedule {
         }
     }
 
+    /// Equality as the server sees it: intervals are compared by length, not
+    /// by spelling, because the server stores `24 HOUR` as `1 DAY`.
+    pub fn is_equivalent(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.append == other.append
+            && self.unmodelled == other.unmodelled
+            && self.same_timing(other)
+    }
+
+    fn same_timing(&self, other: &Self) -> bool {
+        fn same(a: &Option<RefreshInterval>, b: &Option<RefreshInterval>) -> bool {
+            match (a, b) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.canonical() == b.canonical(),
+                _ => false,
+            }
+        }
+        self.interval.canonical() == other.interval.canonical()
+            && same(&self.offset, &other.offset)
+            && same(&self.randomize_for, &other.randomize_for)
+    }
+
     /// True when the two differ only in kind/interval/offset/randomize_for.
     ///
     /// False when either side carries `unmodelled`, or when `append` differs
@@ -225,10 +275,7 @@ impl RefreshSchedule {
         self.unmodelled.is_none()
             && other.unmodelled.is_none()
             && self.append == other.append
-            && (self.kind != other.kind
-                || self.interval != other.interval
-                || self.offset != other.offset
-                || self.randomize_for != other.randomize_for)
+            && (self.kind != other.kind || !self.same_timing(other))
     }
 }
 
@@ -347,6 +394,41 @@ fn parse_interval(
     tokens: &[Token],
     idx: &mut usize,
 ) -> Result<RefreshInterval, RefreshParseError> {
+    let (mut value, mut unit) = parse_interval_part(src, tokens, idx)?;
+    // The server spells some intervals as several parts (`1 MINUTE 30 SECOND`).
+    // Fold them into one interval in the smallest unit used.
+    while let (Some(n), Some(u)) = (tokens.get(*idx), tokens.get(*idx + 1)) {
+        let follows = n.kind == TokenKind::Number
+            && u.kind == TokenKind::Word
+            && IntervalUnit::parse(text(src, Some(u))).is_some();
+        if !follows {
+            break;
+        }
+        let (next_value, next_unit) = parse_interval_part(src, tokens, idx)?;
+        let (base, factor) = unit.base_factor();
+        let (next_base, next_factor) = next_unit.base_factor();
+        if base != next_base {
+            return Err(RefreshParseError::BadInterval(
+                text(src, Some(n)).to_string(),
+            ));
+        }
+        let total = value * factor + next_value * next_factor;
+        let smallest = if next_factor < factor {
+            next_unit
+        } else {
+            unit
+        };
+        value = total / smallest.base_factor().1;
+        unit = smallest;
+    }
+    Ok(RefreshInterval { value, unit })
+}
+
+fn parse_interval_part(
+    src: &str,
+    tokens: &[Token],
+    idx: &mut usize,
+) -> Result<(u64, IntervalUnit), RefreshParseError> {
     let number = tokens.get(*idx);
     let bad = || RefreshParseError::BadInterval(text(src, number).to_string());
     let value = match number {
@@ -362,7 +444,7 @@ fn parse_interval(
         _ => return Err(bad()),
     };
     *idx += 2;
-    Ok(RefreshInterval { value, unit })
+    Ok((value, unit))
 }
 
 /// Parses the modelled prefix of a clause; returns the schedule and the index
@@ -615,6 +697,58 @@ mod tests {
             ..every_day()
         };
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn parses_compound_intervals_the_server_writes() {
+        let parsed = parse_refresh_clause(
+            "REFRESH EVERY 1 DAY 12 HOUR OFFSET 1 MINUTE 30 SECOND RANDOMIZE FOR 2 HOUR",
+        )
+        .unwrap();
+        assert_eq!(parsed.interval, iv(36, IntervalUnit::Hour));
+        assert_eq!(parsed.offset, Some(iv(90, IntervalUnit::Second)));
+        assert_eq!(parsed.randomize_for, Some(iv(2, IntervalUnit::Hour)));
+        assert_eq!(
+            parse_refresh_clause("REFRESH EVERY 1 YEAR 3 MONTH")
+                .unwrap()
+                .interval,
+            iv(15, IntervalUnit::Month)
+        );
+        // Months and seconds do not mix.
+        assert!(matches!(
+            parse_refresh_clause("REFRESH EVERY 1 MONTH 3 DAY"),
+            Err(RefreshParseError::BadInterval(_))
+        ));
+    }
+
+    #[test]
+    fn equivalence_ignores_how_the_server_respells_intervals() {
+        // Observed: EVERY 24 HOUR is stored as EVERY 1 DAY.
+        let code = RefreshSchedule {
+            interval: iv(24, IntervalUnit::Hour),
+            ..every_day()
+        };
+        let reality = parse_refresh_clause("REFRESH EVERY 1 DAY").unwrap();
+        assert_ne!(code, reality);
+        assert!(code.is_equivalent(&reality));
+        let offset_code = RefreshSchedule {
+            offset: Some(iv(120, IntervalUnit::Minute)),
+            ..every_day()
+        };
+        let offset_reality = parse_refresh_clause("REFRESH EVERY 1 DAY OFFSET 2 HOUR").unwrap();
+        assert!(offset_code.is_equivalent(&offset_reality));
+        // Differences that matter still differ.
+        assert!(!code.is_equivalent(&RefreshSchedule {
+            interval: iv(25, IntervalUnit::Hour),
+            ..every_day()
+        }));
+        assert!(!code.is_equivalent(&RefreshSchedule {
+            append: true,
+            ..every_day()
+        }));
+        assert!(!offset_code.is_equivalent(&every_day()));
+        // A respelling is not a schedule change, so no MODIFY REFRESH is needed.
+        assert!(!code.differs_only_in_schedule(&reality));
     }
 
     #[test]

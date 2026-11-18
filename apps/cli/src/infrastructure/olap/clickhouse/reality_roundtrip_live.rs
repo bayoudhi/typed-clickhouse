@@ -25,6 +25,10 @@ use serde_json::json;
 use super::diff_strategy::{ddl_relevant_annotations, ClickHouseTableDiffStrategy};
 use super::queries::ClickhouseEngine;
 use super::{create_client, run_query, ClickHouseConfig};
+use crate::framework::core::infrastructure::materialized_view::MaterializedView;
+use crate::framework::core::infrastructure::refresh::{
+    split_refresh_clause, IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+};
 use crate::framework::core::infrastructure::table::{
     Column, ColumnType, IntType, OrderBy, Table, TableProjection,
 };
@@ -37,6 +41,7 @@ use crate::framework::core::partial_infrastructure_map::LifeCycle;
 use crate::framework::core::plan::{
     normalize_infra_map_for_comparison, reconcile_with_reality, ReconciliationFilter,
 };
+use crate::infrastructure::olap::ddl_ordering::{order_olap_changes, AtomicOlapOperation};
 use crate::project::Project;
 
 const DB: &str = "typed_clickhouse_roundtrip_test";
@@ -170,6 +175,8 @@ fn empty_map() -> InfrastructureMap {
 ///   parse; ClickHouse stores the canonical lower-case names (defect 5)
 /// - `v_window_devices`: reads a parameterized view as a table function,
 ///   whose name the formatter quotes on one side only (defect 6)
+/// - `mv_device_snapshot`: refreshable MV (`EVERY 1 DAY OFFSET 10 HOUR`) into
+///   `device_snapshot`; the clause is stored in `create_table_query`
 /// - `p_by_device`: references modified columns, so it cascades from 1 and 2
 ///
 /// ClickHouse checks that a view's sources exist, so the schema is built in
@@ -244,6 +251,28 @@ fn fixture(stage: Stage) -> InfrastructureMap {
     }
 
     if stage >= Stage::Views {
+        let snapshot = table(
+            "device_snapshot",
+            vec![
+                column("id", ColumnType::String),
+                column("readings", ColumnType::Int(IntType::UInt64)),
+            ],
+            &["id"],
+            ClickhouseEngine::ReplacingMergeTree {
+                ver: None,
+                is_deleted: None,
+            },
+        );
+        map.tables.insert(snapshot.id(DB), snapshot);
+
+        let mv = snapshot_view(
+            "SELECT d.id AS id, count(r.deviceId) AS readings \
+             FROM devices AS d \
+             LEFT JOIN sensor_readings AS r ON d.id = r.deviceId \
+             GROUP BY d.id",
+        );
+        map.materialized_views.insert(mv.name.clone(), mv);
+
         let views = [
             View {
                 name: "v_device_activity".to_string(),
@@ -315,6 +344,101 @@ GROUP BY d.id, d.label"
     }
 
     map
+}
+
+fn every(value: u64, unit: IntervalUnit) -> RefreshInterval {
+    RefreshInterval { value, unit }
+}
+
+/// The refreshable view of the fixture, over the given SELECT.
+fn snapshot_view(select_sql: &str) -> MaterializedView {
+    MaterializedView {
+        name: "mv_device_snapshot".to_string(),
+        database: None,
+        select_sql: select_sql.to_string(),
+        source_tables: vec!["`devices`".to_string(), "`sensor_readings`".to_string()],
+        target_table: "device_snapshot".to_string(),
+        target_database: None,
+        metadata: None,
+        life_cycle: LifeCycle::FullyManaged,
+        refresh: Some(RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: every(1, IntervalUnit::Day),
+            offset: Some(every(10, IntervalUnit::Hour)),
+            randomize_for: None,
+            append: false,
+            unmodelled: None,
+        }),
+    }
+}
+
+/// A copy of `map` with the snapshot view changed by `f`.
+fn with_snapshot_view(
+    map: &InfrastructureMap,
+    f: impl FnOnce(&mut MaterializedView),
+) -> InfrastructureMap {
+    let mut copy = map.clone();
+    f(copy
+        .materialized_views
+        .get_mut("mv_device_snapshot")
+        .expect("fixture has the snapshot view"));
+    copy
+}
+
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct CountRow {
+    count: u64,
+}
+
+#[derive(clickhouse::Row, serde::Deserialize)]
+struct TextRow {
+    text: String,
+}
+
+async fn count_rows(sql: &str) -> u64 {
+    create_client(config())
+        .client
+        .query(sql)
+        .fetch_one::<CountRow>()
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {sql}\n{e}"))
+        .count
+}
+
+async fn text_of(sql: &str) -> String {
+    create_client(config())
+        .client
+        .query(sql)
+        .fetch_one::<TextRow>()
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {sql}\n{e}"))
+        .text
+}
+
+async fn create_table_query(name: &str) -> String {
+    text_of(&format!(
+        "SELECT create_table_query AS text FROM system.tables \
+         WHERE database = '{DB}' AND name = '{name}'"
+    ))
+    .await
+}
+
+async fn exec(sql: &str) {
+    run_query(sql, &create_client(config()))
+        .await
+        .unwrap_or_else(|e| panic!("statement failed: {sql}\n{e}"));
+}
+
+/// Builds and applies the whole fixture on a fresh database.
+async fn apply_full_fixture(project: &Project) -> InfrastructureMap {
+    reset_database().await;
+    let tables = fixture(Stage::Tables);
+    let views = fixture(Stage::Views);
+    let full = fixture(Stage::DependentViews);
+    apply(project, &empty_map(), &tables).await;
+    apply(project, &tables, &views).await;
+    apply(project, &views, &full).await;
+    full
 }
 
 /// Starts from an empty database. The executor checks readiness through a
@@ -440,5 +564,187 @@ async fn live_reality_roundtrip_plans_nothing() {
         "planner reported {} phantom change(s) against a database it just created:\n{}",
         phantoms.len(),
         phantoms.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn live_refresh_schedule_change_is_modify_only() {
+    if !enabled() {
+        eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
+        return;
+    }
+
+    let project = project();
+    let full = apply_full_fixture(&project).await;
+    let changed = with_snapshot_view(&full, |mv| {
+        mv.refresh.as_mut().unwrap().interval = every(2, IntervalUnit::Day);
+    });
+
+    let changes = plan_against_reality(&project, &changed).await;
+    assert!(
+        matches!(
+            changes.olap_changes.as_slice(),
+            [OlapChange::MaterializedView(Change::Updated { .. })]
+        ),
+        "expected one materialized view update, got: {:?}",
+        changes.olap_changes
+    );
+    let (teardown, setup) = order_olap_changes(&changes.olap_changes, DB).unwrap();
+    assert!(teardown.is_empty(), "unexpected teardown: {teardown:?}");
+    match setup.as_slice() {
+        [AtomicOlapOperation::ModifyMaterializedViewRefresh { mv, .. }] => {
+            assert_eq!(mv.name, "mv_device_snapshot");
+        }
+        other => panic!("expected exactly one ModifyMaterializedViewRefresh, got {other:?}"),
+    }
+
+    apply(&project, &full, &changed).await;
+
+    let after = plan_against_reality(&project, &changed).await;
+    let phantoms: Vec<String> = after.olap_changes.iter().map(describe).collect();
+    assert!(
+        phantoms.is_empty(),
+        "changes remain after MODIFY REFRESH:\n{}",
+        phantoms.join("\n")
+    );
+    let create = create_table_query("mv_device_snapshot").await;
+    assert!(
+        create.contains("EVERY 2 DAY"),
+        "server did not record the new schedule: {create}"
+    );
+}
+
+#[tokio::test]
+async fn live_refresh_select_change_keeps_target_rows() {
+    if !enabled() {
+        eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
+        return;
+    }
+
+    let project = project();
+    let full = apply_full_fixture(&project).await;
+
+    exec(&format!(
+        "INSERT INTO `{DB}`.`devices` VALUES ('a', 'A'), ('b', 'B')"
+    ))
+    .await;
+    exec(&format!("SYSTEM REFRESH VIEW `{DB}`.`mv_device_snapshot`")).await;
+    exec(&format!("SYSTEM WAIT VIEW `{DB}`.`mv_device_snapshot`")).await;
+    let before_rows = count_rows(&format!(
+        "SELECT count() AS count FROM `{DB}`.`device_snapshot`"
+    ))
+    .await;
+    assert!(before_rows > 0, "the refresh did not fill device_snapshot");
+    let uuid_sql = format!(
+        "SELECT toString(uuid) AS text FROM system.tables \
+         WHERE database = '{DB}' AND name = 'device_snapshot'"
+    );
+    let uuid_before = text_of(&uuid_sql).await;
+
+    let changed = with_snapshot_view(&full, |mv| {
+        mv.select_sql.push_str(" HAVING readings >= 0");
+    });
+    let changes = plan_against_reality(&project, &changed).await;
+    assert!(
+        matches!(
+            changes.olap_changes.as_slice(),
+            [OlapChange::MaterializedView(Change::Updated { .. })]
+        ),
+        "expected one materialized view update and no table change, got: {:?}",
+        changes.olap_changes
+    );
+    let (teardown, setup) = order_olap_changes(&changes.olap_changes, DB).unwrap();
+    assert!(
+        matches!(
+            teardown.as_slice(),
+            [AtomicOlapOperation::DropMaterializedView { mv, .. }] if mv.name == "mv_device_snapshot"
+        ),
+        "expected only a view drop, got {teardown:?}"
+    );
+    assert!(
+        matches!(
+            setup.as_slice(),
+            [AtomicOlapOperation::CreateMaterializedView { mv, .. }] if mv.name == "mv_device_snapshot"
+        ),
+        "expected only a view create, got {setup:?}"
+    );
+
+    apply(&project, &full, &changed).await;
+
+    // No SYSTEM REFRESH here: the rows must already be there, because the
+    // target table was never dropped. Its identity must be unchanged too.
+    let rows = count_rows(&format!(
+        "SELECT count() AS count FROM `{DB}`.`device_snapshot`"
+    ))
+    .await;
+    assert!(rows > 0, "device_snapshot was emptied by the view change");
+    assert_eq!(
+        text_of(&uuid_sql).await,
+        uuid_before,
+        "device_snapshot was recreated"
+    );
+}
+
+#[tokio::test]
+async fn live_mv_without_to_does_not_fail_plan() {
+    if !enabled() {
+        eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
+        return;
+    }
+
+    let project = project();
+    let full = apply_full_fixture(&project).await;
+    exec(&format!(
+        "CREATE MATERIALIZED VIEW `{DB}`.`stray` REFRESH EVERY 1 HOUR \
+         ENGINE = MergeTree ORDER BY tuple() AS SELECT 1 AS x"
+    ))
+    .await;
+
+    let changes = plan_against_reality(&project, &full).await;
+    let reported: Vec<String> = changes.olap_changes.iter().map(describe).collect();
+    assert!(
+        reported.is_empty(),
+        "planning with a TO-less view present reported changes:\n{}",
+        reported.join("\n")
+    );
+}
+
+#[tokio::test]
+async fn live_records_server_spelling() {
+    if !enabled() {
+        eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
+        return;
+    }
+
+    reset_database().await;
+    exec(&format!(
+        "CREATE TABLE `{DB}`.`spelling_target` (x UInt8) ENGINE = MergeTree ORDER BY x"
+    ))
+    .await;
+    exec(&format!(
+        "CREATE MATERIALIZED VIEW `{DB}`.`spelling_mv` REFRESH EVERY 24 HOUR \
+         TO `{DB}`.`spelling_target` AS SELECT 1 AS x"
+    ))
+    .await;
+
+    let create = create_table_query("spelling_mv").await;
+    let (_, parsed) = split_refresh_clause(&create);
+    let expected = RefreshSchedule {
+        kind: RefreshKind::Every,
+        interval: every(24, IntervalUnit::Hour),
+        offset: None,
+        randomize_for: None,
+        append: false,
+        unmodelled: None,
+    };
+    let rewritten = !create.contains("EVERY 24 HOUR");
+    assert!(
+        parsed.as_ref().is_some_and(|p| p.is_equivalent(&expected)),
+        "schedule did not round-trip, got {parsed:?}; server {} `24 HOUR`; create_table_query = {create}",
+        if rewritten { "rewrote" } else { "kept" }
+    );
+    eprintln!(
+        "server {} `EVERY 24 HOUR`; create_table_query = {create}",
+        if rewritten { "rewrote" } else { "kept" }
     );
 }

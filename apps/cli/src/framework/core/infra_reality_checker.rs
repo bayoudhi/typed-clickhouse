@@ -182,9 +182,12 @@ pub fn materialized_views_are_equivalent(
         return false;
     }
 
-    // Compare the refresh schedule by value
-    if mv1.refresh != mv2.refresh {
-        return false;
+    // Compare the refresh schedule
+    // Intervals are compared by length: the server stores `24 HOUR` as `1 DAY`.
+    match (&mv1.refresh, &mv2.refresh) {
+        (None, None) => {}
+        (Some(a), Some(b)) if a.is_equivalent(b) => {}
+        _ => return false,
     }
 
     // Compare source tables (order-independent via HashSet). A refreshable view
@@ -1841,6 +1844,20 @@ mod tests {
         assert!(!materialized_views_are_equivalent(&a, &none, "mydb"));
         assert!(!materialized_views_are_equivalent(&none, &a, "mydb"));
         assert!(materialized_views_are_equivalent(&a, &a.clone(), "mydb"));
+    }
+
+    #[test]
+    fn respelled_interval_is_equivalent() {
+        use crate::framework::core::infrastructure::refresh::{IntervalUnit, RefreshInterval};
+        // The server stores EVERY 24 HOUR as EVERY 1 DAY.
+        let mut code = every_days(1);
+        code.interval = RefreshInterval {
+            value: 24,
+            unit: IntervalUnit::Hour,
+        };
+        let a = refresh_test_mv(&["a"], Some(code));
+        let b = refresh_test_mv(&["a"], Some(every_days(1)));
+        assert!(materialized_views_are_equivalent(&a, &b, "mydb"));
     }
 
     #[test]
