@@ -641,6 +641,30 @@ mod tests {
     }
 
     #[test]
+    fn split_ignores_unquoted_as_inside_parens() {
+        let (sql, s) = split_refresh_clause(
+            "CREATE MATERIALIZED VIEW mv REFRESH EVERY 1 HOUR TO t (x String DEFAULT CAST(1 AS String)) AS SELECT 1 AS x",
+        );
+        assert_eq!(
+            sql,
+            "CREATE MATERIALIZED VIEW mv TO t (x String DEFAULT CAST(1 AS String)) AS SELECT 1 AS x"
+        );
+        assert_eq!(
+            s,
+            Some(RefreshSchedule {
+                interval: iv(1, IntervalUnit::Hour),
+                ..every_day()
+            })
+        );
+    }
+
+    #[test]
+    fn split_ignores_unquoted_refresh_inside_parens() {
+        let src = "CREATE MATERIALIZED VIEW mv TO t (refresh String, x String DEFAULT CAST(1 AS String)) AS SELECT 1 AS x";
+        assert_eq!(split_refresh_clause(src), (src.to_string(), None));
+    }
+
+    #[test]
     fn split_ignores_view_named_refresh() {
         let src = "CREATE MATERIALIZED VIEW refresh TO t AS SELECT 1";
         assert_eq!(split_refresh_clause(src), (src.to_string(), None));
