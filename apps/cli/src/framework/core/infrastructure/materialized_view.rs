@@ -445,17 +445,53 @@ mod tests {
         assert_eq!(MaterializedView::from_proto(proto).refresh, None);
     }
 
-    #[test]
-    fn proto_with_unknown_unit_or_missing_kind_is_unparsed() {
-        let mut proto = full_schedule().to_proto();
-        proto.offset.as_mut().unwrap().unit = "FORTNIGHT".to_string();
-        let restored = RefreshSchedule::from_proto(proto);
-        assert!(restored.unmodelled.is_some());
-        assert_ne!(restored, full_schedule());
+    fn schedule_without_unmodelled() -> RefreshSchedule {
+        RefreshSchedule {
+            unmodelled: None,
+            ..full_schedule()
+        }
+    }
 
-        let mut proto = full_schedule().to_proto();
+    fn assert_unparsed(restored: RefreshSchedule) {
+        assert!(restored.unmodelled.is_some());
+        assert_ne!(restored, schedule_without_unmodelled());
+        assert_eq!(
+            restored,
+            RefreshSchedule::unparsed(restored.unmodelled.as_deref().unwrap())
+        );
+    }
+
+    #[test]
+    fn proto_with_unknown_interval_unit_is_unparsed() {
+        let mut proto = schedule_without_unmodelled().to_proto();
+        match proto.kind.as_mut().unwrap() {
+            crate::proto::infrastructure_map::refresh_schedule::Kind::Every(i)
+            | crate::proto::infrastructure_map::refresh_schedule::Kind::After(i) => {
+                i.unit = "FORTNIGHT".to_string()
+            }
+        }
+        assert_unparsed(RefreshSchedule::from_proto(proto));
+    }
+
+    #[test]
+    fn proto_with_unknown_offset_unit_is_unparsed() {
+        let mut proto = schedule_without_unmodelled().to_proto();
+        proto.offset.as_mut().unwrap().unit = "FORTNIGHT".to_string();
+        assert_unparsed(RefreshSchedule::from_proto(proto));
+    }
+
+    #[test]
+    fn proto_with_unknown_randomize_for_unit_is_unparsed() {
+        let mut proto = schedule_without_unmodelled().to_proto();
+        proto.randomize_for.as_mut().unwrap().unit = "day".to_string();
+        assert_unparsed(RefreshSchedule::from_proto(proto));
+    }
+
+    #[test]
+    fn proto_with_missing_kind_is_unparsed() {
+        let mut proto = schedule_without_unmodelled().to_proto();
         proto.kind = None;
-        assert!(RefreshSchedule::from_proto(proto).unmodelled.is_some());
+        assert_unparsed(RefreshSchedule::from_proto(proto));
     }
 
     #[test]

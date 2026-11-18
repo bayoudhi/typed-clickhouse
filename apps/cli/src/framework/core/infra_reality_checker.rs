@@ -1768,7 +1768,6 @@ mod tests {
             source_tables: vec!["source".to_string()],
             metadata: None,
             life_cycle: crate::framework::core::partial_infrastructure_map::LifeCycle::FullyManaged,
-
             refresh: None,
         };
 
@@ -1781,7 +1780,6 @@ mod tests {
             source_tables: vec!["source".to_string()],
             metadata: None,
             life_cycle: crate::framework::core::partial_infrastructure_map::LifeCycle::FullyManaged,
-
             refresh: None,
         };
 
