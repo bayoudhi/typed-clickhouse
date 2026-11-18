@@ -605,6 +605,42 @@ mod tests {
     }
 
     #[test]
+    fn split_leaves_select_body_intact_when_clause_present() {
+        let (sql, s) = split_refresh_clause(
+            "CREATE MATERIALIZED VIEW mv REFRESH EVERY 1 DAY OFFSET 10 HOUR TO t AS SELECT refresh, ' TO ' AS x FROM s",
+        );
+        assert_eq!(
+            sql,
+            "CREATE MATERIALIZED VIEW mv TO t AS SELECT refresh, ' TO ' AS x FROM s"
+        );
+        assert_eq!(
+            s,
+            Some(RefreshSchedule {
+                offset: Some(iv(10, IntervalUnit::Hour)),
+                ..every_day()
+            })
+        );
+    }
+
+    #[test]
+    fn split_ignores_as_and_to_in_column_list() {
+        let (sql, s) = split_refresh_clause(
+            "CREATE MATERIALIZED VIEW `db`.`mv` REFRESH EVERY 1 HOUR TO `db`.`t` (`to` String, `as` String) AS SELECT 'x' AS `to`, 'y' AS `as` FROM src",
+        );
+        assert_eq!(
+            sql,
+            "CREATE MATERIALIZED VIEW `db`.`mv` TO `db`.`t` (`to` String, `as` String) AS SELECT 'x' AS `to`, 'y' AS `as` FROM src"
+        );
+        assert_eq!(
+            s,
+            Some(RefreshSchedule {
+                interval: iv(1, IntervalUnit::Hour),
+                ..every_day()
+            })
+        );
+    }
+
+    #[test]
     fn split_ignores_view_named_refresh() {
         let src = "CREATE MATERIALIZED VIEW refresh TO t AS SELECT 1";
         assert_eq!(split_refresh_clause(src), (src.to_string(), None));
