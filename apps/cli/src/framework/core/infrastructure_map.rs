@@ -773,7 +773,9 @@ impl InfrastructureMap {
         filtered_changes: &mut Vec<FilteredChange>,
         respect_life_cycle: bool,
     ) {
-        use crate::framework::core::infra_reality_checker::materialized_views_are_equivalent;
+        use crate::framework::core::infra_reality_checker::{
+            is_refresh_schedule_only_change, materialized_views_are_equivalent,
+        };
 
         tracing::info!(
             "Analyzing materialized view differences between {} source MVs and {} target MVs",
@@ -790,18 +792,31 @@ impl InfrastructureMap {
                 // Use semantic equivalence check instead of plain !=
                 if !materialized_views_are_equivalent(mv, target_mv, default_database) {
                     tracing::debug!("Materialized view '{}' has differences", id);
-                    // MV update = DROP + CREATE in ClickHouse. Block if drop-protected.
-                    // Check the AFTER lifecycle (target_mv) to handle transitions.
-                    if respect_life_cycle && target_mv.life_cycle.is_drop_protected() {
+                    // An MV update is DROP + CREATE in ClickHouse, except a
+                    // schedule-only change, which is an in-place MODIFY REFRESH.
+                    // Block DROP + CREATE if drop-protected, and any update if
+                    // externally managed. Check the AFTER lifecycle (target_mv)
+                    // to handle transitions.
+                    let modify_only =
+                        is_refresh_schedule_only_change(mv, target_mv, default_database);
+                    let blocked = target_mv.life_cycle.is_any_modification_protected()
+                        || (!modify_only && target_mv.life_cycle.is_drop_protected());
+                    if respect_life_cycle && blocked {
+                        let operation = if modify_only {
+                            "MODIFY REFRESH"
+                        } else {
+                            "DROP+CREATE"
+                        };
                         tracing::warn!(
-                            "Blocking update of {:?} materialized view '{}' (update requires DROP+CREATE)",
+                            "Blocking update of {:?} materialized view '{}' (update requires {})",
                             target_mv.life_cycle,
-                            id
+                            id,
+                            operation
                         );
                         filtered_changes.push(FilteredChange {
                             reason: format!(
-                                "MaterializedView '{}' has {:?} lifecycle - UPDATE (DROP+CREATE) blocked",
-                                mv.name, target_mv.life_cycle
+                                "MaterializedView '{}' has {:?} lifecycle - UPDATE ({}) blocked",
+                                mv.name, target_mv.life_cycle, operation
                             ),
                             change: OlapChange::MaterializedView(Change::Updated {
                                 before: Box::new(mv.clone()),
@@ -6625,6 +6640,78 @@ mod diff_select_row_policy_tests {
             );
             assert_eq!(changes.len(), 1);
             assert_eq!(populations(&changes), 0);
+        }
+
+        /// Diffs one view from `before` to `after` under `life_cycle` with
+        /// lifecycle respected; returns (applied, filtered).
+        fn diff_protected(
+            before: MaterializedView,
+            after: MaterializedView,
+            life_cycle: LifeCycle,
+        ) -> (Vec<OlapChange>, Vec<FilteredChange>) {
+            let before = MaterializedView {
+                life_cycle,
+                ..before
+            };
+            let after = MaterializedView {
+                life_cycle,
+                ..after
+            };
+            let mut changes = vec![];
+            let mut filtered = vec![];
+            InfrastructureMap::diff_materialized_views(
+                &HashMap::from([(before.name.clone(), before)]),
+                &HashMap::from([(after.name.clone(), after)]),
+                &HashMap::new(),
+                false,
+                DEFAULT_DATABASE_NAME,
+                &mut changes,
+                &mut filtered,
+                true,
+            );
+            (changes, filtered)
+        }
+
+        #[test]
+        fn deletion_protected_allows_schedule_only_change() {
+            let (changes, filtered) = diff_protected(
+                mv("v", Some(refresh(1))),
+                mv("v", Some(refresh(2))),
+                LifeCycle::DeletionProtected,
+            );
+            assert!(filtered.is_empty(), "filtered: {filtered:?}");
+            assert!(matches!(
+                changes.as_slice(),
+                [OlapChange::MaterializedView(Change::Updated { .. })]
+            ));
+        }
+
+        #[test]
+        fn deletion_protected_still_blocks_drop_create_change() {
+            let mut changed_select = mv("v", Some(refresh(1)));
+            changed_select.select_sql = "SELECT 2".to_string();
+            let mut appended = refresh(2);
+            appended.append = true;
+            for after in [changed_select, mv("v", Some(appended))] {
+                let (changes, filtered) = diff_protected(
+                    mv("v", Some(refresh(1))),
+                    after,
+                    LifeCycle::DeletionProtected,
+                );
+                assert!(changes.is_empty(), "applied: {changes:?}");
+                assert_eq!(filtered.len(), 1);
+            }
+        }
+
+        #[test]
+        fn externally_managed_blocks_schedule_only_change() {
+            let (changes, filtered) = diff_protected(
+                mv("v", Some(refresh(1))),
+                mv("v", Some(refresh(2))),
+                LifeCycle::ExternallyManaged,
+            );
+            assert!(changes.is_empty(), "applied: {changes:?}");
+            assert_eq!(filtered.len(), 1);
         }
 
         #[test]

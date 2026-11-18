@@ -1414,7 +1414,7 @@ fn handle_sql_resource_update(
     plan
 }
 
-use crate::framework::core::infra_reality_checker::materialized_views_are_equivalent;
+use crate::framework::core::infra_reality_checker::is_refresh_schedule_only_change;
 use crate::framework::core::infrastructure::materialized_view::MaterializedView;
 use crate::framework::core::infrastructure::view::View;
 
@@ -1471,23 +1471,14 @@ fn handle_materialized_view_update(
 ) -> OperationPlan {
     // A schedule-only change on a refreshable view is applied in place with
     // `ALTER TABLE ... MODIFY REFRESH`: no drop, no recreate, nothing to backfill.
-    if let (Some(before_refresh), Some(after_refresh)) = (&before.refresh, &after.refresh) {
-        if before_refresh.differs_only_in_schedule(after_refresh) {
-            let mut before_with_new_schedule = before.clone();
-            before_with_new_schedule.refresh = after.refresh.clone();
-            if materialized_views_are_equivalent(&before_with_new_schedule, after, default_database)
-            {
-                return OperationPlan::setup(vec![
-                    AtomicOlapOperation::ModifyMaterializedViewRefresh {
-                        mv: after.clone(),
-                        dependency_info: create_dependency_info(
-                            after.pulls_data_from(default_database),
-                            after.pushes_data_to(default_database),
-                        ),
-                    },
-                ]);
-            }
-        }
+    if is_refresh_schedule_only_change(before, after, default_database) {
+        return OperationPlan::setup(vec![AtomicOlapOperation::ModifyMaterializedViewRefresh {
+            mv: after.clone(),
+            dependency_info: create_dependency_info(
+                after.pulls_data_from(default_database),
+                after.pushes_data_to(default_database),
+            ),
+        }]);
     }
 
     let before_pulls = before.pulls_data_from(default_database);

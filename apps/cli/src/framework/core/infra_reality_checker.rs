@@ -146,6 +146,27 @@ fn normalize_source_tables(tables: &[String], default_database: &str) -> HashSet
 
 /// Checks if two MaterializedViews are semantically equivalent.
 /// Compares target table, source tables (order-independent), and normalized SELECT SQL.
+/// True when `before` and `after` differ only in their refresh schedule, in a
+/// way `ALTER TABLE … MODIFY REFRESH` can apply in place: no drop, no
+/// recreate. The planner emits that statement exactly when this holds, and
+/// lifecycle protection lets such a change through for deletion-protected
+/// views, so both decide from this one predicate.
+pub fn is_refresh_schedule_only_change(
+    before: &MaterializedView,
+    after: &MaterializedView,
+    default_database: &str,
+) -> bool {
+    let (Some(before_refresh), Some(after_refresh)) = (&before.refresh, &after.refresh) else {
+        return false;
+    };
+    if !before_refresh.differs_only_in_schedule(after_refresh) {
+        return false;
+    }
+    let mut before_with_new_schedule = before.clone();
+    before_with_new_schedule.refresh = after.refresh.clone();
+    materialized_views_are_equivalent(&before_with_new_schedule, after, default_database)
+}
+
 /// Uses default_database to normalize `None` database references.
 ///
 /// Note: `life_cycle` is intentionally excluded — it is CLI-managed metadata and does not

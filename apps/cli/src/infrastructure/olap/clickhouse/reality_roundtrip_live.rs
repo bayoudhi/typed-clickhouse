@@ -651,6 +651,24 @@ async fn live_refresh_schedule_change_on_append_view_is_modify_only() {
 }
 
 #[tokio::test]
+async fn live_refresh_schedule_change_on_deletion_protected_view_is_modify_only() {
+    if !enabled() {
+        eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
+        return;
+    }
+
+    let project = project();
+    let full = apply_full_fixture(&project).await;
+    // A lifecycle change alone emits no DDL; the schedule change after it is
+    // a MODIFY REFRESH, which deletion protection must let through.
+    let protected = with_snapshot_view(&full, |mv| {
+        mv.life_cycle = LifeCycle::DeletionProtected;
+    });
+    apply(&project, &full, &protected).await;
+    assert_schedule_change_is_modify_only(&project, &protected).await;
+}
+
+#[tokio::test]
 async fn live_unmodelled_refresh_is_not_equal_to_plain_schedule() {
     if !enabled() {
         eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
