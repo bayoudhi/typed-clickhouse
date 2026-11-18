@@ -1981,7 +1981,7 @@ impl InfrastructureMap {
             target_database: parsed.target_database,
             metadata,
             life_cycle: crate::framework::core::partial_infrastructure_map::LifeCycle::FullyManaged,
-            refresh: None,
+            refresh: parsed.refresh,
         })
     }
 
@@ -5788,6 +5788,46 @@ mod normalize_tests {
     use super::*;
     use crate::framework::core::infrastructure::sql_resource::SqlResource;
     use crate::framework::core::infrastructure::InfrastructureSignature;
+
+    #[test]
+    fn migrates_refreshable_sql_resource() {
+        let resource = SqlResource {
+            name: "mv".to_string(),
+            database: None,
+            source_file: None,
+            source_line: None,
+            source_column: None,
+            setup: vec![
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS mv REFRESH EVERY 1 DAY OFFSET 10 HOUR TO t AS SELECT a FROM s".to_string(),
+            ],
+            teardown: vec!["DROP VIEW IF EXISTS mv".to_string()],
+            pulls_data_from: vec![],
+            pushes_data_to: vec![],
+        };
+        let mv = InfrastructureMap::try_migrate_sql_resource_to_mv(&resource, "local")
+            .expect("refreshable MV should migrate");
+        assert_eq!(mv.target_table, "t");
+        assert!(mv.refresh.is_some());
+    }
+
+    #[test]
+    fn multi_statement_refresh_resource_not_migrated() {
+        let resource = SqlResource {
+            name: "mv".to_string(),
+            database: None,
+            source_file: None,
+            source_line: None,
+            source_column: None,
+            setup: vec![
+                "DROP VIEW IF EXISTS mv".to_string(),
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS mv REFRESH EVERY 1 DAY TO t AS SELECT a FROM s".to_string(),
+            ],
+            teardown: vec!["DROP VIEW IF EXISTS mv".to_string()],
+            pulls_data_from: vec![],
+            pushes_data_to: vec![],
+        };
+        assert!(InfrastructureMap::try_migrate_sql_resource_to_mv(&resource, "local").is_none());
+    }
 
     #[test]
     fn test_normalize_converts_materialized_view_sql_resource() {
