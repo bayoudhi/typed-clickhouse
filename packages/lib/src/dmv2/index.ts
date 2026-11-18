@@ -51,6 +51,9 @@ export { ClickHouseEngines } from "../dataModels/types";
 export {
   MaterializedView,
   MaterializedViewConfig,
+  RefreshConfig,
+  RefreshInterval,
+  IntervalUnit,
 } from "./sdk/materializedView";
 export { SqlResource } from "./sdk/sqlResource";
 export { View } from "./sdk/view";

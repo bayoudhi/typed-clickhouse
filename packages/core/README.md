@@ -154,6 +154,22 @@ export async function handler(event: any) {
 | `database` | `string?` | `"my_database"` (optional — only needed if your OlapTable configs don't specify `database`) |
 | `useSSL` | `boolean` | `true` |
 
+### Refreshable materialized views
+
+Pass `refresh` to `MaterializedView` to re-run the SELECT on a schedule instead of on every insert:
+
+```typescript
+new MaterializedView<DeviceSnapshot>({
+  materializedViewName: "device_snapshot_mv",
+  targetTable: { name: "device_snapshot" },
+  selectTables: [devices],
+  selectStatement: "SELECT id, count() AS n FROM devices GROUP BY id",
+  refresh: { every: "1 DAY", offset: "2 HOUR" }, // or { after: "10 MINUTE" }
+});
+```
+
+Intervals are `"<positive integer> <SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|YEAR>"`. `offset` is only valid with `every`; `randomizeFor` and `append: true` are optional.
+
 ## What's Included
 
 | Export | Description |

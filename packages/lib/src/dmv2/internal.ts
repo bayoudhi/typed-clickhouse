@@ -31,7 +31,8 @@ import {
 import type { TableProjection } from "./sdk/olapTable";
 import { compilerLog } from "../commons";
 import { WebApp } from "./sdk/webApp";
-import { MaterializedView } from "./sdk/materializedView";
+import { MaterializedView, normalizeRefresh } from "./sdk/materializedView";
+import type { RefreshJson } from "./sdk/materializedView";
 import { View } from "./sdk/view";
 import { SelectRowPolicy } from "./sdk/selectRowPolicy";
 import {
@@ -506,6 +507,8 @@ interface MaterializedViewJson {
   metadata?: { [key: string]: any };
   /** Optional lifecycle management policy */
   lifeCycle?: string;
+  /** Optional refresh schedule (refreshable materialized view) */
+  refresh?: RefreshJson;
 }
 
 /**
@@ -1146,6 +1149,9 @@ export const toInfraMap = (registry: InternalRegistry) => {
       targetDatabase: mv.targetTable.config.database,
       metadata: mv.metadata,
       lifeCycle: mv.lifeCycle,
+      ...(mv.refresh !== undefined && {
+        refresh: normalizeRefresh(mv.refresh, mv.name),
+      }),
     };
   });
 

@@ -20,6 +20,119 @@ function formatTableReference(table: OlapTable<any> | View): string {
   return `\`${table.name}\``;
 }
 
+/** Time units accepted in a refresh interval. */
+export type IntervalUnit =
+  | "SECOND"
+  | "MINUTE"
+  | "HOUR"
+  | "DAY"
+  | "WEEK"
+  | "MONTH"
+  | "YEAR";
+
+/** A refresh interval such as `"1 DAY"` or `"10 HOUR"`. */
+export type RefreshInterval = `${number} ${IntervalUnit}`;
+
+/**
+ * Schedule for a refreshable materialized view.
+ * `every` runs on a fixed schedule (optionally shifted by `offset`);
+ * `after` waits the interval after the previous refresh finishes.
+ * `offset` is only valid with `every`.
+ */
+export type RefreshConfig =
+  | {
+      every: RefreshInterval;
+      offset?: RefreshInterval;
+      randomizeFor?: RefreshInterval;
+      append?: boolean;
+    }
+  | {
+      after: RefreshInterval;
+      offset?: never;
+      randomizeFor?: RefreshInterval;
+      append?: boolean;
+    };
+
+/** @internal Normalised interval as serialised to the infra map. */
+export interface RefreshIntervalJson {
+  value: number;
+  unit: IntervalUnit;
+}
+
+/** @internal Normalised refresh schedule as serialised to the infra map. */
+export interface RefreshJson {
+  kind: "every" | "after";
+  interval: RefreshIntervalJson;
+  offset?: RefreshIntervalJson;
+  randomizeFor?: RefreshIntervalJson;
+  append: boolean;
+}
+
+const INTERVAL_UNITS: readonly string[] = [
+  "SECOND",
+  "MINUTE",
+  "HOUR",
+  "DAY",
+  "WEEK",
+  "MONTH",
+  "YEAR",
+];
+
+const parseRefreshInterval = (
+  input: string,
+  viewName: string,
+): RefreshIntervalJson => {
+  const match = /^\s*(\d+)\s+([A-Za-z]+?)S?\s*$/i.exec(String(input));
+  const value = match ? Number(match[1]) : NaN;
+  const unit = match ? match[2].toUpperCase() : "";
+  if (
+    !match ||
+    !Number.isSafeInteger(value) ||
+    value <= 0 ||
+    !INTERVAL_UNITS.includes(unit)
+  ) {
+    throw new Error(
+      `Invalid refresh interval '${input}' on materialized view '${viewName}': expected '<positive integer> <SECOND|MINUTE|HOUR|DAY|WEEK|MONTH|YEAR>'`,
+    );
+  }
+  return { value, unit: unit as IntervalUnit };
+};
+
+/** @internal Validates and normalises a refresh config for the infra map. */
+export const normalizeRefresh = (
+  refresh: RefreshConfig,
+  viewName: string,
+): RefreshJson => {
+  const r = refresh as {
+    every?: string;
+    after?: string;
+    offset?: string;
+    randomizeFor?: string;
+    append?: boolean;
+  };
+  const kind = r.every !== undefined ? "every" : "after";
+  if (kind === "after" && r.offset !== undefined) {
+    throw new Error(
+      `Invalid refresh on materialized view '${viewName}': OFFSET is only valid with EVERY, not AFTER`,
+    );
+  }
+  const json: RefreshJson = {
+    kind,
+    interval: parseRefreshInterval(
+      (kind === "every" ? r.every : r.after) as string,
+      viewName,
+    ),
+    append: r.append ?? false,
+  };
+  if (r.offset !== undefined) {
+    json.offset = parseRefreshInterval(r.offset, viewName);
+  }
+  if (r.randomizeFor !== undefined) {
+    json.randomizeFor = parseRefreshInterval(r.randomizeFor, viewName);
+  }
+  return json;
+};
+
 /**
  * Configuration options for creating a Materialized View.
  * @template T The data type of the records stored in the target table of the materialized view.
@@ -63,6 +176,10 @@ export interface MaterializedViewConfig<T> {
    * Controls whether the library can drop or modify the MV automatically.
    * Defaults to FULLY_MANAGED if not specified. */
   lifeCycle?: LifeCycle;
+
+  /** Optional refresh schedule. When set, the view is a refreshable materialized view
+   * that re-runs `selectStatement` on a schedule instead of on every insert. */
+  refresh?: RefreshConfig;
 }
 
 const requireTargetTableName = (tableName: string | undefined): string => {
@@ -77,6 +194,9 @@ const requireTargetTableName = (tableName: string | undefined): string => {
  * Represents a Materialized View in ClickHouse.
  * This encapsulates both the target OlapTable that stores the data and the MATERIALIZED VIEW definition
  * that populates the table based on inserts into the source tables.
+ *
+ * With `refresh` set, the view instead re-runs its SELECT on a schedule rather than on insert,
+ * and `selectTables` is only used for dependency ordering.
  *
  * @template TargetTable The data type of the records stored in the underlying target OlapTable. The structure of T defines the target table schema.
  */
@@ -102,6 +222,9 @@ export class MaterializedView<TargetTable> {
   /** Optional lifecycle management policy for the materialized view */
   lifeCycle?: LifeCycle;
 
+  /** Optional refresh schedule, as given by the user */
+  refresh: RefreshConfig | undefined;
+
   /**
    * Creates a new MaterializedView instance.
    * Requires the `TargetTable` type parameter to be explicitly provided or inferred,
@@ -122,6 +245,11 @@ export class MaterializedView<TargetTable> {
     targetSchema?: IJsonSchemaCollection.IV3_1,
     targetColumns?: Column[],
   ) {
+    if (options.refresh !== undefined) {
+      // Validate eagerly, before the target table or the view is registered.
+      normalizeRefresh(options.refresh, options.materializedViewName);
+    }
+
     let selectStatement = options.selectStatement;
     if (typeof selectStatement !== "string") {
       selectStatement = toStaticQuery(selectStatement);
@@ -165,6 +293,7 @@ export class MaterializedView<TargetTable> {
       formatTableReference(t),
     );
     this.lifeCycle = options.lifeCycle;
+    this.refresh = options.refresh;
 
     // Initialize metadata, preserving user-provided metadata if any
     this.metadata = options.metadata ? { ...options.metadata } : {};
