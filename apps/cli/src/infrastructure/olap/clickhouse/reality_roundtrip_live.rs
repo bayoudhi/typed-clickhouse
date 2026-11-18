@@ -567,20 +567,14 @@ async fn live_reality_roundtrip_plans_nothing() {
     );
 }
 
-#[tokio::test]
-async fn live_refresh_schedule_change_is_modify_only() {
-    if !enabled() {
-        eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
-        return;
-    }
-
-    let project = project();
-    let full = apply_full_fixture(&project).await;
-    let changed = with_snapshot_view(&full, |mv| {
+/// Changes the snapshot view's interval on top of `base` (already applied) and
+/// checks the change is planned and applied as one MODIFY REFRESH.
+async fn assert_schedule_change_is_modify_only(project: &Project, base: &InfrastructureMap) {
+    let changed = with_snapshot_view(base, |mv| {
         mv.refresh.as_mut().unwrap().interval = every(2, IntervalUnit::Day);
     });
 
-    let changes = plan_against_reality(&project, &changed).await;
+    let changes = plan_against_reality(project, &changed).await;
     assert!(
         matches!(
             changes.olap_changes.as_slice(),
@@ -598,9 +592,9 @@ async fn live_refresh_schedule_change_is_modify_only() {
         other => panic!("expected exactly one ModifyMaterializedViewRefresh, got {other:?}"),
     }
 
-    apply(&project, &full, &changed).await;
+    apply(project, base, &changed).await;
 
-    let after = plan_against_reality(&project, &changed).await;
+    let after = plan_against_reality(project, &changed).await;
     let phantoms: Vec<String> = after.olap_changes.iter().map(describe).collect();
     assert!(
         phantoms.is_empty(),
@@ -611,6 +605,48 @@ async fn live_refresh_schedule_change_is_modify_only() {
     assert!(
         create.contains("EVERY 2 DAY"),
         "server did not record the new schedule: {create}"
+    );
+}
+
+#[tokio::test]
+async fn live_refresh_schedule_change_is_modify_only() {
+    if !enabled() {
+        eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
+        return;
+    }
+
+    let project = project();
+    let full = apply_full_fixture(&project).await;
+    assert_schedule_change_is_modify_only(&project, &full).await;
+}
+
+#[tokio::test]
+async fn live_refresh_schedule_change_on_append_view_is_modify_only() {
+    if !enabled() {
+        eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
+        return;
+    }
+
+    let project = project();
+    let full = apply_full_fixture(&project).await;
+    // Turning APPEND on is a drop and recreate; the schedule change after it
+    // must be a MODIFY REFRESH that keeps APPEND, or the server rejects it.
+    let appended = with_snapshot_view(&full, |mv| {
+        mv.refresh.as_mut().unwrap().append = true;
+    });
+    apply(&project, &full, &appended).await;
+    assert!(
+        create_table_query("mv_device_snapshot")
+            .await
+            .contains(" APPEND TO "),
+        "fixture view is not an APPEND view"
+    );
+
+    assert_schedule_change_is_modify_only(&project, &appended).await;
+    let create = create_table_query("mv_device_snapshot").await;
+    assert!(
+        create.contains(" APPEND TO "),
+        "MODIFY REFRESH dropped APPEND: {create}"
     );
 }
 

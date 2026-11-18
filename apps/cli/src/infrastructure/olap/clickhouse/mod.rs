@@ -1973,6 +1973,10 @@ fn build_create_materialized_view_sql(
 }
 
 /// Builds the statement that changes a refreshable materialized view's schedule.
+///
+/// The clause repeats APPEND when the view has it: the server rejects a
+/// `MODIFY REFRESH` that would add or remove APPEND, and treats a missing
+/// APPEND on an APPEND view as removing it.
 fn build_modify_materialized_view_refresh_sql(
     db_name: &str,
     view_name: &str,
@@ -1983,7 +1987,7 @@ fn build_modify_materialized_view_refresh_sql(
         "ALTER TABLE `{}`.`{}` MODIFY {}",
         view_database.unwrap_or(db_name),
         view_name,
-        refresh.schedule_sql()
+        refresh.to_create_clause()
     )
 }
 
@@ -6010,6 +6014,28 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
         assert_eq!(
             build_modify_materialized_view_refresh_sql("db", "mv", None, &refresh),
             "ALTER TABLE `db`.`mv` MODIFY REFRESH AFTER 2 HOUR"
+        );
+    }
+
+    #[test]
+    fn modify_refresh_sql_keeps_append() {
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        let refresh = RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: 2,
+                unit: IntervalUnit::Day,
+            },
+            offset: None,
+            randomize_for: None,
+            append: true,
+            unmodelled: None,
+        };
+        assert_eq!(
+            build_modify_materialized_view_refresh_sql("db", "mv", None, &refresh),
+            "ALTER TABLE `db`.`mv` MODIFY REFRESH EVERY 2 DAY APPEND"
         );
     }
 }
