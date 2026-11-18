@@ -38,7 +38,8 @@ impl IntervalUnit {
     }
 
     /// The unit's length in its base: seconds for SECOND..WEEK, months for
-    /// MONTH and YEAR. The two bases do not convert into each other.
+    /// MONTH and YEAR. The two bases do not convert into each other (a month
+    /// has no fixed number of seconds), so this module never folds them.
     fn base_factor(self) -> (IntervalBase, u64) {
         match self {
             IntervalUnit::Second => (IntervalBase::Seconds, 1),
@@ -432,6 +433,10 @@ fn parse_interval(
         let bad = || RefreshParseError::BadInterval(text(src, Some(n)).to_string());
         let (base, factor) = unit.base_factor();
         let (next_base, next_factor) = next_unit.base_factor();
+        // Calendar (MONTH, YEAR) and clock units have no common base. The
+        // server rejects the mix for EVERY but accepts it for AFTER
+        // (`AFTER 1 MONTH 1 DAY`); either way the clause is left unmodelled
+        // and rendered verbatim.
         if base != next_base {
             return Err(bad());
         }
@@ -740,7 +745,8 @@ mod tests {
                 .interval,
             iv(15, IntervalUnit::Month)
         );
-        // Months and seconds do not mix.
+        // Calendar and clock units are not folded. (The server rejects the
+        // mix for EVERY but accepts it for AFTER; see the unmodelled tests.)
         assert!(matches!(
             parse_refresh_clause("REFRESH EVERY 1 MONTH 3 DAY"),
             Err(RefreshParseError::BadInterval(_))
@@ -982,6 +988,36 @@ mod tests {
         assert!(!at(max_ts).is_equivalent(&at(max_ts - 1)));
         assert!(!at(u64::MAX).is_equivalent(&at(u64::MAX - 1)));
         assert!(at(u64::MAX).is_equivalent(&at(u64::MAX)));
+    }
+
+    #[test]
+    fn equivalence_keeps_calendar_and_clock_apart() {
+        let with = |kind, value, unit| RefreshSchedule {
+            kind,
+            interval: iv(value, unit),
+            ..every_day()
+        };
+        let every = RefreshKind::Every;
+        assert!(!with(every, 1, IntervalUnit::Month).is_equivalent(&with(
+            every,
+            30,
+            IntervalUnit::Day
+        )));
+        assert!(!with(every, 1, IntervalUnit::Month).is_equivalent(&with(
+            every,
+            4,
+            IntervalUnit::Week
+        )));
+        assert!(with(every, 12, IntervalUnit::Month).is_equivalent(&with(
+            every,
+            1,
+            IntervalUnit::Year
+        )));
+        assert!(!with(every, 1, IntervalUnit::Day).is_equivalent(&with(
+            RefreshKind::After,
+            1,
+            IntervalUnit::Day
+        )));
     }
 
     #[test]
