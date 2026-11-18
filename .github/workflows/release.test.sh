@@ -11,6 +11,10 @@ W=release.yaml
 
 grep -q 'ubuntu-22-8-core' "$W" && fail "still targets an unavailable large runner"
 grep -q 'macos-14-large'   "$W" && fail "still targets an unavailable large runner"
+# GitHub retired the macos-14 image: a job asking for it is cancelled before
+# it starts ("The configuration 'macos-14-arm64-us-default' is not supported"),
+# which left the v0.3.0 release with the library published and no CLI.
+grep -qE 'OS: macos-14[ ,]' "$W" && fail "targets the retired macos-14 runner"
 grep -q 'x86_64-apple-darwin' "$W" && fail "Intel macOS is a non-goal"
 grep -q 'windows' "$W" && fail "Windows is a non-goal"
 grep -q 'POSTHOG_API_KEY' "$W" && fail "telemetry key must not be wired into builds"
