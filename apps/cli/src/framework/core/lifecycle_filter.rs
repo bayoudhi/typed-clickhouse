@@ -34,6 +34,7 @@
 //! the diffing logic, it will be caught and rejected before reaching the database.
 //! This guard is called in `olap::execute_changes` as the last line of defense.
 
+use crate::framework::core::infra_reality_checker::is_refresh_schedule_only_change;
 use crate::framework::core::infrastructure::materialized_view::MaterializedView;
 use crate::framework::core::infrastructure::table::Table;
 use crate::framework::core::infrastructure_map::{
@@ -392,6 +393,9 @@ pub enum ViolationType {
     MaterializedViewDrop,
     /// Attempted to create an externally managed materialized view
     MaterializedViewCreate,
+    /// Attempted to change the refresh schedule of an externally managed
+    /// materialized view in place (`MODIFY REFRESH`)
+    MaterializedViewModification,
 }
 
 impl std::fmt::Display for LifecycleViolation {
@@ -468,7 +472,11 @@ pub fn validate_lifecycle_compliance(
                 );
             }
             OlapChange::MaterializedView(mv_change) => {
-                check_materialized_view_change_compliance(mv_change, &mut violations);
+                check_materialized_view_change_compliance(
+                    mv_change,
+                    default_database,
+                    &mut violations,
+                );
             }
             _ => {}
         }
@@ -496,10 +504,13 @@ pub fn validate_lifecycle_compliance(
 /// Checks a materialized view change for lifecycle violations
 ///
 /// MV update = DROP + CREATE in ClickHouse (no ALTER MATERIALIZED VIEW for SELECT changes).
-/// So both removals and updates are blocked for drop-protected MVs.
+/// So both removals and updates are blocked for drop-protected MVs, except a
+/// schedule-only change to a refreshable view, which is an in-place
+/// `MODIFY REFRESH` and is blocked only for externally-managed MVs.
 /// Additions are blocked for externally-managed MVs.
 fn check_materialized_view_change_compliance(
     mv_change: &Change<MaterializedView>,
+    default_database: &str,
     violations: &mut Vec<LifecycleViolation>,
 ) {
     match mv_change {
@@ -518,9 +529,23 @@ fn check_materialized_view_change_compliance(
                 });
             }
         }
-        Change::Updated { after, .. } => {
-            // MV update requires DROP+CREATE - block if drop-protected
-            if after.life_cycle.is_drop_protected() {
+        Change::Updated { before, after } => {
+            // MV update requires DROP+CREATE - block if drop-protected - unless
+            // it is a schedule-only MODIFY REFRESH, blocked only if externally managed.
+            let modify_only = is_refresh_schedule_only_change(before, after, default_database);
+            if modify_only && after.life_cycle.is_any_modification_protected() {
+                violations.push(LifecycleViolation {
+                    message: format!(
+                        "Attempted to UPDATE (MODIFY REFRESH) materialized view '{}' which has \
+                        {:?} lifecycle. This is a bug - the diff/filter pipeline should have blocked this.",
+                        after.name, after.life_cycle
+                    ),
+                    resource_name: after.name.clone(),
+                    database: after.database.clone(),
+                    life_cycle: after.life_cycle,
+                    violation_type: ViolationType::MaterializedViewModification,
+                });
+            } else if !modify_only && after.life_cycle.is_drop_protected() {
                 violations.push(LifecycleViolation {
                     message: format!(
                         "Attempted to UPDATE (DROP+CREATE) materialized view '{}' which has \
@@ -1280,6 +1305,76 @@ mod tests {
         let mut mv = MaterializedView::new(name, "SELECT 1", vec![], "target");
         mv.life_cycle = life_cycle;
         mv
+    }
+
+    /// A refreshable test view, refreshed every `days` days.
+    fn create_refreshable_test_mv(
+        name: &str,
+        life_cycle: LifeCycle,
+        days: u64,
+    ) -> crate::framework::core::infrastructure::materialized_view::MaterializedView {
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        let mut mv = create_test_mv(name, life_cycle);
+        mv.refresh = Some(RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: days,
+                unit: IntervalUnit::Day,
+            },
+            offset: None,
+            randomize_for: None,
+            append: false,
+            unmodelled: None,
+        });
+        mv
+    }
+
+    fn schedule_change(life_cycle: LifeCycle) -> Vec<OlapChange> {
+        vec![OlapChange::MaterializedView(Change::Updated {
+            before: Box::new(create_refreshable_test_mv("refreshed_mv", life_cycle, 1)),
+            after: Box::new(create_refreshable_test_mv("refreshed_mv", life_cycle, 2)),
+        })]
+    }
+
+    #[test]
+    fn test_guard_allows_deletion_protected_schedule_only_update() {
+        let violations = validate_lifecycle_compliance(
+            &schedule_change(LifeCycle::DeletionProtected),
+            "test_db",
+        );
+        assert!(violations.is_empty(), "violations: {violations:?}");
+    }
+
+    #[test]
+    fn test_guard_blocks_externally_managed_schedule_only_update() {
+        let violations = validate_lifecycle_compliance(
+            &schedule_change(LifeCycle::ExternallyManaged),
+            "test_db",
+        );
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0].violation_type,
+            ViolationType::MaterializedViewModification
+        );
+    }
+
+    #[test]
+    fn test_guard_blocks_deletion_protected_refreshable_select_update() {
+        let before = create_refreshable_test_mv("refreshed_mv", LifeCycle::DeletionProtected, 1);
+        let mut after = before.clone();
+        after.select_sql = "SELECT 2".to_string();
+        let changes = vec![OlapChange::MaterializedView(Change::Updated {
+            before: Box::new(before),
+            after: Box::new(after),
+        })];
+        let violations = validate_lifecycle_compliance(&changes, "test_db");
+        assert_eq!(violations.len(), 1);
+        assert_eq!(
+            violations[0].violation_type,
+            ViolationType::MaterializedViewDrop
+        );
     }
 
     #[test]

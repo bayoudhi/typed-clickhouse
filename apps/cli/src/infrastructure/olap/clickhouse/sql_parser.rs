@@ -3,6 +3,7 @@
 //! This module provides parsing functionality for ClickHouse SQL statements,
 //! particularly CREATE MATERIALIZED VIEW and INSERT INTO ... SELECT statements.
 
+use crate::framework::core::infrastructure::refresh::{split_refresh_clause, RefreshSchedule};
 use crate::infrastructure::olap::clickhouse::model::ClickHouseIndex;
 use sqlparser::ast::{
     CreateTableOptions, Expr, ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr,
@@ -78,6 +79,8 @@ pub struct MaterializedViewStatement {
     pub source_tables: Vec<TableReference>,
     pub if_not_exists: bool,
     pub populate: bool,
+    /// Refresh schedule when this is a refreshable materialized view.
+    pub refresh: Option<RefreshSchedule>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -959,7 +962,9 @@ pub fn parse_create_materialized_view(
     sql: &str,
 ) -> Result<MaterializedViewStatement, SqlParseError> {
     let dialect = ClickHouseDialect {};
-    let ast = Parser::parse_sql(&dialect, sql)?;
+    // sqlparser has no REFRESH grammar: take the clause out first, keep it aside.
+    let (stripped_sql, refresh) = split_refresh_clause(sql);
+    let ast = Parser::parse_sql(&dialect, &stripped_sql)?;
 
     if ast.len() != 1 {
         return Err(SqlParseError::NotMaterializedView);
@@ -1000,6 +1005,7 @@ pub fn parse_create_materialized_view(
                 source_tables,
                 if_not_exists: create_view.if_not_exists,
                 populate: false, // sqlparser doesn't support POPULATE, always false
+                refresh,
             })
         }
         _ => Err(SqlParseError::NotMaterializedView),
@@ -1337,6 +1343,35 @@ pub mod tests {
     pub const NESTED_OBJECTS_SQL: &str = "CREATE TABLE local.NestedObjects (`id` String, `timestamp` DateTime('UTC'), `address` Nested(street String, city String, coordinates Nested(lat Float64, lng Float64)), `metadata` Nested(tags Array(String), priority Int64, config Nested(enabled Bool, settings Nested(theme String, notifications Bool)))) ENGINE = MergeTree PRIMARY KEY id ORDER BY id SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_granularity_bytes = 10485760";
 
     // Tests for extract_engine_from_create_table
+    #[test]
+    fn parses_refreshable_mv() {
+        let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv REFRESH EVERY 1 DAY OFFSET 10 HOUR TO t AS SELECT a FROM s JOIN u ON s.id = u.id";
+        let parsed = parse_create_materialized_view(sql).unwrap();
+        assert_eq!(parsed.view_name, "mv");
+        assert_eq!(parsed.target_table, "t");
+        assert!(parsed.select_statement.starts_with("SELECT a FROM s"));
+        let (_, expected) = split_refresh_clause(sql);
+        assert!(expected.is_some());
+        assert_eq!(parsed.refresh, expected);
+        assert_eq!(
+            parsed.refresh.unwrap().to_create_clause(),
+            "REFRESH EVERY 1 DAY OFFSET 10 HOUR"
+        );
+    }
+
+    #[test]
+    fn parse_without_refresh_unchanged() {
+        let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO db.t AS SELECT a FROM s";
+        let parsed = parse_create_materialized_view(sql).unwrap();
+        assert_eq!(parsed.refresh, None);
+        assert_eq!(parsed.view_name, "mv");
+        assert_eq!(parsed.target_database.as_deref(), Some("db"));
+        assert_eq!(parsed.target_table, "t");
+        assert_eq!(parsed.select_statement, "SELECT a FROM s");
+        assert!(parsed.if_not_exists);
+        assert!(!parsed.populate);
+    }
+
     #[test]
     fn test_extract_simple_merge_tree() {
         let sql = "CREATE TABLE test (x Int32) ENGINE = MergeTree ORDER BY x";

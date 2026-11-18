@@ -55,6 +55,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::cli::logger::{context, resource_type};
 
 use self::model::ClickHouseSystemTable;
+use crate::framework::core::infrastructure::refresh::{split_refresh_clause, RefreshSchedule};
 use crate::framework::core::infrastructure::select_row_policy::{
     SelectRowPolicy, TableReference, MOOSE_RLS_ROLE,
 };
@@ -270,6 +271,18 @@ pub enum SerializableOlapOperation {
         target_database: Option<String>,
         /// The SELECT SQL statement
         select_sql: String,
+        /// Refresh schedule; `Some` creates a refreshable materialized view
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refresh: Option<RefreshSchedule>,
+    },
+    /// Change the refresh schedule of a refreshable materialized view
+    ModifyMaterializedViewRefresh {
+        /// Name of the materialized view
+        name: String,
+        /// Database where the MV is located (None = default database)
+        database: Option<String>,
+        /// The new refresh schedule
+        refresh: RefreshSchedule,
     },
     /// Drop a materialized view
     DropMaterializedView {
@@ -402,6 +415,7 @@ fn extract_cluster_name(op: &AtomicOlapOperation) -> Option<&str> {
         | AtomicOlapOperation::RunSetupSql { .. }
         | AtomicOlapOperation::RunTeardownSql { .. }
         | AtomicOlapOperation::CreateMaterializedView { .. }
+        | AtomicOlapOperation::ModifyMaterializedViewRefresh { .. }
         | AtomicOlapOperation::DropMaterializedView { .. }
         | AtomicOlapOperation::CreateView { .. }
         | AtomicOlapOperation::DropView { .. }
@@ -636,6 +650,9 @@ pub fn describe_operation(operation: &SerializableOlapOperation) -> String {
                 "Creating materialized view '{}' -> table '{}'",
                 name, target_table
             )
+        }
+        SerializableOlapOperation::ModifyMaterializedViewRefresh { name, .. } => {
+            format!("Modifying refresh schedule of materialized view '{}'", name)
         }
         SerializableOlapOperation::DropMaterializedView { name, .. } => {
             format!("Dropping materialized view '{}'", name)
@@ -890,6 +907,7 @@ pub async fn execute_atomic_operation(
             target_table,
             target_database,
             select_sql,
+            refresh,
         } => {
             execute_create_materialized_view(
                 db_name,
@@ -898,6 +916,21 @@ pub async fn execute_atomic_operation(
                 target_table,
                 target_database.as_deref(),
                 select_sql,
+                refresh.as_ref(),
+                client,
+            )
+            .await?;
+        }
+        SerializableOlapOperation::ModifyMaterializedViewRefresh {
+            name,
+            database,
+            refresh,
+        } => {
+            execute_modify_materialized_view_refresh(
+                db_name,
+                name,
+                database.as_deref(),
+                refresh,
                 client,
             )
             .await?;
@@ -1912,6 +1945,85 @@ fn strip_backticks(s: &str) -> String {
     s.trim().trim_matches('`').replace('`', "")
 }
 
+/// Builds the CREATE MATERIALIZED VIEW statement; a refresh schedule goes between
+/// the name and `TO`.
+fn build_create_materialized_view_sql(
+    db_name: &str,
+    view_name: &str,
+    view_database: Option<&str>,
+    target_table: &str,
+    target_database: Option<&str>,
+    select_sql: &str,
+    refresh: Option<&RefreshSchedule>,
+) -> String {
+    let target_db = view_database.unwrap_or(db_name);
+    // Strip any existing backticks from target_table to avoid double-backticks
+    let clean_target_table = strip_backticks(target_table);
+    let to_target = match target_database {
+        Some(tdb) => format!("`{}`.`{}`", tdb, clean_target_table),
+        None => format!("`{}`.`{}`", target_db, clean_target_table),
+    };
+    let refresh_clause = refresh
+        .map(|r| format!(" {}", r.to_create_clause()))
+        .unwrap_or_default();
+    format!(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS `{}`.`{}`{} TO {} AS {}",
+        target_db, view_name, refresh_clause, to_target, select_sql
+    )
+}
+
+/// Builds the statement that changes a refreshable materialized view's schedule.
+///
+/// The clause repeats APPEND when the view has it: the server rejects a
+/// `MODIFY REFRESH` that would add or remove APPEND, and treats a missing
+/// APPEND on an APPEND view as removing it.
+fn build_modify_materialized_view_refresh_sql(
+    db_name: &str,
+    view_name: &str,
+    view_database: Option<&str>,
+    refresh: &RefreshSchedule,
+) -> String {
+    format!(
+        "ALTER TABLE `{}`.`{}` MODIFY {}",
+        view_database.unwrap_or(db_name),
+        view_name,
+        refresh.to_create_clause()
+    )
+}
+
+/// Executes `ALTER TABLE ... MODIFY REFRESH ...` on a refreshable materialized view
+#[instrument(
+    name = "modify_materialized_view_refresh",
+    skip_all,
+    fields(
+        context = context::BOOT,
+        resource_type = resource_type::MATERIALIZED_VIEW,
+        resource_name = %view_name,
+    )
+)]
+async fn execute_modify_materialized_view_refresh(
+    db_name: &str,
+    view_name: &str,
+    view_database: Option<&str>,
+    refresh: &RefreshSchedule,
+    client: &ConfiguredDBClient,
+) -> Result<(), ClickhouseChangesError> {
+    let sql =
+        build_modify_materialized_view_refresh_sql(db_name, view_name, view_database, refresh);
+    tracing::info!(
+        "Modifying refresh schedule of materialized view: {}",
+        view_name
+    );
+    tracing::debug!("MV SQL: {}", sql);
+    run_query(&sql, client)
+        .await
+        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
+            error: e,
+            resource: Some(format!("materialized_view:{}", view_name)),
+        })?;
+    Ok(())
+}
+
 /// Executes a CREATE MATERIALIZED VIEW statement
 #[instrument(
     name = "create_materialized_view",
@@ -1922,6 +2034,7 @@ fn strip_backticks(s: &str) -> String {
         resource_name = %view_name,
     )
 )]
+#[allow(clippy::too_many_arguments)]
 async fn execute_create_materialized_view(
     db_name: &str,
     view_name: &str,
@@ -1929,18 +2042,18 @@ async fn execute_create_materialized_view(
     target_table: &str,
     target_database: Option<&str>,
     select_sql: &str,
+    refresh: Option<&RefreshSchedule>,
     client: &ConfiguredDBClient,
 ) -> Result<(), ClickhouseChangesError> {
     let target_db = view_database.unwrap_or(db_name);
-    // Strip any existing backticks from target_table to avoid double-backticks
-    let clean_target_table = strip_backticks(target_table);
-    let to_target = match target_database {
-        Some(tdb) => format!("`{}`.`{}`", tdb, clean_target_table),
-        None => format!("`{}`.`{}`", target_db, clean_target_table),
-    };
-    let sql = format!(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS `{}`.`{}` TO {} AS {}",
-        target_db, view_name, to_target, select_sql
+    let sql = build_create_materialized_view_sql(
+        db_name,
+        view_name,
+        view_database,
+        target_table,
+        target_database,
+        select_sql,
+        refresh,
     );
     tracing::info!("Creating materialized view: {}.{}", target_db, view_name);
     tracing::debug!("MV SQL: {}", sql);
@@ -3156,13 +3269,24 @@ impl OlapOperations for ConfiguredDBClient {
 
             // Reconstruct SqlResource based on engine type
             let sql_resource = match engine.as_str() {
-                "MaterializedView" => reconstruct_sql_resource_from_mv(
-                    name,
-                    create_query,
-                    as_select,
-                    database,
-                    default_database,
-                )?,
+                "MaterializedView" => {
+                    match reconstruct_sql_resource_from_mv(
+                        name.clone(),
+                        create_query,
+                        as_select,
+                        database.clone(),
+                        default_database,
+                    )? {
+                        Some(resource) => resource,
+                        None => {
+                            warn!(
+                                "Materialized view {}.{} has no TO target and is left unmanaged",
+                                database, name
+                            );
+                            continue;
+                        }
+                    }
+                }
                 "View" => {
                     reconstruct_sql_resource_from_view(name, as_select, database, default_database)?
                 }
@@ -3355,25 +3479,29 @@ static MATERIALIZED_VIEW_TO_PATTERN: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// * `default_database` - The default database for resolving unqualified table references
 ///
 /// # Returns
-/// * `Result<SqlResource, OlapChangesError>` - The reconstructed SqlResource
+/// * `Result<Option<SqlResource>, OlapChangesError>` - The reconstructed SqlResource, or
+///   `None` when the view has no `TO` target (it stores its rows itself and is not managed)
 fn reconstruct_sql_resource_from_mv(
     name: String,
     create_query: String,
     as_select: String,
     database: String,
     default_database: &str,
-) -> Result<SqlResource, OlapChangesError> {
-    // Extract target table from create_query for MV
-    let target_table = MATERIALIZED_VIEW_TO_PATTERN
-        .captures(&create_query)
+) -> Result<Option<SqlResource>, OlapChangesError> {
+    // Take the REFRESH clause out so it is neither mistaken for part of the header
+    // nor lost from the rebuilt setup text.
+    let (without_refresh, refresh) = split_refresh_clause(&create_query);
+
+    // Look for TO only in the statement header: a ` TO ` inside the SELECT body must
+    // not make a view without a target look like it has one.
+    let header = materialized_view_header(&without_refresh, &as_select);
+    let Some(target_table) = MATERIALIZED_VIEW_TO_PATTERN
+        .captures(header)
         .and_then(|caps| caps.get(1))
         .map(|m| m.as_str().replace('`', ""))
-        .ok_or_else(|| {
-            OlapChangesError::DatabaseError(format!(
-                "Could not find TO target in materialized view definition: {}",
-                name
-            ))
-        })?;
+    else {
+        return Ok(None);
+    };
 
     // Extract pushes_data_to (target table for MV)
     let (target_base_name, _version) = extract_version_from_table_name(&target_table);
@@ -3394,9 +3522,12 @@ fn reconstruct_sql_resource_from_mv(
     }];
 
     // Reconstruct with MV-specific CREATE statement
+    let refresh_clause = refresh
+        .map(|r| format!("{} ", r.to_create_clause()))
+        .unwrap_or_default();
     let setup_raw = format!(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS {} TO {} AS {}",
-        name, target_table, as_select
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS {} {}TO {} AS {}",
+        name, refresh_clause, target_table, as_select
     );
 
     reconstruct_sql_resource_common(
@@ -3407,6 +3538,51 @@ fn reconstruct_sql_resource_from_mv(
         default_database,
         pushes_data_to,
     )
+    .map(Some)
+}
+
+/// The part of a CREATE MATERIALIZED VIEW statement before its SELECT body.
+///
+/// Uses `as_select` (from `system.tables`) when the statement ends with it;
+/// otherwise cuts at the first `AS` outside quotes, backticks and parentheses.
+fn materialized_view_header<'a>(create_query: &'a str, as_select: &str) -> &'a str {
+    let trimmed = create_query.trim_end();
+    let select = as_select.trim();
+    if !select.is_empty() {
+        if let Some(head) = trimmed.strip_suffix(select) {
+            return head;
+        }
+    }
+
+    let bytes = create_query.as_bytes();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            continue;
+        }
+        match b {
+            b'\'' | b'`' | b'"' => quote = Some(b),
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'a' | b'A'
+                if depth == 0
+                    && i > 0
+                    && bytes[i - 1].is_ascii_whitespace()
+                    && bytes
+                        .get(i + 1)
+                        .is_some_and(|n| n.eq_ignore_ascii_case(&b'S'))
+                    && bytes.get(i + 2).is_some_and(|n| n.is_ascii_whitespace()) =>
+            {
+                return &create_query[..i];
+            }
+            _ => {}
+        }
+    }
+    create_query
 }
 
 /// Reconstructs a SqlResource from a view's CREATE statement
@@ -5351,7 +5527,8 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             "mydb".to_string(),
             "mydb",
         )
-        .unwrap();
+        .unwrap()
+        .expect("view has a TO target");
 
         assert_eq!(result.name, "test_mv");
         assert_eq!(result.pulls_data_from.len(), 1);
@@ -5384,7 +5561,8 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             "mydb".to_string(),
             "mydb",
         )
-        .unwrap();
+        .unwrap()
+        .expect("view has a TO target");
 
         assert_eq!(result.name, "test_mv");
         // Regex fallback should extract source_table
@@ -5393,6 +5571,132 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             InfrastructureSignature::Table { id } => assert_eq!(id, "source_table"),
             _ => panic!("Expected Table signature"),
         }
+    }
+
+    #[test]
+    fn reconstruct_keeps_refresh() {
+        let create_query = "CREATE MATERIALIZED VIEW db.mv REFRESH EVERY 1 DAY OFFSET 10 HOUR TO db.t (`id` String) AS SELECT id FROM db.s".to_string();
+        let result = reconstruct_sql_resource_from_mv(
+            "mv".to_string(),
+            create_query,
+            "SELECT id FROM db.s".to_string(),
+            "db".to_string(),
+            "db",
+        )
+        .unwrap()
+        .expect("view has a TO target");
+        assert!(
+            result.setup[0].contains("REFRESH EVERY 1 DAY OFFSET 10 HOUR TO"),
+            "setup was: {}",
+            result.setup[0]
+        );
+        assert_eq!(
+            result.setup[0],
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv REFRESH EVERY 1 DAY OFFSET 10 HOUR TO t AS SELECT id FROM s"
+        );
+    }
+
+    #[test]
+    fn reconstruct_keeps_unmodelled_refresh_and_stays_distinct() {
+        use crate::framework::core::infra_reality_checker::materialized_views_are_equivalent;
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        use crate::framework::core::infrastructure_map::InfrastructureMap;
+
+        let raw = "REFRESH EVERY 1 HOUR DEPENDS ON db.m SETTINGS refresh_retries = 3";
+        let create_query = format!(
+            "CREATE MATERIALIZED VIEW db.mv {raw} TO db.t (`id` String) AS SELECT id FROM db.s"
+        );
+        let resource = reconstruct_sql_resource_from_mv(
+            "mv".to_string(),
+            create_query,
+            "SELECT id FROM db.s".to_string(),
+            "db".to_string(),
+            "db",
+        )
+        .unwrap()
+        .expect("view has a TO target");
+        // The rebuilt text drops the default database qualifier, as it does
+        // everywhere else in the statement.
+        let kept = "REFRESH EVERY 1 HOUR DEPENDS ON m SETTINGS refresh_retries = 3";
+        assert!(
+            resource.setup[0].contains(&format!("{kept} TO")),
+            "setup was: {}",
+            resource.setup[0]
+        );
+
+        let reality = InfrastructureMap::try_migrate_sql_resource_to_mv(&resource, "db")
+            .expect("reconstructed view migrates");
+        let reality_refresh = reality.refresh.clone().unwrap();
+        assert_eq!(reality_refresh.unmodelled.as_deref(), Some(kept));
+
+        let mut code = reality.clone();
+        code.refresh = Some(RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: 1,
+                unit: IntervalUnit::Hour,
+            },
+            offset: None,
+            randomize_for: None,
+            append: false,
+            unmodelled: None,
+        });
+        assert!(!materialized_views_are_equivalent(&reality, &code, "db"));
+        assert!(materialized_views_are_equivalent(
+            &reality,
+            &reality.clone(),
+            "db"
+        ));
+    }
+
+    #[test]
+    fn reconstruct_without_to_is_skipped() {
+        let create_query = "CREATE MATERIALIZED VIEW db.mv REFRESH EVERY 1 HOUR ENGINE = MergeTree ORDER BY id AS SELECT 1".to_string();
+        let result = reconstruct_sql_resource_from_mv(
+            "mv".to_string(),
+            create_query,
+            "SELECT 1".to_string(),
+            "db".to_string(),
+            "db",
+        )
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn reconstruct_ignores_to_inside_select_body() {
+        let select = "SELECT ' TO x' AS note, 1 AS id".to_string();
+        let create_query = format!(
+            "CREATE MATERIALIZED VIEW db.mv REFRESH EVERY 1 HOUR ENGINE = MergeTree ORDER BY id AS {}",
+            select
+        );
+        let result = reconstruct_sql_resource_from_mv(
+            "mv".to_string(),
+            create_query,
+            select,
+            "db".to_string(),
+            "db",
+        )
+        .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn reconstruct_ignores_to_inside_select_body_without_as_select_match() {
+        // as_select does not match the statement tail, so the header comes from the first
+        // top-level AS.
+        let create_query = "CREATE MATERIALIZED VIEW db.mv REFRESH EVERY 1 HOUR ENGINE = MergeTree ORDER BY id AS SELECT ' TO x' AS note".to_string();
+        let result = reconstruct_sql_resource_from_mv(
+            "mv".to_string(),
+            create_query,
+            "SELECT 'something else'".to_string(),
+            "db".to_string(),
+            "db",
+        )
+        .unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
@@ -5436,7 +5740,8 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             "my_db".to_string(),
             "my_db",
         )
-        .unwrap();
+        .unwrap()
+        .expect("view has a TO target");
 
         // Target table name should have backticks stripped
         match &result.pushes_data_to[0] {
@@ -5693,5 +5998,126 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             sql,
             "query without `?` should be unchanged"
         );
+    }
+
+    #[test]
+    fn serializable_create_without_refresh_unchanged() {
+        let op = SerializableOlapOperation::CreateMaterializedView {
+            name: "mv".to_string(),
+            database: None,
+            target_table: "t".to_string(),
+            target_database: None,
+            select_sql: "SELECT 1".to_string(),
+            refresh: None,
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        let inner = &json["CreateMaterializedView"];
+        assert!(
+            inner.get("refresh").is_none(),
+            "unexpected refresh key: {json}"
+        );
+        let back: SerializableOlapOperation = serde_json::from_value(json).unwrap();
+        assert_eq!(back, op);
+    }
+
+    #[test]
+    fn create_mv_sql_places_refresh_before_to() {
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        let refresh = RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: 1,
+                unit: IntervalUnit::Day,
+            },
+            offset: None,
+            randomize_for: None,
+            append: true,
+            unmodelled: None,
+        };
+        assert_eq!(
+            build_create_materialized_view_sql("db", "mv", None, "t", None, "SELECT 1", Some(&refresh)),
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv` REFRESH EVERY 1 DAY APPEND TO `db`.`t` AS SELECT 1"
+        );
+        assert_eq!(
+            build_create_materialized_view_sql("db", "mv", None, "t", None, "SELECT 1", None),
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv` TO `db`.`t` AS SELECT 1"
+        );
+    }
+
+    #[test]
+    fn modify_refresh_sql_is_alter_table_modify() {
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        let refresh = RefreshSchedule {
+            kind: RefreshKind::After,
+            interval: RefreshInterval {
+                value: 2,
+                unit: IntervalUnit::Hour,
+            },
+            offset: None,
+            randomize_for: None,
+            append: false,
+            unmodelled: None,
+        };
+        assert_eq!(
+            build_modify_materialized_view_refresh_sql("db", "mv", Some("other"), &refresh),
+            "ALTER TABLE `other`.`mv` MODIFY REFRESH AFTER 2 HOUR"
+        );
+        assert_eq!(
+            build_modify_materialized_view_refresh_sql("db", "mv", None, &refresh),
+            "ALTER TABLE `db`.`mv` MODIFY REFRESH AFTER 2 HOUR"
+        );
+    }
+
+    #[test]
+    fn modify_refresh_sql_keeps_append() {
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        let refresh = RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: 2,
+                unit: IntervalUnit::Day,
+            },
+            offset: None,
+            randomize_for: None,
+            append: true,
+            unmodelled: None,
+        };
+        assert_eq!(
+            build_modify_materialized_view_refresh_sql("db", "mv", None, &refresh),
+            "ALTER TABLE `db`.`mv` MODIFY REFRESH EVERY 2 DAY APPEND"
+        );
+    }
+
+    #[test]
+    fn create_mv_sql_renders_unmodelled_refresh_verbatim() {
+        use crate::framework::core::infrastructure::refresh::split_refresh_clause;
+        for raw in [
+            "REFRESH EVERY 1 HOUR DEPENDS ON `db`.`m` SETTINGS refresh_retries = 3",
+            "REFRESH AFTER 1 MONTH 1 DAY APPEND",
+        ] {
+            let (_, refresh) = split_refresh_clause(&format!(
+                "CREATE MATERIALIZED VIEW mv {raw} TO t AS SELECT 1"
+            ));
+            let sql = build_create_materialized_view_sql(
+                "db",
+                "mv",
+                None,
+                "t",
+                None,
+                "SELECT 1",
+                refresh.as_ref(),
+            );
+            assert_eq!(
+                sql,
+                format!("CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv` {raw} TO `db`.`t` AS SELECT 1")
+            );
+            assert!(!sql.contains("EVERY 0 SECOND"));
+        }
     }
 }

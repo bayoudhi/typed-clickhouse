@@ -146,6 +146,27 @@ fn normalize_source_tables(tables: &[String], default_database: &str) -> HashSet
 
 /// Checks if two MaterializedViews are semantically equivalent.
 /// Compares target table, source tables (order-independent), and normalized SELECT SQL.
+/// True when `before` and `after` differ only in their refresh schedule, in a
+/// way `ALTER TABLE … MODIFY REFRESH` can apply in place: no drop, no
+/// recreate. The planner emits that statement exactly when this holds, and
+/// lifecycle protection lets such a change through for deletion-protected
+/// views, so both decide from this one predicate.
+pub fn is_refresh_schedule_only_change(
+    before: &MaterializedView,
+    after: &MaterializedView,
+    default_database: &str,
+) -> bool {
+    let (Some(before_refresh), Some(after_refresh)) = (&before.refresh, &after.refresh) else {
+        return false;
+    };
+    if !before_refresh.differs_only_in_schedule(after_refresh) {
+        return false;
+    }
+    let mut before_with_new_schedule = before.clone();
+    before_with_new_schedule.refresh = after.refresh.clone();
+    materialized_views_are_equivalent(&before_with_new_schedule, after, default_database)
+}
+
 /// Uses default_database to normalize `None` database references.
 ///
 /// Note: `life_cycle` is intentionally excluded — it is CLI-managed metadata and does not
@@ -182,11 +203,23 @@ pub fn materialized_views_are_equivalent(
         return false;
     }
 
-    // Compare source tables (order-independent via HashSet)
-    let sources1 = normalize_source_tables(&mv1.source_tables, default_database);
-    let sources2 = normalize_source_tables(&mv2.source_tables, default_database);
-    if sources1 != sources2 {
-        return false;
+    // Compare the refresh schedule
+    // Intervals are compared by length: the server stores `24 HOUR` as `1 DAY`.
+    match (&mv1.refresh, &mv2.refresh) {
+        (None, None) => {}
+        (Some(a), Some(b)) if a.is_equivalent(b) => {}
+        _ => return false,
+    }
+
+    // Compare source tables (order-independent via HashSet). A refreshable view
+    // has no incremental source tracking, and the read-back side recovers them
+    // from SQL, so they are not compared there.
+    if mv1.refresh.is_none() && mv2.refresh.is_none() {
+        let sources1 = normalize_source_tables(&mv1.source_tables, default_database);
+        let sources2 = normalize_source_tables(&mv2.source_tables, default_database);
+        if sources1 != sources2 {
+            return false;
+        }
     }
 
     // Compare SELECT SQL (must be pre-normalized via ClickHouse + Rust db prefix stripping)
@@ -1768,6 +1801,7 @@ mod tests {
             source_tables: vec!["source".to_string()],
             metadata: None,
             life_cycle: crate::framework::core::partial_infrastructure_map::LifeCycle::FullyManaged,
+            refresh: None,
         };
 
         let mv2 = MaterializedView {
@@ -1779,12 +1813,86 @@ mod tests {
             source_tables: vec!["source".to_string()],
             metadata: None,
             life_cycle: crate::framework::core::partial_infrastructure_map::LifeCycle::FullyManaged,
+            refresh: None,
         };
 
         assert!(
             materialized_views_are_equivalent(&mv1, &mv2, default_db),
             "Pre-normalized MVs should be equivalent"
         );
+    }
+
+    fn refresh_test_mv(
+        sources: &[&str],
+        refresh: Option<crate::framework::core::infrastructure::refresh::RefreshSchedule>,
+    ) -> crate::framework::core::infrastructure::materialized_view::MaterializedView {
+        crate::framework::core::infrastructure::materialized_view::MaterializedView {
+            name: "test_mv".to_string(),
+            database: None,
+            target_table: "events".to_string(),
+            target_database: None,
+            select_sql: "SELECT * FROM a".to_string(),
+            source_tables: sources.iter().map(|s| s.to_string()).collect(),
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            refresh,
+        }
+    }
+
+    fn every_days(days: u64) -> crate::framework::core::infrastructure::refresh::RefreshSchedule {
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: days,
+                unit: IntervalUnit::Day,
+            },
+            offset: None,
+            randomize_for: None,
+            append: false,
+            unmodelled: None,
+        }
+    }
+
+    #[test]
+    fn refresh_difference_is_not_equivalent() {
+        let a = refresh_test_mv(&["a"], Some(every_days(1)));
+        let b = refresh_test_mv(&["a"], Some(every_days(2)));
+        let none = refresh_test_mv(&["a"], None);
+        assert!(!materialized_views_are_equivalent(&a, &b, "mydb"));
+        assert!(!materialized_views_are_equivalent(&a, &none, "mydb"));
+        assert!(!materialized_views_are_equivalent(&none, &a, "mydb"));
+        assert!(materialized_views_are_equivalent(&a, &a.clone(), "mydb"));
+    }
+
+    #[test]
+    fn respelled_interval_is_equivalent() {
+        use crate::framework::core::infrastructure::refresh::{IntervalUnit, RefreshInterval};
+        // The server stores EVERY 24 HOUR as EVERY 1 DAY.
+        let mut code = every_days(1);
+        code.interval = RefreshInterval {
+            value: 24,
+            unit: IntervalUnit::Hour,
+        };
+        let a = refresh_test_mv(&["a"], Some(code));
+        let b = refresh_test_mv(&["a"], Some(every_days(1)));
+        assert!(materialized_views_are_equivalent(&a, &b, "mydb"));
+    }
+
+    #[test]
+    fn refreshable_ignores_source_tables() {
+        let a = refresh_test_mv(&["a"], Some(every_days(1)));
+        let b = refresh_test_mv(&["a", "b"], Some(every_days(1)));
+        assert!(materialized_views_are_equivalent(&a, &b, "mydb"));
+    }
+
+    #[test]
+    fn incremental_still_compares_source_tables() {
+        let a = refresh_test_mv(&["a"], None);
+        let b = refresh_test_mv(&["a", "b"], None);
+        assert!(!materialized_views_are_equivalent(&a, &b, "mydb"));
     }
 
     #[test]

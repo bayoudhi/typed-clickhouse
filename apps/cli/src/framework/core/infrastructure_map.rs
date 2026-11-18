@@ -773,7 +773,9 @@ impl InfrastructureMap {
         filtered_changes: &mut Vec<FilteredChange>,
         respect_life_cycle: bool,
     ) {
-        use crate::framework::core::infra_reality_checker::materialized_views_are_equivalent;
+        use crate::framework::core::infra_reality_checker::{
+            is_refresh_schedule_only_change, materialized_views_are_equivalent,
+        };
 
         tracing::info!(
             "Analyzing materialized view differences between {} source MVs and {} target MVs",
@@ -790,18 +792,31 @@ impl InfrastructureMap {
                 // Use semantic equivalence check instead of plain !=
                 if !materialized_views_are_equivalent(mv, target_mv, default_database) {
                     tracing::debug!("Materialized view '{}' has differences", id);
-                    // MV update = DROP + CREATE in ClickHouse. Block if drop-protected.
-                    // Check the AFTER lifecycle (target_mv) to handle transitions.
-                    if respect_life_cycle && target_mv.life_cycle.is_drop_protected() {
+                    // An MV update is DROP + CREATE in ClickHouse, except a
+                    // schedule-only change, which is an in-place MODIFY REFRESH.
+                    // Block DROP + CREATE if drop-protected, and any update if
+                    // externally managed. Check the AFTER lifecycle (target_mv)
+                    // to handle transitions.
+                    let modify_only =
+                        is_refresh_schedule_only_change(mv, target_mv, default_database);
+                    let blocked = target_mv.life_cycle.is_any_modification_protected()
+                        || (!modify_only && target_mv.life_cycle.is_drop_protected());
+                    if respect_life_cycle && blocked {
+                        let operation = if modify_only {
+                            "MODIFY REFRESH"
+                        } else {
+                            "DROP+CREATE"
+                        };
                         tracing::warn!(
-                            "Blocking update of {:?} materialized view '{}' (update requires DROP+CREATE)",
+                            "Blocking update of {:?} materialized view '{}' (update requires {})",
                             target_mv.life_cycle,
-                            id
+                            id,
+                            operation
                         );
                         filtered_changes.push(FilteredChange {
                             reason: format!(
-                                "MaterializedView '{}' has {:?} lifecycle - UPDATE (DROP+CREATE) blocked",
-                                mv.name, target_mv.life_cycle
+                                "MaterializedView '{}' has {:?} lifecycle - UPDATE ({}) blocked",
+                                mv.name, target_mv.life_cycle, operation
                             ),
                             change: OlapChange::MaterializedView(Change::Updated {
                                 before: Box::new(mv.clone()),
@@ -906,6 +921,11 @@ impl InfrastructureMap {
         olap_changes: &mut Vec<OlapChange>,
     ) {
         use crate::infrastructure::olap::clickhouse::diff_strategy::ClickHouseTableDiffStrategy;
+
+        // A refreshable view fills itself on its schedule; there is nothing to backfill.
+        if mv.refresh.is_some() {
+            return;
+        }
 
         /// Helper to parse a table reference string (e.g., "`table`" or "`database`.`table`")
         /// and return the database and table names with backticks removed.
@@ -1981,6 +2001,7 @@ impl InfrastructureMap {
             target_database: parsed.target_database,
             metadata,
             life_cycle: crate::framework::core::partial_infrastructure_map::LifeCycle::FullyManaged,
+            refresh: parsed.refresh,
         })
     }
 
@@ -5789,6 +5810,80 @@ mod normalize_tests {
     use crate::framework::core::infrastructure::InfrastructureSignature;
 
     #[test]
+    fn migrates_refreshable_sql_resource() {
+        let resource = SqlResource {
+            name: "mv".to_string(),
+            database: None,
+            source_file: None,
+            source_line: None,
+            source_column: None,
+            setup: vec![
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS mv REFRESH EVERY 1 DAY OFFSET 10 HOUR TO t AS SELECT a FROM s".to_string(),
+            ],
+            teardown: vec!["DROP VIEW IF EXISTS mv".to_string()],
+            pulls_data_from: vec![],
+            pushes_data_to: vec![],
+        };
+        let mv = InfrastructureMap::try_migrate_sql_resource_to_mv(&resource, "local")
+            .expect("refreshable MV should migrate");
+        assert_eq!(mv.target_table, "t");
+        assert!(mv.refresh.is_some());
+    }
+
+    #[test]
+    fn migrated_sql_resource_keeps_unmodelled_refresh_in_ddl() {
+        for clause in [
+            "REFRESH EVERY 1 HOUR DEPENDS ON other_mv",
+            // The server accepts mixed calendar and clock units for AFTER.
+            "REFRESH AFTER 1 MONTH 1 DAY",
+        ] {
+            let resource = SqlResource {
+                name: "mv".to_string(),
+                database: None,
+                source_file: None,
+                source_line: None,
+                source_column: None,
+                setup: vec![format!(
+                    "CREATE MATERIALIZED VIEW IF NOT EXISTS mv {clause} TO t AS SELECT a FROM s"
+                )],
+                teardown: vec!["DROP VIEW IF EXISTS mv".to_string()],
+                pulls_data_from: vec![],
+                pushes_data_to: vec![],
+            };
+            let mv = InfrastructureMap::try_migrate_sql_resource_to_mv(&resource, "local")
+                .expect("an unmodelled refresh clause still migrates");
+            let sql = mv.to_create_sql();
+            assert!(
+                sql.contains(&format!("{clause} TO")),
+                "clause lost from: {sql}"
+            );
+            assert!(
+                !sql.contains("EVERY 0 SECOND"),
+                "placeholder rendered: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_statement_refresh_resource_not_migrated() {
+        let resource = SqlResource {
+            name: "mv".to_string(),
+            database: None,
+            source_file: None,
+            source_line: None,
+            source_column: None,
+            setup: vec![
+                "DROP VIEW IF EXISTS mv".to_string(),
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS mv REFRESH EVERY 1 DAY TO t AS SELECT a FROM s".to_string(),
+            ],
+            teardown: vec!["DROP VIEW IF EXISTS mv".to_string()],
+            pulls_data_from: vec![],
+            pushes_data_to: vec![],
+        };
+        assert!(InfrastructureMap::try_migrate_sql_resource_to_mv(&resource, "local").is_none());
+    }
+
+    #[test]
     fn test_normalize_converts_materialized_view_sql_resource() {
         let mut map = InfrastructureMap::default();
 
@@ -6463,6 +6558,170 @@ mod diff_select_row_policy_tests {
                 assert_eq!(**a, after);
             }
             _ => panic!("Expected SelectRowPolicy Updated"),
+        }
+    }
+
+    mod mv_population {
+        use super::*;
+        use crate::framework::core::infrastructure::materialized_view::MaterializedView;
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        use std::collections::HashMap;
+
+        fn mv(name: &str, refresh: Option<RefreshSchedule>) -> MaterializedView {
+            MaterializedView {
+                name: name.to_string(),
+                database: None,
+                select_sql: "SELECT 1".to_string(),
+                source_tables: vec![],
+                target_table: "t".to_string(),
+                target_database: None,
+                metadata: None,
+                life_cycle: LifeCycle::FullyManaged,
+                refresh,
+            }
+        }
+
+        fn refresh(days: u64) -> RefreshSchedule {
+            RefreshSchedule {
+                kind: RefreshKind::Every,
+                interval: RefreshInterval {
+                    value: days,
+                    unit: IntervalUnit::Day,
+                },
+                offset: None,
+                randomize_for: None,
+                append: false,
+                unmodelled: None,
+            }
+        }
+
+        fn diff(
+            before: HashMap<String, MaterializedView>,
+            after: HashMap<String, MaterializedView>,
+        ) -> Vec<OlapChange> {
+            let mut changes = vec![];
+            let mut filtered = vec![];
+            InfrastructureMap::diff_materialized_views(
+                &before,
+                &after,
+                &HashMap::new(),
+                false,
+                DEFAULT_DATABASE_NAME,
+                &mut changes,
+                &mut filtered,
+                true,
+            );
+            changes
+        }
+
+        fn populations(changes: &[OlapChange]) -> usize {
+            changes
+                .iter()
+                .filter(|c| matches!(c, OlapChange::PopulateMaterializedView { .. }))
+                .count()
+        }
+
+        #[test]
+        fn refreshable_mv_is_not_populated() {
+            let new_mv = mv("fresh", Some(refresh(1)));
+            let changes = diff(
+                HashMap::new(),
+                HashMap::from([("fresh".to_string(), new_mv)]),
+            );
+            assert_eq!(changes.len(), 1);
+            assert_eq!(populations(&changes), 0);
+
+            // A schedule-only update must not repopulate either.
+            let changes = diff(
+                HashMap::from([("fresh".to_string(), mv("fresh", Some(refresh(1))))]),
+                HashMap::from([("fresh".to_string(), mv("fresh", Some(refresh(2))))]),
+            );
+            assert_eq!(changes.len(), 1);
+            assert_eq!(populations(&changes), 0);
+        }
+
+        /// Diffs one view from `before` to `after` under `life_cycle` with
+        /// lifecycle respected; returns (applied, filtered).
+        fn diff_protected(
+            before: MaterializedView,
+            after: MaterializedView,
+            life_cycle: LifeCycle,
+        ) -> (Vec<OlapChange>, Vec<FilteredChange>) {
+            let before = MaterializedView {
+                life_cycle,
+                ..before
+            };
+            let after = MaterializedView {
+                life_cycle,
+                ..after
+            };
+            let mut changes = vec![];
+            let mut filtered = vec![];
+            InfrastructureMap::diff_materialized_views(
+                &HashMap::from([(before.name.clone(), before)]),
+                &HashMap::from([(after.name.clone(), after)]),
+                &HashMap::new(),
+                false,
+                DEFAULT_DATABASE_NAME,
+                &mut changes,
+                &mut filtered,
+                true,
+            );
+            (changes, filtered)
+        }
+
+        #[test]
+        fn deletion_protected_allows_schedule_only_change() {
+            let (changes, filtered) = diff_protected(
+                mv("v", Some(refresh(1))),
+                mv("v", Some(refresh(2))),
+                LifeCycle::DeletionProtected,
+            );
+            assert!(filtered.is_empty(), "filtered: {filtered:?}");
+            assert!(matches!(
+                changes.as_slice(),
+                [OlapChange::MaterializedView(Change::Updated { .. })]
+            ));
+        }
+
+        #[test]
+        fn deletion_protected_still_blocks_drop_create_change() {
+            let mut changed_select = mv("v", Some(refresh(1)));
+            changed_select.select_sql = "SELECT 2".to_string();
+            let mut appended = refresh(2);
+            appended.append = true;
+            for after in [changed_select, mv("v", Some(appended))] {
+                let (changes, filtered) = diff_protected(
+                    mv("v", Some(refresh(1))),
+                    after,
+                    LifeCycle::DeletionProtected,
+                );
+                assert!(changes.is_empty(), "applied: {changes:?}");
+                assert_eq!(filtered.len(), 1);
+            }
+        }
+
+        #[test]
+        fn externally_managed_blocks_schedule_only_change() {
+            let (changes, filtered) = diff_protected(
+                mv("v", Some(refresh(1))),
+                mv("v", Some(refresh(2))),
+                LifeCycle::ExternallyManaged,
+            );
+            assert!(changes.is_empty(), "applied: {changes:?}");
+            assert_eq!(filtered.len(), 1);
+        }
+
+        #[test]
+        fn incremental_mv_is_still_populated() {
+            let changes = diff(
+                HashMap::new(),
+                HashMap::from([("plain".to_string(), mv("plain", None))]),
+            );
+            assert_eq!(changes.len(), 2);
+            assert_eq!(populations(&changes), 1);
         }
     }
 }

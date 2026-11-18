@@ -184,6 +184,13 @@ pub enum AtomicOlapOperation {
         /// Dependency information
         dependency_info: DependencyInfo,
     },
+    /// Change the refresh schedule of a refreshable materialized view in place
+    ModifyMaterializedViewRefresh {
+        /// The materialized view with its new refresh schedule
+        mv: crate::framework::core::infrastructure::materialized_view::MaterializedView,
+        /// Dependency information
+        dependency_info: DependencyInfo,
+    },
     /// Drop a structured materialized view
     DropMaterializedView {
         /// The materialized view to drop
@@ -432,6 +439,18 @@ impl AtomicOlapOperation {
                     target_table: mv.target_table.clone(),
                     target_database: mv.target_database.clone(),
                     select_sql: mv.select_sql.clone(),
+                    refresh: mv.refresh.clone(),
+                }
+            }
+            AtomicOlapOperation::ModifyMaterializedViewRefresh { mv, .. } => {
+                SerializableOlapOperation::ModifyMaterializedViewRefresh {
+                    name: mv.name.clone(),
+                    database: mv.database.clone(),
+                    // Only constructed for views that have a schedule.
+                    refresh: mv
+                        .refresh
+                        .clone()
+                        .expect("ModifyMaterializedViewRefresh requires a refresh schedule"),
                 }
             }
             AtomicOlapOperation::DropMaterializedView { mv, .. } => {
@@ -539,7 +558,8 @@ impl AtomicOlapOperation {
                     id: resource.name.clone(),
                 }
             }
-            AtomicOlapOperation::CreateMaterializedView { mv, .. } => {
+            AtomicOlapOperation::CreateMaterializedView { mv, .. }
+            | AtomicOlapOperation::ModifyMaterializedViewRefresh { mv, .. } => {
                 InfrastructureSignature::MaterializedView {
                     id: mv.id(default_database),
                 }
@@ -616,6 +636,9 @@ impl AtomicOlapOperation {
                 dependency_info, ..
             }
             | AtomicOlapOperation::CreateMaterializedView {
+                dependency_info, ..
+            }
+            | AtomicOlapOperation::ModifyMaterializedViewRefresh {
                 dependency_info, ..
             }
             | AtomicOlapOperation::DropMaterializedView {
@@ -1391,6 +1414,7 @@ fn handle_sql_resource_update(
     plan
 }
 
+use crate::framework::core::infra_reality_checker::is_refresh_schedule_only_change;
 use crate::framework::core::infrastructure::materialized_view::MaterializedView;
 use crate::framework::core::infrastructure::view::View;
 
@@ -1445,6 +1469,18 @@ fn handle_materialized_view_update(
     after: &MaterializedView,
     default_database: &str,
 ) -> OperationPlan {
+    // A schedule-only change on a refreshable view is applied in place with
+    // `ALTER TABLE ... MODIFY REFRESH`: no drop, no recreate, nothing to backfill.
+    if is_refresh_schedule_only_change(before, after, default_database) {
+        return OperationPlan::setup(vec![AtomicOlapOperation::ModifyMaterializedViewRefresh {
+            mv: after.clone(),
+            dependency_info: create_dependency_info(
+                after.pulls_data_from(default_database),
+                after.pushes_data_to(default_database),
+            ),
+        }]);
+    }
+
     let before_pulls = before.pulls_data_from(default_database);
     let before_pushes = before.pushes_data_to(default_database);
     let teardown_op = AtomicOlapOperation::DropMaterializedView {
@@ -4928,6 +4964,119 @@ mod tests {
                 projection.body, "(col_b ORDER BY col_b)",
                 "re-added projection must use the new body"
             );
+        }
+    }
+
+    mod refreshable_mv_updates {
+        use super::*;
+        use crate::framework::core::infrastructure::materialized_view::MaterializedView;
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+
+        fn schedule(days: u64, append: bool) -> RefreshSchedule {
+            RefreshSchedule {
+                kind: RefreshKind::Every,
+                interval: RefreshInterval {
+                    value: days,
+                    unit: IntervalUnit::Day,
+                },
+                offset: None,
+                randomize_for: None,
+                append,
+                unmodelled: None,
+            }
+        }
+
+        fn mv(select: &str, refresh: Option<RefreshSchedule>) -> MaterializedView {
+            MaterializedView {
+                name: "daily_mv".to_string(),
+                database: None,
+                select_sql: select.to_string(),
+                source_tables: vec![],
+                target_table: "daily".to_string(),
+                target_database: None,
+                metadata: None,
+                life_cycle: LifeCycle::FullyManaged,
+                refresh,
+            }
+        }
+
+        fn assert_drop_and_create(plan: &OperationPlan) {
+            assert_eq!(plan.teardown_ops.len(), 1);
+            assert!(matches!(
+                plan.teardown_ops[0],
+                AtomicOlapOperation::DropMaterializedView { .. }
+            ));
+            assert_eq!(plan.setup_ops.len(), 1);
+            assert!(matches!(
+                plan.setup_ops[0],
+                AtomicOlapOperation::CreateMaterializedView { .. }
+            ));
+        }
+
+        #[test]
+        fn schedule_only_change_is_modify() {
+            let before = mv("SELECT 1", Some(schedule(1, false)));
+            let after = mv("SELECT 1", Some(schedule(2, false)));
+            let plan = handle_materialized_view_update(&before, &after, "mydb");
+            assert!(plan.teardown_ops.is_empty());
+            assert_eq!(plan.setup_ops.len(), 1);
+            match &plan.setup_ops[0] {
+                AtomicOlapOperation::ModifyMaterializedViewRefresh { mv, .. } => {
+                    assert_eq!(mv, &after);
+                    match plan.setup_ops[0].to_minimal() {
+                        SerializableOlapOperation::ModifyMaterializedViewRefresh {
+                            name,
+                            database,
+                            refresh,
+                        } => {
+                            assert_eq!(name, "daily_mv");
+                            assert_eq!(database, None);
+                            assert_eq!(refresh, schedule(2, false));
+                        }
+                        other => panic!("unexpected op {other:?}"),
+                    }
+                }
+                other => panic!("expected ModifyMaterializedViewRefresh, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn select_change_on_refreshable_is_drop_create() {
+            let before = mv("SELECT 1", Some(schedule(1, false)));
+            let after = mv("SELECT 2", Some(schedule(2, false)));
+            assert_drop_and_create(&handle_materialized_view_update(&before, &after, "mydb"));
+        }
+
+        #[test]
+        fn append_change_is_drop_create() {
+            let before = mv("SELECT 1", Some(schedule(1, false)));
+            let after = mv("SELECT 1", Some(schedule(1, true)));
+            assert_drop_and_create(&handle_materialized_view_update(&before, &after, "mydb"));
+        }
+
+        #[test]
+        fn adding_refresh_is_drop_create() {
+            let before = mv("SELECT 1", None);
+            let after = mv("SELECT 1", Some(schedule(1, false)));
+            assert_drop_and_create(&handle_materialized_view_update(&before, &after, "mydb"));
+        }
+
+        #[test]
+        fn removing_refresh_is_drop_create() {
+            let before = mv("SELECT 1", Some(schedule(1, false)));
+            let after = mv("SELECT 1", None);
+            assert_drop_and_create(&handle_materialized_view_update(&before, &after, "mydb"));
+        }
+
+        #[test]
+        fn unmodelled_clause_is_drop_create() {
+            let mut unmodelled = schedule(1, false);
+            unmodelled.unmodelled = Some("DEPENDS ON x".to_string());
+            let before = mv("SELECT 1", Some(unmodelled));
+            let after = mv("SELECT 1", Some(schedule(2, false)));
+            assert_drop_and_create(&handle_materialized_view_update(&before, &after, "mydb"));
         }
     }
 }
