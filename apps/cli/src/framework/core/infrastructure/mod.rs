@@ -25,6 +25,7 @@ pub mod consumption_webserver;
 pub mod function_process;
 pub mod materialized_view;
 pub mod orchestration_worker;
+pub mod refresh;
 pub mod select_row_policy;
 pub mod sql_resource;
 pub mod table;
