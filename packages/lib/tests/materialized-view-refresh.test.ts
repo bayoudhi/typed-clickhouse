@@ -148,4 +148,17 @@ describe("MaterializedView refresh", () => {
     const bad: RefreshConfig = { after: "1 HOUR", offset: "5 MINUTE" };
     expect(bad).to.be.an("object");
   });
+
+  it("rejects every and after together at runtime", () => {
+    expect(() =>
+      makeMv("mv", { every: "1 DAY", after: "1 HOUR" } as any),
+    ).to.throw(/materialized view 'mv'.*either EVERY or AFTER, not both/);
+    expect(getInternalRegistry().materializedViews.has("mv")).to.equal(false);
+  });
+
+  it("every and after together do not typecheck", () => {
+    // @ts-expect-error a schedule is either EVERY or AFTER
+    const bad: RefreshConfig = { every: "1 DAY", after: "1 HOUR" };
+    expect(bad).to.be.an("object");
+  });
 });

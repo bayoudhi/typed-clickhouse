@@ -37,11 +37,12 @@ export type RefreshInterval = `${number} ${IntervalUnit}`;
  * Schedule for a refreshable materialized view.
  * `every` runs on a fixed schedule (optionally shifted by `offset`);
  * `after` waits the interval after the previous refresh finishes.
- * `offset` is only valid with `every`.
+ * Give exactly one of `every` and `after`; `offset` is only valid with `every`.
  */
 export type RefreshConfig =
   | {
       every: RefreshInterval;
+      after?: never;
       offset?: RefreshInterval;
       randomizeFor?: RefreshInterval;
       append?: boolean;
@@ -110,6 +111,11 @@ export const normalizeRefresh = (
     randomizeFor?: string;
     append?: boolean;
   };
+  if (r.every !== undefined && r.after !== undefined) {
+    throw new Error(
+      `Invalid refresh on materialized view '${viewName}': give either EVERY or AFTER, not both`,
+    );
+  }
   const kind = r.every !== undefined ? "every" : "after";
   if (kind === "after" && r.offset !== undefined) {
     throw new Error(
