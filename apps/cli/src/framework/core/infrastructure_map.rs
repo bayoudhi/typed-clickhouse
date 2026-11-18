@@ -907,6 +907,11 @@ impl InfrastructureMap {
     ) {
         use crate::infrastructure::olap::clickhouse::diff_strategy::ClickHouseTableDiffStrategy;
 
+        // A refreshable view fills itself on its schedule; there is nothing to backfill.
+        if mv.refresh.is_some() {
+            return;
+        }
+
         /// Helper to parse a table reference string (e.g., "`table`" or "`database`.`table`")
         /// and return the database and table names with backticks removed.
         fn parse_table_reference(table_ref: &str) -> (Option<String>, String) {
@@ -6504,6 +6509,98 @@ mod diff_select_row_policy_tests {
                 assert_eq!(**a, after);
             }
             _ => panic!("Expected SelectRowPolicy Updated"),
+        }
+    }
+
+    mod mv_population {
+        use super::*;
+        use crate::framework::core::infrastructure::materialized_view::MaterializedView;
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        use std::collections::HashMap;
+
+        fn mv(name: &str, refresh: Option<RefreshSchedule>) -> MaterializedView {
+            MaterializedView {
+                name: name.to_string(),
+                database: None,
+                select_sql: "SELECT 1".to_string(),
+                source_tables: vec![],
+                target_table: "t".to_string(),
+                target_database: None,
+                metadata: None,
+                life_cycle: LifeCycle::FullyManaged,
+                refresh,
+            }
+        }
+
+        fn refresh(days: u64) -> RefreshSchedule {
+            RefreshSchedule {
+                kind: RefreshKind::Every,
+                interval: RefreshInterval {
+                    value: days,
+                    unit: IntervalUnit::Day,
+                },
+                offset: None,
+                randomize_for: None,
+                append: false,
+                unmodelled: None,
+            }
+        }
+
+        fn diff(
+            before: HashMap<String, MaterializedView>,
+            after: HashMap<String, MaterializedView>,
+        ) -> Vec<OlapChange> {
+            let mut changes = vec![];
+            let mut filtered = vec![];
+            InfrastructureMap::diff_materialized_views(
+                &before,
+                &after,
+                &HashMap::new(),
+                false,
+                DEFAULT_DATABASE_NAME,
+                &mut changes,
+                &mut filtered,
+                true,
+            );
+            changes
+        }
+
+        fn populations(changes: &[OlapChange]) -> usize {
+            changes
+                .iter()
+                .filter(|c| matches!(c, OlapChange::PopulateMaterializedView { .. }))
+                .count()
+        }
+
+        #[test]
+        fn refreshable_mv_is_not_populated() {
+            let new_mv = mv("fresh", Some(refresh(1)));
+            let changes = diff(
+                HashMap::new(),
+                HashMap::from([("fresh".to_string(), new_mv)]),
+            );
+            assert_eq!(changes.len(), 1);
+            assert_eq!(populations(&changes), 0);
+
+            // A schedule-only update must not repopulate either.
+            let changes = diff(
+                HashMap::from([("fresh".to_string(), mv("fresh", Some(refresh(1))))]),
+                HashMap::from([("fresh".to_string(), mv("fresh", Some(refresh(2))))]),
+            );
+            assert_eq!(changes.len(), 1);
+            assert_eq!(populations(&changes), 0);
+        }
+
+        #[test]
+        fn incremental_mv_is_still_populated() {
+            let changes = diff(
+                HashMap::new(),
+                HashMap::from([("plain".to_string(), mv("plain", None))]),
+            );
+            assert_eq!(changes.len(), 2);
+            assert_eq!(populations(&changes), 1);
         }
     }
 }

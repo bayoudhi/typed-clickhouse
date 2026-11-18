@@ -355,6 +355,7 @@ fn validate_table_databases_and_clusters(
                 // RawSql doesn't reference specific tables/databases/clusters, skip validation
             }
             SerializableOlapOperation::CreateMaterializedView { .. }
+            | SerializableOlapOperation::ModifyMaterializedViewRefresh { .. }
             | SerializableOlapOperation::DropMaterializedView { .. }
             | SerializableOlapOperation::CreateView { .. }
             | SerializableOlapOperation::DropView { .. } => {

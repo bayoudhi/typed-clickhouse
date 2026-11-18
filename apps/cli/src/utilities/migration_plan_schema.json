@@ -394,12 +394,204 @@
                 "select_sql": {
                   "description": "The SELECT SQL statement",
                   "type": "string"
+                },
+                "refresh": {
+                  "description": "Refresh schedule; present only for a refreshable materialized view",
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "description": "EVERY is wall-clock, AFTER is relative to the last refresh",
+                      "type": "string",
+                      "enum": ["every", "after"]
+                    },
+                    "interval": {
+                      "type": "object",
+                      "properties": {
+                        "value": { "type": "integer", "minimum": 0 },
+                        "unit": {
+                          "type": "string",
+                          "enum": [
+                            "SECOND",
+                            "MINUTE",
+                            "HOUR",
+                            "DAY",
+                            "WEEK",
+                            "MONTH",
+                            "YEAR"
+                          ]
+                        }
+                      },
+                      "required": ["value", "unit"]
+                    },
+                    "offset": {
+                      "description": "Optional OFFSET",
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "value": { "type": "integer", "minimum": 0 },
+                            "unit": {
+                              "type": "string",
+                              "enum": [
+                                "SECOND",
+                                "MINUTE",
+                                "HOUR",
+                                "DAY",
+                                "WEEK",
+                                "MONTH",
+                                "YEAR"
+                              ]
+                            }
+                          },
+                          "required": ["value", "unit"]
+                        },
+                        { "type": "null" }
+                      ]
+                    },
+                    "randomizeFor": {
+                      "description": "Optional RANDOMIZE FOR",
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "value": { "type": "integer", "minimum": 0 },
+                            "unit": {
+                              "type": "string",
+                              "enum": [
+                                "SECOND",
+                                "MINUTE",
+                                "HOUR",
+                                "DAY",
+                                "WEEK",
+                                "MONTH",
+                                "YEAR"
+                              ]
+                            }
+                          },
+                          "required": ["value", "unit"]
+                        },
+                        { "type": "null" }
+                      ]
+                    },
+                    "append": {
+                      "description": "APPEND mode",
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["kind", "interval"]
                 }
               },
               "required": ["name", "target_table", "select_sql"]
             }
           },
           "required": ["CreateMaterializedView"],
+          "additionalProperties": false
+        },
+        {
+          "description": "Change the refresh schedule of a refreshable materialized view",
+          "type": "object",
+          "properties": {
+            "ModifyMaterializedViewRefresh": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "description": "Name of the materialized view",
+                  "type": "string"
+                },
+                "database": {
+                  "description": "Database where the MV is located",
+                  "type": ["string", "null"]
+                },
+                "refresh": {
+                  "description": "The new refresh schedule",
+                  "type": "object",
+                  "properties": {
+                    "kind": {
+                      "description": "EVERY is wall-clock, AFTER is relative to the last refresh",
+                      "type": "string",
+                      "enum": ["every", "after"]
+                    },
+                    "interval": {
+                      "type": "object",
+                      "properties": {
+                        "value": { "type": "integer", "minimum": 0 },
+                        "unit": {
+                          "type": "string",
+                          "enum": [
+                            "SECOND",
+                            "MINUTE",
+                            "HOUR",
+                            "DAY",
+                            "WEEK",
+                            "MONTH",
+                            "YEAR"
+                          ]
+                        }
+                      },
+                      "required": ["value", "unit"]
+                    },
+                    "offset": {
+                      "description": "Optional OFFSET",
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "value": { "type": "integer", "minimum": 0 },
+                            "unit": {
+                              "type": "string",
+                              "enum": [
+                                "SECOND",
+                                "MINUTE",
+                                "HOUR",
+                                "DAY",
+                                "WEEK",
+                                "MONTH",
+                                "YEAR"
+                              ]
+                            }
+                          },
+                          "required": ["value", "unit"]
+                        },
+                        { "type": "null" }
+                      ]
+                    },
+                    "randomizeFor": {
+                      "description": "Optional RANDOMIZE FOR",
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "value": { "type": "integer", "minimum": 0 },
+                            "unit": {
+                              "type": "string",
+                              "enum": [
+                                "SECOND",
+                                "MINUTE",
+                                "HOUR",
+                                "DAY",
+                                "WEEK",
+                                "MONTH",
+                                "YEAR"
+                              ]
+                            }
+                          },
+                          "required": ["value", "unit"]
+                        },
+                        { "type": "null" }
+                      ]
+                    },
+                    "append": {
+                      "description": "APPEND mode",
+                      "type": "boolean"
+                    }
+                  },
+                  "required": ["kind", "interval"]
+                }
+              },
+              "required": ["name", "refresh"]
+            }
+          },
+          "required": ["ModifyMaterializedViewRefresh"],
           "additionalProperties": false
         },
         {

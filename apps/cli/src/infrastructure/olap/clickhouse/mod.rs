@@ -55,7 +55,7 @@ use tracing::{debug, info, instrument, warn};
 use crate::cli::logger::{context, resource_type};
 
 use self::model::ClickHouseSystemTable;
-use crate::framework::core::infrastructure::refresh::split_refresh_clause;
+use crate::framework::core::infrastructure::refresh::{split_refresh_clause, RefreshSchedule};
 use crate::framework::core::infrastructure::select_row_policy::{
     SelectRowPolicy, TableReference, MOOSE_RLS_ROLE,
 };
@@ -271,6 +271,18 @@ pub enum SerializableOlapOperation {
         target_database: Option<String>,
         /// The SELECT SQL statement
         select_sql: String,
+        /// Refresh schedule; `Some` creates a refreshable materialized view
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refresh: Option<RefreshSchedule>,
+    },
+    /// Change the refresh schedule of a refreshable materialized view
+    ModifyMaterializedViewRefresh {
+        /// Name of the materialized view
+        name: String,
+        /// Database where the MV is located (None = default database)
+        database: Option<String>,
+        /// The new refresh schedule
+        refresh: RefreshSchedule,
     },
     /// Drop a materialized view
     DropMaterializedView {
@@ -403,6 +415,7 @@ fn extract_cluster_name(op: &AtomicOlapOperation) -> Option<&str> {
         | AtomicOlapOperation::RunSetupSql { .. }
         | AtomicOlapOperation::RunTeardownSql { .. }
         | AtomicOlapOperation::CreateMaterializedView { .. }
+        | AtomicOlapOperation::ModifyMaterializedViewRefresh { .. }
         | AtomicOlapOperation::DropMaterializedView { .. }
         | AtomicOlapOperation::CreateView { .. }
         | AtomicOlapOperation::DropView { .. }
@@ -637,6 +650,9 @@ pub fn describe_operation(operation: &SerializableOlapOperation) -> String {
                 "Creating materialized view '{}' -> table '{}'",
                 name, target_table
             )
+        }
+        SerializableOlapOperation::ModifyMaterializedViewRefresh { name, .. } => {
+            format!("Modifying refresh schedule of materialized view '{}'", name)
         }
         SerializableOlapOperation::DropMaterializedView { name, .. } => {
             format!("Dropping materialized view '{}'", name)
@@ -891,6 +907,7 @@ pub async fn execute_atomic_operation(
             target_table,
             target_database,
             select_sql,
+            refresh,
         } => {
             execute_create_materialized_view(
                 db_name,
@@ -899,6 +916,21 @@ pub async fn execute_atomic_operation(
                 target_table,
                 target_database.as_deref(),
                 select_sql,
+                refresh.as_ref(),
+                client,
+            )
+            .await?;
+        }
+        SerializableOlapOperation::ModifyMaterializedViewRefresh {
+            name,
+            database,
+            refresh,
+        } => {
+            execute_modify_materialized_view_refresh(
+                db_name,
+                name,
+                database.as_deref(),
+                refresh,
                 client,
             )
             .await?;
@@ -1913,6 +1945,81 @@ fn strip_backticks(s: &str) -> String {
     s.trim().trim_matches('`').replace('`', "")
 }
 
+/// Builds the CREATE MATERIALIZED VIEW statement; a refresh schedule goes between
+/// the name and `TO`.
+fn build_create_materialized_view_sql(
+    db_name: &str,
+    view_name: &str,
+    view_database: Option<&str>,
+    target_table: &str,
+    target_database: Option<&str>,
+    select_sql: &str,
+    refresh: Option<&RefreshSchedule>,
+) -> String {
+    let target_db = view_database.unwrap_or(db_name);
+    // Strip any existing backticks from target_table to avoid double-backticks
+    let clean_target_table = strip_backticks(target_table);
+    let to_target = match target_database {
+        Some(tdb) => format!("`{}`.`{}`", tdb, clean_target_table),
+        None => format!("`{}`.`{}`", target_db, clean_target_table),
+    };
+    let refresh_clause = refresh
+        .map(|r| format!(" {}", r.to_create_clause()))
+        .unwrap_or_default();
+    format!(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS `{}`.`{}`{} TO {} AS {}",
+        target_db, view_name, refresh_clause, to_target, select_sql
+    )
+}
+
+/// Builds the statement that changes a refreshable materialized view's schedule.
+fn build_modify_materialized_view_refresh_sql(
+    db_name: &str,
+    view_name: &str,
+    view_database: Option<&str>,
+    refresh: &RefreshSchedule,
+) -> String {
+    format!(
+        "ALTER TABLE `{}`.`{}` MODIFY {}",
+        view_database.unwrap_or(db_name),
+        view_name,
+        refresh.schedule_sql()
+    )
+}
+
+/// Executes `ALTER TABLE ... MODIFY REFRESH ...` on a refreshable materialized view
+#[instrument(
+    name = "modify_materialized_view_refresh",
+    skip_all,
+    fields(
+        context = context::BOOT,
+        resource_type = resource_type::MATERIALIZED_VIEW,
+        resource_name = %view_name,
+    )
+)]
+async fn execute_modify_materialized_view_refresh(
+    db_name: &str,
+    view_name: &str,
+    view_database: Option<&str>,
+    refresh: &RefreshSchedule,
+    client: &ConfiguredDBClient,
+) -> Result<(), ClickhouseChangesError> {
+    let sql =
+        build_modify_materialized_view_refresh_sql(db_name, view_name, view_database, refresh);
+    tracing::info!(
+        "Modifying refresh schedule of materialized view: {}",
+        view_name
+    );
+    tracing::debug!("MV SQL: {}", sql);
+    run_query(&sql, client)
+        .await
+        .map_err(|e| ClickhouseChangesError::ClickhouseClient {
+            error: e,
+            resource: Some(format!("materialized_view:{}", view_name)),
+        })?;
+    Ok(())
+}
+
 /// Executes a CREATE MATERIALIZED VIEW statement
 #[instrument(
     name = "create_materialized_view",
@@ -1923,6 +2030,7 @@ fn strip_backticks(s: &str) -> String {
         resource_name = %view_name,
     )
 )]
+#[allow(clippy::too_many_arguments)]
 async fn execute_create_materialized_view(
     db_name: &str,
     view_name: &str,
@@ -1930,18 +2038,18 @@ async fn execute_create_materialized_view(
     target_table: &str,
     target_database: Option<&str>,
     select_sql: &str,
+    refresh: Option<&RefreshSchedule>,
     client: &ConfiguredDBClient,
 ) -> Result<(), ClickhouseChangesError> {
     let target_db = view_database.unwrap_or(db_name);
-    // Strip any existing backticks from target_table to avoid double-backticks
-    let clean_target_table = strip_backticks(target_table);
-    let to_target = match target_database {
-        Some(tdb) => format!("`{}`.`{}`", tdb, clean_target_table),
-        None => format!("`{}`.`{}`", target_db, clean_target_table),
-    };
-    let sql = format!(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS `{}`.`{}` TO {} AS {}",
-        target_db, view_name, to_target, select_sql
+    let sql = build_create_materialized_view_sql(
+        db_name,
+        view_name,
+        view_database,
+        target_table,
+        target_database,
+        select_sql,
+        refresh,
     );
     tracing::info!("Creating materialized view: {}.{}", target_db, view_name);
     tracing::debug!("MV SQL: {}", sql);
@@ -5830,6 +5938,78 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             q.sql_display().to_string(),
             sql,
             "query without `?` should be unchanged"
+        );
+    }
+
+    #[test]
+    fn serializable_create_without_refresh_unchanged() {
+        let op = SerializableOlapOperation::CreateMaterializedView {
+            name: "mv".to_string(),
+            database: None,
+            target_table: "t".to_string(),
+            target_database: None,
+            select_sql: "SELECT 1".to_string(),
+            refresh: None,
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        let inner = &json["CreateMaterializedView"];
+        assert!(
+            inner.get("refresh").is_none(),
+            "unexpected refresh key: {json}"
+        );
+        let back: SerializableOlapOperation = serde_json::from_value(json).unwrap();
+        assert_eq!(back, op);
+    }
+
+    #[test]
+    fn create_mv_sql_places_refresh_before_to() {
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        let refresh = RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: 1,
+                unit: IntervalUnit::Day,
+            },
+            offset: None,
+            randomize_for: None,
+            append: true,
+            unmodelled: None,
+        };
+        assert_eq!(
+            build_create_materialized_view_sql("db", "mv", None, "t", None, "SELECT 1", Some(&refresh)),
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv` REFRESH EVERY 1 DAY APPEND TO `db`.`t` AS SELECT 1"
+        );
+        assert_eq!(
+            build_create_materialized_view_sql("db", "mv", None, "t", None, "SELECT 1", None),
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv` TO `db`.`t` AS SELECT 1"
+        );
+    }
+
+    #[test]
+    fn modify_refresh_sql_is_alter_table_modify() {
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        let refresh = RefreshSchedule {
+            kind: RefreshKind::After,
+            interval: RefreshInterval {
+                value: 2,
+                unit: IntervalUnit::Hour,
+            },
+            offset: None,
+            randomize_for: None,
+            append: false,
+            unmodelled: None,
+        };
+        assert_eq!(
+            build_modify_materialized_view_refresh_sql("db", "mv", Some("other"), &refresh),
+            "ALTER TABLE `other`.`mv` MODIFY REFRESH AFTER 2 HOUR"
+        );
+        assert_eq!(
+            build_modify_materialized_view_refresh_sql("db", "mv", None, &refresh),
+            "ALTER TABLE `db`.`mv` MODIFY REFRESH AFTER 2 HOUR"
         );
     }
 }

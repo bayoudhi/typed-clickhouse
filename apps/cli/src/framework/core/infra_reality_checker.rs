@@ -182,11 +182,20 @@ pub fn materialized_views_are_equivalent(
         return false;
     }
 
-    // Compare source tables (order-independent via HashSet)
-    let sources1 = normalize_source_tables(&mv1.source_tables, default_database);
-    let sources2 = normalize_source_tables(&mv2.source_tables, default_database);
-    if sources1 != sources2 {
+    // Compare the refresh schedule by value
+    if mv1.refresh != mv2.refresh {
         return false;
+    }
+
+    // Compare source tables (order-independent via HashSet). A refreshable view
+    // has no incremental source tracking, and the read-back side recovers them
+    // from SQL, so they are not compared there.
+    if mv1.refresh.is_none() && mv2.refresh.is_none() {
+        let sources1 = normalize_source_tables(&mv1.source_tables, default_database);
+        let sources2 = normalize_source_tables(&mv2.source_tables, default_database);
+        if sources1 != sources2 {
+            return false;
+        }
     }
 
     // Compare SELECT SQL (must be pre-normalized via ClickHouse + Rust db prefix stripping)
@@ -1787,6 +1796,65 @@ mod tests {
             materialized_views_are_equivalent(&mv1, &mv2, default_db),
             "Pre-normalized MVs should be equivalent"
         );
+    }
+
+    fn refresh_test_mv(
+        sources: &[&str],
+        refresh: Option<crate::framework::core::infrastructure::refresh::RefreshSchedule>,
+    ) -> crate::framework::core::infrastructure::materialized_view::MaterializedView {
+        crate::framework::core::infrastructure::materialized_view::MaterializedView {
+            name: "test_mv".to_string(),
+            database: None,
+            target_table: "events".to_string(),
+            target_database: None,
+            select_sql: "SELECT * FROM a".to_string(),
+            source_tables: sources.iter().map(|s| s.to_string()).collect(),
+            metadata: None,
+            life_cycle: LifeCycle::FullyManaged,
+            refresh,
+        }
+    }
+
+    fn every_days(days: u64) -> crate::framework::core::infrastructure::refresh::RefreshSchedule {
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: days,
+                unit: IntervalUnit::Day,
+            },
+            offset: None,
+            randomize_for: None,
+            append: false,
+            unmodelled: None,
+        }
+    }
+
+    #[test]
+    fn refresh_difference_is_not_equivalent() {
+        let a = refresh_test_mv(&["a"], Some(every_days(1)));
+        let b = refresh_test_mv(&["a"], Some(every_days(2)));
+        let none = refresh_test_mv(&["a"], None);
+        assert!(!materialized_views_are_equivalent(&a, &b, "mydb"));
+        assert!(!materialized_views_are_equivalent(&a, &none, "mydb"));
+        assert!(!materialized_views_are_equivalent(&none, &a, "mydb"));
+        assert!(materialized_views_are_equivalent(&a, &a.clone(), "mydb"));
+    }
+
+    #[test]
+    fn refreshable_ignores_source_tables() {
+        let a = refresh_test_mv(&["a"], Some(every_days(1)));
+        let b = refresh_test_mv(&["a", "b"], Some(every_days(1)));
+        assert!(materialized_views_are_equivalent(&a, &b, "mydb"));
+    }
+
+    #[test]
+    fn incremental_still_compares_source_tables() {
+        let a = refresh_test_mv(&["a"], None);
+        let b = refresh_test_mv(&["a", "b"], None);
+        assert!(!materialized_views_are_equivalent(&a, &b, "mydb"));
     }
 
     #[test]
