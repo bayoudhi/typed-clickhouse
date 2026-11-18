@@ -691,7 +691,7 @@ async fn live_unmodelled_refresh_is_not_equal_to_plain_schedule() {
 }
 
 #[tokio::test]
-async fn live_refresh_select_change_keeps_target_rows() {
+async fn live_refresh_select_change_drops_only_the_view() {
     if !enabled() {
         eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
         return;
@@ -710,12 +710,11 @@ async fn live_refresh_select_change_keeps_target_rows() {
         "SELECT count() AS count FROM `{DB}`.`device_snapshot`"
     ))
     .await;
+    // Sanity check of the fixture only: every non-APPEND refresh, including
+    // the one ClickHouse runs at CREATE, swaps in a new target table and
+    // refills it, so neither row counts nor the target's uuid can show that
+    // apply left the target alone. The op shape below and the query log do.
     assert!(before_rows > 0, "the refresh did not fill device_snapshot");
-    let uuid_sql = format!(
-        "SELECT toString(uuid) AS text FROM system.tables \
-         WHERE database = '{DB}' AND name = 'device_snapshot'"
-    );
-    let uuid_before = text_of(&uuid_sql).await;
 
     let changed = with_snapshot_view(&full, |mv| {
         mv.select_sql.push_str(" HAVING readings >= 0");
@@ -745,20 +744,27 @@ async fn live_refresh_select_change_keeps_target_rows() {
         "expected only a view create, got {setup:?}"
     );
 
+    let started = text_of("SELECT toString(now64(6)) AS text").await;
     apply(&project, &full, &changed).await;
 
-    // No SYSTEM REFRESH here: the rows must already be there, because the
-    // target table was never dropped. Its identity must be unchanged too.
-    let rows = count_rows(&format!(
-        "SELECT count() AS count FROM `{DB}`.`device_snapshot`"
+    // Refreshes swap the target internally and log no DROP; a DROP naming the
+    // target can only come from the apply.
+    exec("SYSTEM FLUSH LOGS").await;
+    let target_drops = count_rows(&format!(
+        "SELECT count() AS count FROM system.query_log \
+         WHERE event_time_microseconds >= toDateTime64('{started}', 6) \
+           AND query_kind = 'Drop' AND has(tables, '{DB}.device_snapshot')"
     ))
     .await;
-    assert!(rows > 0, "device_snapshot was emptied by the view change");
-    assert_eq!(
-        text_of(&uuid_sql).await,
-        uuid_before,
-        "device_snapshot was recreated"
-    );
+    assert_eq!(target_drops, 0, "apply dropped the target table");
+    let view_drops = count_rows(&format!(
+        "SELECT count() AS count FROM system.query_log \
+         WHERE event_time_microseconds >= toDateTime64('{started}', 6) \
+           AND query_kind = 'Drop' AND type = 'QueryFinish' \
+           AND has(tables, '{DB}.mv_device_snapshot')"
+    ))
+    .await;
+    assert_eq!(view_drops, 1, "the query log did not record the view drop");
 }
 
 #[tokio::test]
