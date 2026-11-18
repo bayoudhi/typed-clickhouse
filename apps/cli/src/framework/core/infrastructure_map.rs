@@ -5816,6 +5816,40 @@ mod normalize_tests {
     }
 
     #[test]
+    fn migrated_sql_resource_keeps_unmodelled_refresh_in_ddl() {
+        for clause in [
+            "REFRESH EVERY 1 HOUR DEPENDS ON other_mv",
+            // The server accepts mixed calendar and clock units for AFTER.
+            "REFRESH AFTER 1 MONTH 1 DAY",
+        ] {
+            let resource = SqlResource {
+                name: "mv".to_string(),
+                database: None,
+                source_file: None,
+                source_line: None,
+                source_column: None,
+                setup: vec![format!(
+                    "CREATE MATERIALIZED VIEW IF NOT EXISTS mv {clause} TO t AS SELECT a FROM s"
+                )],
+                teardown: vec!["DROP VIEW IF EXISTS mv".to_string()],
+                pulls_data_from: vec![],
+                pushes_data_to: vec![],
+            };
+            let mv = InfrastructureMap::try_migrate_sql_resource_to_mv(&resource, "local")
+                .expect("an unmodelled refresh clause still migrates");
+            let sql = mv.to_create_sql();
+            assert!(
+                sql.contains(&format!("{clause} TO")),
+                "clause lost from: {sql}"
+            );
+            assert!(
+                !sql.contains("EVERY 0 SECOND"),
+                "placeholder rendered: {sql}"
+            );
+        }
+    }
+
+    #[test]
     fn multi_statement_refresh_resource_not_migrated() {
         let resource = SqlResource {
             name: "mv".to_string(),

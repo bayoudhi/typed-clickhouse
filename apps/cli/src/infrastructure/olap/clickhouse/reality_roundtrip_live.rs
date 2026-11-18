@@ -651,6 +651,46 @@ async fn live_refresh_schedule_change_on_append_view_is_modify_only() {
 }
 
 #[tokio::test]
+async fn live_unmodelled_refresh_is_not_equal_to_plain_schedule() {
+    if !enabled() {
+        eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
+        return;
+    }
+
+    let project = project();
+    let full = apply_full_fixture(&project).await;
+    // Give the deployed view a DEPENDS ON the code does not have. Read back,
+    // it must not pass for the code's plain `EVERY 1 DAY OFFSET 10 HOUR`.
+    exec(&format!(
+        "CREATE TABLE `{DB}`.`upstream_target` (x UInt8) ENGINE = MergeTree ORDER BY x"
+    ))
+    .await;
+    exec(&format!(
+        "CREATE MATERIALIZED VIEW `{DB}`.`upstream_mv` REFRESH EVERY 1 DAY OFFSET 10 HOUR \
+         TO `{DB}`.`upstream_target` AS SELECT 1 AS x"
+    ))
+    .await;
+    exec(&format!(
+        "ALTER TABLE `{DB}`.`mv_device_snapshot` MODIFY REFRESH EVERY 1 DAY OFFSET 10 HOUR \
+         DEPENDS ON `{DB}`.`upstream_mv`"
+    ))
+    .await;
+    let create = create_table_query("mv_device_snapshot").await;
+    assert!(create.contains("DEPENDS ON"), "fixture: {create}");
+
+    let changes = plan_against_reality(&project, &full).await;
+    assert!(
+        changes.olap_changes.iter().any(|c| matches!(
+            c,
+            OlapChange::MaterializedView(Change::Updated { after, .. })
+                if after.name == "mv_device_snapshot"
+        )),
+        "a DEPENDS ON the code lacks was read back as equal; changes: {:?}",
+        changes.olap_changes
+    );
+}
+
+#[tokio::test]
 async fn live_refresh_select_change_keeps_target_rows() {
     if !enabled() {
         eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");

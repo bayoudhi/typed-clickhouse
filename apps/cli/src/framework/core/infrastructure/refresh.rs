@@ -114,9 +114,14 @@ pub struct RefreshSchedule {
     pub randomize_for: Option<RefreshInterval>,
     #[serde(default)]
     pub append: bool,
-    /// Reality-only: clause text this module does not model (DEPENDS ON,
-    /// SETTINGS, or a clause that failed to parse). Code never sets it, so a
-    /// schedule carrying it never equals a code-side one.
+    /// The whole raw `REFRESH …` clause (APPEND included) when it holds text
+    /// this module does not model: DEPENDS ON, SETTINGS, or a clause that
+    /// failed to parse. Set when a clause is read back from the server, and
+    /// when a user's single-statement `SqlResource` is migrated to a
+    /// structured view; the TypeScript library never sets it.
+    ///
+    /// When set, [`RefreshSchedule::to_create_clause`] renders this text
+    /// verbatim and the modelled fields are only a best-effort reading of it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unmodelled: Option<String>,
 }
@@ -205,8 +210,8 @@ impl RefreshSchedule {
         }
     }
 
-    /// The clause without APPEND: `REFRESH EVERY 1 DAY OFFSET 10 HOUR`.
-    pub fn schedule_sql(&self) -> String {
+    /// The clause rendered from the modelled fields only.
+    fn modelled_clause(&self) -> String {
         let kind = match self.kind {
             RefreshKind::Every => "EVERY",
             RefreshKind::After => "AFTER",
@@ -218,19 +223,35 @@ impl RefreshSchedule {
         if let Some(randomize) = &self.randomize_for {
             sql.push_str(&format!(" RANDOMIZE FOR {}", randomize.sql()));
         }
-        sql
-    }
-
-    /// `schedule_sql()` plus ` APPEND` when set: what goes between name and TO.
-    pub fn to_create_clause(&self) -> String {
-        let mut sql = self.schedule_sql();
         if self.append {
             sql.push_str(" APPEND");
         }
         sql
     }
 
+    /// The whole clause, APPEND included: what goes between the view's name
+    /// and `TO` in CREATE, and after `MODIFY` in `ALTER TABLE … MODIFY REFRESH`.
+    ///
+    /// An `unmodelled` clause is returned verbatim, so DEPENDS ON and SETTINGS
+    /// survive and a clause this module cannot parse is never replaced by the
+    /// placeholder schedule of [`RefreshSchedule::unparsed`].
+    ///
+    /// MODIFY must repeat APPEND when the view has it: the server rejects
+    /// `MODIFY REFRESH` without it on an APPEND view ("Adding or removing
+    /// APPEND is not supported"). MODIFY is only planned when both sides are
+    /// modelled (see [`RefreshSchedule::differs_only_in_schedule`]), but the
+    /// verbatim clause is also valid after MODIFY.
+    pub fn to_create_clause(&self) -> String {
+        match &self.unmodelled {
+            Some(raw) => raw.clone(),
+            None => self.modelled_clause(),
+        }
+    }
+
     /// Placeholder for a clause that did not parse; `unmodelled = Some(raw)`.
+    ///
+    /// The placeholder fields (`EVERY 0 SECOND`) are never rendered:
+    /// [`RefreshSchedule::to_create_clause`] returns `raw` instead.
     pub fn unparsed(raw: &str) -> Self {
         RefreshSchedule {
             kind: RefreshKind::Every,
@@ -631,7 +652,7 @@ mod tests {
             offset: Some(iv(10, IntervalUnit::Hour)),
             ..every_day()
         };
-        assert_eq!(s.schedule_sql(), "REFRESH EVERY 1 DAY OFFSET 10 HOUR");
+        assert_eq!(s.to_create_clause(), "REFRESH EVERY 1 DAY OFFSET 10 HOUR");
     }
 
     #[test]
@@ -900,6 +921,32 @@ mod tests {
         let s = s.unwrap();
         assert_eq!(s.unmodelled.as_deref(), Some("REFRESH SOMETIMES"));
         assert_eq!(sql, "CREATE MATERIALIZED VIEW mv TO t AS SELECT 1");
+    }
+
+    #[test]
+    fn unmodelled_clause_renders_verbatim() {
+        let raw = "REFRESH EVERY 1 HOUR DEPENDS ON db.m SETTINGS refresh_retries = 3 APPEND";
+        let (_, s) = split_refresh_clause(&format!(
+            "CREATE MATERIALIZED VIEW mv {raw} TO t AS SELECT 1"
+        ));
+        let s = s.unwrap();
+        assert_eq!(s.unmodelled.as_deref(), Some(raw));
+        assert_eq!(s.to_create_clause(), raw);
+    }
+
+    #[test]
+    fn unparseable_clause_never_renders_placeholder() {
+        // The server accepts mixed calendar and clock units for AFTER.
+        for raw in ["REFRESH AFTER 1 MONTH 1 DAY APPEND", "REFRESH SOMETIMES"] {
+            let (_, s) = split_refresh_clause(&format!(
+                "CREATE MATERIALIZED VIEW mv {raw} TO t AS SELECT 1"
+            ));
+            let rendered = s.unwrap().to_create_clause();
+            assert_eq!(rendered, raw);
+            assert!(!rendered.contains("EVERY 0 SECOND"));
+        }
+        let placeholder = RefreshSchedule::unparsed("REFRESH SOMETIMES");
+        assert_eq!(placeholder.to_create_clause(), "REFRESH SOMETIMES");
     }
 
     #[test]

@@ -5597,6 +5597,61 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
     }
 
     #[test]
+    fn reconstruct_keeps_unmodelled_refresh_and_stays_distinct() {
+        use crate::framework::core::infra_reality_checker::materialized_views_are_equivalent;
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        use crate::framework::core::infrastructure_map::InfrastructureMap;
+
+        let raw = "REFRESH EVERY 1 HOUR DEPENDS ON db.m SETTINGS refresh_retries = 3";
+        let create_query = format!(
+            "CREATE MATERIALIZED VIEW db.mv {raw} TO db.t (`id` String) AS SELECT id FROM db.s"
+        );
+        let resource = reconstruct_sql_resource_from_mv(
+            "mv".to_string(),
+            create_query,
+            "SELECT id FROM db.s".to_string(),
+            "db".to_string(),
+            "db",
+        )
+        .unwrap()
+        .expect("view has a TO target");
+        // The rebuilt text drops the default database qualifier, as it does
+        // everywhere else in the statement.
+        let kept = "REFRESH EVERY 1 HOUR DEPENDS ON m SETTINGS refresh_retries = 3";
+        assert!(
+            resource.setup[0].contains(&format!("{kept} TO")),
+            "setup was: {}",
+            resource.setup[0]
+        );
+
+        let reality = InfrastructureMap::try_migrate_sql_resource_to_mv(&resource, "db")
+            .expect("reconstructed view migrates");
+        let reality_refresh = reality.refresh.clone().unwrap();
+        assert_eq!(reality_refresh.unmodelled.as_deref(), Some(kept));
+
+        let mut code = reality.clone();
+        code.refresh = Some(RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: RefreshInterval {
+                value: 1,
+                unit: IntervalUnit::Hour,
+            },
+            offset: None,
+            randomize_for: None,
+            append: false,
+            unmodelled: None,
+        });
+        assert!(!materialized_views_are_equivalent(&reality, &code, "db"));
+        assert!(materialized_views_are_equivalent(
+            &reality,
+            &reality.clone(),
+            "db"
+        ));
+    }
+
+    #[test]
     fn reconstruct_without_to_is_skipped() {
         let create_query = "CREATE MATERIALIZED VIEW db.mv REFRESH EVERY 1 HOUR ENGINE = MergeTree ORDER BY id AS SELECT 1".to_string();
         let result = reconstruct_sql_resource_from_mv(
@@ -6037,5 +6092,32 @@ SETTINGS enable_mixed_granularity_parts = 1, index_granularity = 8192, index_gra
             build_modify_materialized_view_refresh_sql("db", "mv", None, &refresh),
             "ALTER TABLE `db`.`mv` MODIFY REFRESH EVERY 2 DAY APPEND"
         );
+    }
+
+    #[test]
+    fn create_mv_sql_renders_unmodelled_refresh_verbatim() {
+        use crate::framework::core::infrastructure::refresh::split_refresh_clause;
+        for raw in [
+            "REFRESH EVERY 1 HOUR DEPENDS ON `db`.`m` SETTINGS refresh_retries = 3",
+            "REFRESH AFTER 1 MONTH 1 DAY APPEND",
+        ] {
+            let (_, refresh) = split_refresh_clause(&format!(
+                "CREATE MATERIALIZED VIEW mv {raw} TO t AS SELECT 1"
+            ));
+            let sql = build_create_materialized_view_sql(
+                "db",
+                "mv",
+                None,
+                "t",
+                None,
+                "SELECT 1",
+                refresh.as_ref(),
+            );
+            assert_eq!(
+                sql,
+                format!("CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv` {raw} TO `db`.`t` AS SELECT 1")
+            );
+            assert!(!sql.contains("EVERY 0 SECOND"));
+        }
     }
 }
