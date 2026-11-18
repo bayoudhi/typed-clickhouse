@@ -84,9 +84,12 @@ impl RefreshInterval {
     /// The length in a unit-independent form. The server rewrites intervals
     /// (`24 HOUR` is stored as `1 DAY`, `90 SECOND` as `1 MINUTE 30 SECOND`),
     /// so two intervals mean the same schedule when this is equal.
-    fn canonical(&self) -> (IntervalBase, u64) {
+    ///
+    /// Computed in `u128`, which cannot overflow (`u64 * u64 < 2^128`): two
+    /// different huge intervals never collapse onto one saturated value.
+    fn canonical(&self) -> (IntervalBase, u128) {
         let (base, factor) = self.unit.base_factor();
-        (base, self.value.saturating_mul(factor))
+        (base, u128::from(self.value) * u128::from(factor))
     }
 
     fn sql(&self) -> String {
@@ -426,20 +429,22 @@ fn parse_interval(
             break;
         }
         let (next_value, next_unit) = parse_interval_part(src, tokens, idx)?;
+        let bad = || RefreshParseError::BadInterval(text(src, Some(n)).to_string());
         let (base, factor) = unit.base_factor();
         let (next_base, next_factor) = next_unit.base_factor();
         if base != next_base {
-            return Err(RefreshParseError::BadInterval(
-                text(src, Some(n)).to_string(),
-            ));
+            return Err(bad());
         }
-        let total = value * factor + next_value * next_factor;
+        // u128 cannot overflow here; a total that does not fit back into u64
+        // is reported, so the clause stays visible as unmodelled.
+        let total = u128::from(value) * u128::from(factor)
+            + u128::from(next_value) * u128::from(next_factor);
         let smallest = if next_factor < factor {
             next_unit
         } else {
             unit
         };
-        value = total / smallest.base_factor().1;
+        value = u64::try_from(total / u128::from(smallest.base_factor().1)).map_err(|_| bad())?;
         unit = smallest;
     }
     Ok(RefreshInterval { value, unit })
@@ -947,6 +952,36 @@ mod tests {
         }
         let placeholder = RefreshSchedule::unparsed("REFRESH SOMETIMES");
         assert_eq!(placeholder.to_create_clause(), "REFRESH SOMETIMES");
+    }
+
+    #[test]
+    fn overflowing_compound_interval_is_bad() {
+        let clause = format!("REFRESH EVERY {} WEEK 1 SECOND", u64::MAX);
+        assert!(matches!(
+            parse_refresh_clause(&clause),
+            Err(RefreshParseError::BadInterval(_))
+        ));
+        let (_, s) = split_refresh_clause(&format!(
+            "CREATE MATERIALIZED VIEW mv {clause} TO t AS SELECT 1"
+        ));
+        assert_eq!(s.unwrap().unmodelled.as_deref(), Some(clause.as_str()));
+        // A fold whose seconds overflow u64 but whose result fits is exact.
+        let big = u64::MAX / 7;
+        let parsed = parse_refresh_clause(&format!("REFRESH EVERY {big} WEEK 1 DAY")).unwrap();
+        assert_eq!(parsed.interval, iv(big * 7 + 1, IntervalUnit::Day));
+    }
+
+    #[test]
+    fn huge_intervals_do_not_saturate_into_equality() {
+        let at = |value| RefreshSchedule {
+            interval: iv(value, IntervalUnit::Week),
+            ..every_day()
+        };
+        // The TypeScript library accepts up to 2^53 WEEK.
+        let max_ts = 1u64 << 53;
+        assert!(!at(max_ts).is_equivalent(&at(max_ts - 1)));
+        assert!(!at(u64::MAX).is_equivalent(&at(u64::MAX - 1)));
+        assert!(at(u64::MAX).is_equivalent(&at(u64::MAX)));
     }
 
     #[test]
