@@ -637,6 +637,74 @@ pub fn split_refresh_clause(create_sql: &str) -> (String, Option<RefreshSchedule
     (stripped, Some(schedule))
 }
 
+/// The `TO` target and SELECT body of a `CREATE MATERIALIZED VIEW … TO target
+/// AS select` statement whose refresh clause was already removed by
+/// [`split_refresh_clause`], read from the text alone.
+///
+/// For statements whose SELECT the SQL parser rejects. The target is the first
+/// top-level `TO` that is not the view's own name, and the body is the raw text
+/// after the next top-level `AS` (past any column list), trimmed and not
+/// normalised. The target is returned as written, backticks included.
+/// `None` when there is no target or no body.
+pub(crate) fn split_materialized_view_target(create_sql: &str) -> Option<(&str, &str)> {
+    let tokens = tokenize(create_sql);
+
+    let mut depth = 0usize;
+    let mut to_idx = None;
+    for (i, t) in tokens.iter().enumerate() {
+        match t.kind {
+            TokenKind::Open => depth += 1,
+            TokenKind::Close => depth = depth.saturating_sub(1),
+            TokenKind::Word if depth == 0 && is_word(create_sql, t, "AS") => return None,
+            TokenKind::Word if depth == 0 && is_word(create_sql, t, "TO") => {
+                let is_name = i > 0 && {
+                    let prev = &tokens[i - 1];
+                    is_word(create_sql, prev, "VIEW")
+                        || is_word(create_sql, prev, "EXISTS")
+                        || text(create_sql, Some(prev)) == "."
+                };
+                if !is_name {
+                    to_idx = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let to_idx = to_idx?;
+
+    // The target name: identifier parts joined by dots.
+    let mut name_end = to_idx + 1;
+    loop {
+        match tokens.get(name_end) {
+            Some(t) if matches!(t.kind, TokenKind::Word | TokenKind::Quoted) => name_end += 1,
+            _ => break,
+        }
+        match tokens.get(name_end) {
+            Some(t) if text(create_sql, Some(t)) == "." => name_end += 1,
+            _ => break,
+        }
+    }
+    if name_end == to_idx + 1 || text(create_sql, tokens.get(name_end - 1)) == "." {
+        return None;
+    }
+    let target = &create_sql[tokens[to_idx + 1].start..tokens[name_end - 1].end];
+
+    let mut depth = 0usize;
+    for t in tokens.iter().skip(name_end) {
+        match t.kind {
+            TokenKind::Open => depth += 1,
+            TokenKind::Close => depth = depth.saturating_sub(1),
+            TokenKind::Word if depth == 0 && is_word(create_sql, t, "AS") => {
+                let select = create_sql[t.end..].trim();
+                return (!select.is_empty()).then_some((target, select));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +985,54 @@ mod tests {
     fn split_ignores_unquoted_refresh_inside_parens() {
         let src = "CREATE MATERIALIZED VIEW mv TO t (refresh String, x String DEFAULT CAST(1 AS String)) AS SELECT 1 AS x";
         assert_eq!(split_refresh_clause(src), (src.to_string(), None));
+    }
+
+    #[test]
+    fn splits_materialized_view_target() {
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            (
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO t AS SELECT a FROM s",
+                Some(("t", "SELECT a FROM s")),
+            ),
+            (
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv` TO `db`.`t` AS SELECT 'x AS y' AS a",
+                Some(("`db`.`t`", "SELECT 'x AS y' AS a")),
+            ),
+            // The column list holds an AS of its own; the body starts after it.
+            (
+                "CREATE MATERIALIZED VIEW mv TO t (a String, b String ALIAS a) AS SELECT a FROM s",
+                Some(("t", "SELECT a FROM s")),
+            ),
+            (
+                "CREATE MATERIALIZED VIEW mv ON CLUSTER c TO db.t AS SELECT a FROM s",
+                Some(("db.t", "SELECT a FROM s")),
+            ),
+            // A view named `to` is not the target keyword.
+            (
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS to TO t AS SELECT 1",
+                Some(("t", "SELECT 1")),
+            ),
+            (
+                "CREATE MATERIALIZED VIEW mv TO t AS   SELECT 1  ",
+                Some(("t", "SELECT 1")),
+            ),
+            ("CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO t", None),
+            ("CREATE MATERIALIZED VIEW mv TO t AS   ", None),
+            ("CREATE MATERIALIZED VIEW mv TO AS SELECT 1", None),
+            ("CREATE MATERIALIZED VIEW mv TO db. AS SELECT 1", None),
+            // TO only inside the body is not a target.
+            (
+                "CREATE MATERIALIZED VIEW mv ENGINE = Memory AS SELECT 1 TO x",
+                None,
+            ),
+        ];
+        for (src, expected) in cases {
+            assert_eq!(
+                split_materialized_view_target(src),
+                *expected,
+                "input: {src}"
+            );
+        }
     }
 
     #[test]
