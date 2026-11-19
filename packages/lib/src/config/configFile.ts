@@ -4,7 +4,7 @@ import * as toml from "toml";
 /**
  * ClickHouse configuration from tch.config.toml
  */
-export interface ClickHouseConfig {
+interface ClickHouseConfig {
   host: string;
   host_port: number;
   user: string;

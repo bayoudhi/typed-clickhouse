@@ -436,7 +436,7 @@ export interface AggregationFunction {
   argumentTypes: DataType[];
 }
 
-export interface SimpleAggregationFunction {
+interface SimpleAggregationFunction {
   functionName: string;
   argumentType: DataType;
 }

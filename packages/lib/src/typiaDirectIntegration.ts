@@ -12,7 +12,6 @@ import { ValidateProgrammer } from "typia/lib/programmers/ValidateProgrammer";
 import { IsProgrammer } from "typia/lib/programmers/IsProgrammer";
 import { AssertProgrammer } from "typia/lib/programmers/AssertProgrammer";
 import { JsonSchemasProgrammer } from "typia/lib/programmers/json/JsonSchemasProgrammer";
-import { HttpAssertQueryProgrammer } from "typia/lib/programmers/http/HttpAssertQueryProgrammer";
 import { MetadataCollection } from "typia/lib/factories/MetadataCollection";
 import { MetadataFactory } from "typia/lib/factories/MetadataFactory";
 import { LiteralFactory } from "typia/lib/factories/LiteralFactory";
@@ -107,8 +106,7 @@ const toTypiaContext = (ctx: TypiaDirectContext): ITypiaContext => ({
   importer: ctx.importer,
   extras: {
     // Not used by the programmers we call directly (CheckerProgrammer,
-    // HttpAssertQueryProgrammer, JsonSchemasProgrammer) - only used by
-    // FileTransformer which we bypass
+    // JsonSchemasProgrammer) - only used by FileTransformer which we bypass
     addDiagnostic: () => 0,
   },
 });
@@ -279,25 +277,6 @@ export const generateInsertAssertFunction = (
   withInsertableMetadata(columns, () =>
     generateAssertFunction(ctx, type, typeName),
   );
-
-/**
- * Generates an HTTP assert query function for validating URL query parameters
- * This is used by the Api class to validate incoming query parameters
- */
-export const generateHttpAssertQueryFunction = (
-  ctx: TypiaDirectContext,
-  type: ts.Type,
-  typeName?: string,
-): ts.Expression => {
-  const typiaCtx = toTypiaContext(ctx);
-
-  return HttpAssertQueryProgrammer.write({
-    context: typiaCtx,
-    modulo: ctx.modulo,
-    type,
-    name: typeName,
-  });
-};
 
 // ============================================================================
 // JSON Schema Post-Processing

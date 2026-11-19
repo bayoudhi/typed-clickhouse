@@ -51,13 +51,6 @@ export const TCH_COMPILER_OPTIONS = {
   verbatimModuleSyntax: false,
 } as const;
 
-// Module resolution options - only applied if not already set in user's tsconfig
-// These help with ESM/CJS interop but can be overridden by user config
-export const TCH_MODULE_OPTIONS = {
-  module: "NodeNext",
-  moduleResolution: "NodeNext",
-} as const;
-
 /**
  * Default source directory for user code.
  * Can be overridden via TCH_SOURCE_DIR environment variable.

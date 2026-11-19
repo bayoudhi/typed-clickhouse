@@ -55,7 +55,7 @@ export type RefreshConfig =
     };
 
 /** @internal Normalised interval as serialised to the infra map. */
-export interface RefreshIntervalJson {
+interface RefreshIntervalJson {
   value: number;
   unit: IntervalUnit;
 }

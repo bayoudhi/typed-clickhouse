@@ -29,9 +29,6 @@ config = { version = "0.13.1", features = ["toml"] }
 home = "0.5.5"
 clickhouse = { version = "0.14.0", features = ["uuid", "native-tls"] }
 handlebars = "5.1"
-# Kept for src/infrastructure/olap/clickhouse/inserter.rs's KafkaError-typed
-# OffsetCommitCallback, even though nothing constructs it anymore.
-rdkafka = { version = "0.38", features = ["ssl"] }
 convert_case = "0.6.0"
 uuid = { version = "1.6", features = ["v4", "serde"] }
 serde_json = { version = "1.0.133", features = ["preserve_order"] }
@@ -47,7 +44,6 @@ regex = "1.10.3"
 reqwest = { version = "0.13.1", default-features = false, features = ["stream", "json", "blocking", "query", "native-tls"] }
 chrono = { version = "0.4", features = ["serde"] }
 bytes = "1"
-futures = "0.3"
 toml_edit = "0.22.9"
 comfy-table = "7.1.1"
 crossterm = { version = "0.27.0", features = ["event-stream"] }

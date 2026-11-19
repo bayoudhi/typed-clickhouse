@@ -35,18 +35,6 @@ interface RequestContext {
 
 const requestContextStorage = new AsyncLocalStorage<RequestContext>();
 
-/**
- * Run a callback with per-request context (rowPolicyOpts, jwt).
- * Used by the runtime to wrap WebApp handler invocations so that
- * getHandlerUtils() inside the handler auto-scopes with row policies.
- */
-export function runWithRequestContext<T>(
-  context: RequestContext,
-  fn: () => T,
-): T {
-  return requestContextStorage.run(context, fn);
-}
-
 export interface GetHandlerUtilsOptions {
   /** Map of JWT claim names to their values for row policy scoping */
   rlsContext?: Record<string, string>;
