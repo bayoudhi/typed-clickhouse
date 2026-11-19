@@ -55,7 +55,7 @@ export const isNewTchResourceWithTypeParam = (
   return isUntransformed && node.typeArguments?.length === 1;
 };
 
-export const parseAsAny = (s: string) =>
+const parseAsAny = (s: string) =>
   factory.createAsExpression(
     factory.createCallExpression(
       factory.createPropertyAccessExpression(

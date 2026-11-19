@@ -1,7 +1,7 @@
 import ts from "typescript";
 import { IdentifierBrandedString } from "../sqlHelpers";
 
-export type EnumValues =
+type EnumValues =
   | { name: string; value: { Int: number } }[]
   | { name: string; value: { String: string } }[];
 export type DataEnum = { name: string; values: EnumValues };
@@ -9,7 +9,7 @@ export type Nested = { name: string; columns: Column[]; jwt: boolean };
 export type ArrayType = { elementType: DataType; elementNullable: boolean };
 export type NamedTupleType = { fields: Array<[string, DataType]> };
 export type MapType = { keyType: DataType; valueType: DataType };
-export type JsonOptions = {
+type JsonOptions = {
   max_dynamic_paths?: number;
   max_dynamic_types?: number;
   typed_paths?: Array<[string, DataType]>;

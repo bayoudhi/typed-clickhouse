@@ -5,47 +5,17 @@ import {
   QueryClient,
   HandlerUtils,
   RowPoliciesConfig,
-  RowPolicyOptions,
   buildRowPolicyOptionsFromClaims,
 } from "./helpers";
 import { getClickhouseClient } from "../commons";
 import { sql } from "../sqlHelpers";
 import { getSelectRowPolicies } from "../dmv2/registry";
 import type { RuntimeClickHouseConfig } from "../config/runtime";
-import { AsyncLocalStorage } from "node:async_hooks";
 import type { ClickHouseClient } from "@clickhouse/client";
-import type { JWTPayload } from "jose";
 
 // ---------------------------------------------------------------------------
-// Exported types & helpers for runner.ts
+// Exported types & helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Per-request context stored via AsyncLocalStorage.
- * Set by the runtime (runner.ts) before invoking WebApp handlers so that
- * getHandlerUtils() can auto-scope queries with row policies from the JWT.
- *
- * `rowPolicyOpts` carries pre-built ClickHouse settings (setting-keyed).
- * This avoids a redundant round-trip through claim-keyed rlsContext.
- */
-interface RequestContext {
-  rowPolicyOpts?: RowPolicyOptions;
-  jwt?: JWTPayload;
-}
-
-const requestContextStorage = new AsyncLocalStorage<RequestContext>();
-
-/**
- * Run a callback with per-request context (rowPolicyOpts, jwt).
- * Used by the runtime to wrap WebApp handler invocations so that
- * getHandlerUtils() inside the handler auto-scopes with row policies.
- */
-export function runWithRequestContext<T>(
-  context: RequestContext,
-  fn: () => T,
-): T {
-  return requestContextStorage.run(context, fn);
-}
 
 export interface GetHandlerUtilsOptions {
   /** Map of JWT claim names to their values for row policy scoping */
@@ -165,19 +135,16 @@ export async function getHandlerUtils(
 /**
  * Resolve HandlerUtils when running inside the the library runtime.
  *
- * RLS priority:
- *   1. Explicit rlsContext from the caller
- *   2. Pre-built RowPolicyOptions from the request (WebApp path via AsyncLocalStorage)
- *   3. No RLS — return the shared singleton
+ * RLS scope:
+ *   1. Explicit rlsContext from the caller → scoped client enforcing row policies
+ *   2. No rlsContext — return the shared client (no row policies applied)
  */
 function resolveRuntimeUtils(
   runtimeContext: any,
   options?: GetHandlerUtilsOptions,
 ): HandlerUtils {
-  const reqCtx = requestContextStorage.getStore();
-  const jwt = reqCtx?.jwt ?? runtimeContext.jwt;
+  const jwt = runtimeContext.jwt;
 
-  let rowPolicyOpts: RowPolicyOptions | undefined;
   if (options?.rlsContext) {
     if (!runtimeContext.rowPoliciesConfig) {
       throw new Error(
@@ -185,15 +152,10 @@ function resolveRuntimeUtils(
           "Define at least one SelectRowPolicy before using rlsContext.",
       );
     }
-    rowPolicyOpts = buildRowPolicyOptionsFromClaims(
+    const rowPolicyOpts = buildRowPolicyOptionsFromClaims(
       runtimeContext.rowPoliciesConfig,
       options.rlsContext,
     );
-  } else {
-    rowPolicyOpts = reqCtx?.rowPolicyOpts;
-  }
-
-  if (rowPolicyOpts) {
     const rlsClient =
       runtimeContext.rlsClickhouseClient ?? runtimeContext.clickhouseClient;
     const scopedQueryClient = new QueryClient(

@@ -27,11 +27,10 @@ function getExePath() {
 
   try {
     // Since the binary will be located inside `node_modules`, we can simply call `require.resolve`
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
     return require.resolve(
       `@typed-clickhouse/cli-${os}-${arch}/bin/typed-clickhouse${extension}`,
     );
-  } catch (e) {
+  } catch {
     throw new Error(
       `Couldn't find application binary inside node_modules for ${os}-${arch}`,
     );

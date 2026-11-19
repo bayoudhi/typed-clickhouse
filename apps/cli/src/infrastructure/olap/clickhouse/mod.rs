@@ -79,7 +79,6 @@ pub mod constants;
 pub mod diagnostics;
 pub mod diff_strategy;
 pub mod errors;
-pub mod inserter;
 pub mod mapper;
 pub mod model;
 pub mod mutations;

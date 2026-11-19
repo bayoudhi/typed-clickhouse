@@ -21,7 +21,7 @@ export interface InfrastructureSignatureJson {
   kind: SignatureKind;
 }
 
-export interface DependencySignatures {
+interface DependencySignatures {
   pullsDataFrom: InfrastructureSignatureJson[];
   pushesDataTo: InfrastructureSignatureJson[];
 }

@@ -43,8 +43,6 @@
   },
   "devDependencies": {
     "@types/node": "^20",
-    "@typescript-eslint/eslint-plugin": "^8.28.0",
-    "@typescript-eslint/parser": "^8.28.0",
     "eslint": "^9.39.0",
     "@repo/ts-config": "workspace:*",
     "typescript": "^5.7.0"

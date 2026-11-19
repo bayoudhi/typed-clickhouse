@@ -194,7 +194,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.build.TARGET }}
-          args: --release --locked --features rdkafka/cmake-build --target ${{ matrix.build.TARGET }} --out dist
+          args: --release --locked --target ${{ matrix.build.TARGET }} --out dist
           working-directory: ./apps/cli
           # Let maturin-action pick the manylinux image for each target. Pinning
           # x86_64 to the rust-cross *-cross* image broke the build: that image

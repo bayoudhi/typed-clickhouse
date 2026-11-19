@@ -241,8 +241,8 @@ static LOG_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
 //
 // ## TESTING
 //
-// See `apps/cli-e2e/test/structured-logging.test.ts` for E2E tests that verify
-// instrumentation coverage and correctness of span fields.
+// Instrumentation coverage and span-field correctness can be verified by
+// running CLI commands with `RUST_LOG=info` and inspecting `~/.tch/*-cli.log`.
 //
 // ## CONSTANTS
 //

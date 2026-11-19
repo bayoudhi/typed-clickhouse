@@ -17,7 +17,7 @@ import { LifeCycle } from "./lifeCycle";
 import { IdentifierBrandedString, quoteIdentifier } from "../../sqlHelpers";
 import type { NodeClickHouseClient } from "@clickhouse/client/dist/client";
 
-export interface TableIndex {
+interface TableIndex {
   name: string;
   expression: string;
   type: string;
@@ -59,7 +59,7 @@ export interface InsertResult<T> {
 /**
  * Error handling strategy for insert operations
  */
-export type ErrorStrategy =
+type ErrorStrategy =
   | "fail-fast" // Fail immediately on any error (default)
   | "discard" // Discard bad records and continue with good ones
   | "isolate"; // Retry individual records to isolate failures
@@ -170,7 +170,7 @@ export interface S3QueueTableSettings {
  * @template T The data type of the records stored in the table.
  */
 
-export type BaseOlapConfig<T> = (
+type BaseOlapConfig<T> = (
   | {
       /**
        * Specifies the fields to use for ordering data within the ClickHouse table.
@@ -275,7 +275,7 @@ export type BaseOlapConfig<T> = (
  * Configuration for MergeTree engine
  * @template T The data type of the records stored in the table.
  */
-export type MergeTreeConfig<T> = BaseOlapConfig<T> & {
+type MergeTreeConfig<T> = BaseOlapConfig<T> & {
   engine: ClickHouseEngines.MergeTree;
 };
 
@@ -293,7 +293,7 @@ export type ReplacingMergeTreeConfig<T> = BaseOlapConfig<T> & {
  * Configuration for AggregatingMergeTree engine
  * @template T The data type of the records stored in the table.
  */
-export type AggregatingMergeTreeConfig<T> = BaseOlapConfig<T> & {
+type AggregatingMergeTreeConfig<T> = BaseOlapConfig<T> & {
   engine: ClickHouseEngines.AggregatingMergeTree;
 };
 
@@ -310,7 +310,7 @@ export type SummingMergeTreeConfig<T> = BaseOlapConfig<T> & {
  * Configuration for CollapsingMergeTree engine
  * @template T The data type of the records stored in the table.
  */
-export type CollapsingMergeTreeConfig<T> = BaseOlapConfig<T> & {
+type CollapsingMergeTreeConfig<T> = BaseOlapConfig<T> & {
   engine: ClickHouseEngines.CollapsingMergeTree;
   sign: keyof T & string; // Sign column (1 = state, -1 = cancel)
 };
@@ -319,7 +319,7 @@ export type CollapsingMergeTreeConfig<T> = BaseOlapConfig<T> & {
  * Configuration for VersionedCollapsingMergeTree engine
  * @template T The data type of the records stored in the table.
  */
-export type VersionedCollapsingMergeTreeConfig<T> = BaseOlapConfig<T> & {
+type VersionedCollapsingMergeTreeConfig<T> = BaseOlapConfig<T> & {
   engine: ClickHouseEngines.VersionedCollapsingMergeTree;
   sign: keyof T & string; // Sign column (1 = state, -1 = cancel)
   ver: keyof T & string; // Version column for ordering state changes
@@ -462,7 +462,7 @@ export type S3QueueConfig<T> = Omit<
  * Note: S3 engine supports ORDER BY clause, unlike S3Queue, Buffer, and Distributed engines
  * @template T The data type of the records stored in the table.
  */
-export type S3Config<T> = Omit<
+type S3Config<T> = Omit<
   BaseOlapConfig<T>,
   "sampleByExpression" | "projections"
 > & {
@@ -487,7 +487,7 @@ export type S3Config<T> = Omit<
  * Configuration for Buffer engine
  * @template T The data type of the records stored in the table.
  */
-export type BufferConfig<T> = Omit<
+type BufferConfig<T> = Omit<
   BaseOlapConfig<T>,
   | "orderByFields"
   | "orderByExpression"
@@ -526,7 +526,7 @@ export type BufferConfig<T> = Omit<
  * Configuration for Distributed engine
  * @template T The data type of the records stored in the table.
  */
-export type DistributedConfig<T> = Omit<
+type DistributedConfig<T> = Omit<
   BaseOlapConfig<T>,
   | "orderByFields"
   | "orderByExpression"
@@ -548,7 +548,7 @@ export type DistributedConfig<T> = Omit<
 };
 
 /** Kafka table settings. See: https://clickhouse.com/docs/engines/table-engines/integrations/kafka */
-export interface KafkaTableSettings {
+interface KafkaTableSettings {
   kafka_security_protocol?: "PLAINTEXT" | "SSL" | "SASL_PLAINTEXT" | "SASL_SSL";
   kafka_sasl_mechanism?:
     | "GSSAPI"
@@ -577,7 +577,7 @@ export interface KafkaTableSettings {
 }
 
 /** Kafka engine for streaming data from Kafka topics. Additional settings go in `settings`. */
-export type KafkaConfig<T> = Omit<
+type KafkaConfig<T> = Omit<
   BaseOlapConfig<T>,
   | "orderByFields"
   | "orderByExpression"
@@ -617,7 +617,7 @@ export type KafkaConfig<T> = Omit<
  * - Does not support ORDER BY, PARTITION BY, or SAMPLE BY clauses
  * - Queries always see the latest Iceberg snapshot (with metadata cache)
  */
-export type IcebergS3Config<T> = Omit<
+type IcebergS3Config<T> = Omit<
   BaseOlapConfig<T>,
   | "orderByFields"
   | "orderByExpression"
@@ -657,7 +657,7 @@ export type IcebergS3Config<T> = Omit<
  * - Cannot be used as a destination in IngestPipeline
  * - Does not support ORDER BY, PARTITION BY, or SAMPLE BY clauses
  */
-export type MergeConfig<T> = Omit<
+type MergeConfig<T> = Omit<
   BaseOlapConfig<T>,
   | "orderByFields"
   | "orderByExpression"
@@ -676,7 +676,7 @@ export type MergeConfig<T> = Omit<
  * Legacy configuration (backward compatibility) - defaults to MergeTree engine
  * @template T The data type of the records stored in the table.
  */
-export type LegacyOlapConfig<T> = BaseOlapConfig<T>;
+type LegacyOlapConfig<T> = BaseOlapConfig<T>;
 
 type EngineConfig<T> =
   | MergeTreeConfig<T>

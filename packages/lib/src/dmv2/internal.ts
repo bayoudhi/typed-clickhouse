@@ -1309,8 +1309,3 @@ const loadIndex = async () => {
     }
   }
 };
-
-export const getWebApps = async () => {
-  await loadIndex();
-  return getInternalRegistry().webApps;
-};

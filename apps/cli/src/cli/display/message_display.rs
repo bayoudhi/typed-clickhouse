@@ -11,41 +11,6 @@ use crate::utilities::constants::{NO_ANSI, QUIET_STDOUT, SHOW_TIMESTAMPS};
 use std::sync::atomic::Ordering;
 use tracing::{error, info, warn};
 
-/// Displays a message about a batch database insertion.
-///
-/// This function provides standardized messaging for database operations,
-/// showing the number of rows inserted and the target table name.
-///
-/// # Arguments
-///
-/// * `count` - The number of rows successfully inserted
-/// * `table_name` - The name of the database table
-///
-/// # Examples
-///
-/// ```rust
-/// # use crate::cli::display::message_display::batch_inserted;
-/// batch_inserted(150, "user_events");
-/// // Displays: "[DB] 150 row(s) successfully written to DB table (user_events)"
-/// ```
-pub fn batch_inserted(count: usize, table_name: &str) {
-    let message = Message {
-        action: "[DB]".to_string(),
-        details: format!("{count} row(s) successfully written to DB table ({table_name})"),
-    };
-    let no_ansi = NO_ANSI.load(Ordering::Relaxed);
-    let show_timestamps = SHOW_TIMESTAMPS.load(Ordering::Relaxed);
-    let quiet_stdout = QUIET_STDOUT.load(Ordering::Relaxed);
-    let _ = show_message_impl(
-        MessageType::Info,
-        message,
-        true,
-        no_ansi,
-        show_timestamps,
-        quiet_stdout,
-    );
-}
-
 /// Wrapper function for the show_message macro.
 ///
 /// This function allows calling the show_message functionality from contexts
@@ -300,24 +265,6 @@ mod tests {
         );
         // This should not panic
         show_message_wrapper(MessageType::Info, message);
-    }
-
-    #[test]
-    fn test_batch_inserted() {
-        // This should not panic
-        batch_inserted(100, "test_table");
-    }
-
-    #[test]
-    fn test_batch_inserted_zero() {
-        // This should not panic
-        batch_inserted(0, "empty_table");
-    }
-
-    #[test]
-    fn test_batch_inserted_unicode_table() {
-        // This should not panic
-        batch_inserted(50, "测试表");
     }
 
     // Test the macro itself
