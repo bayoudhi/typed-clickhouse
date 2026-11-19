@@ -637,6 +637,74 @@ pub fn split_refresh_clause(create_sql: &str) -> (String, Option<RefreshSchedule
     (stripped, Some(schedule))
 }
 
+/// The `TO` target and SELECT body of a `CREATE MATERIALIZED VIEW … TO target
+/// AS select` statement whose refresh clause was already removed by
+/// [`split_refresh_clause`], read from the text alone.
+///
+/// For statements whose SELECT the SQL parser rejects. The target is the first
+/// top-level `TO` that is not the view's own name, and the body is the raw text
+/// after the next top-level `AS` (past any column list), trimmed and not
+/// normalised. The target is returned as written, backticks included.
+/// `None` when there is no target or no body.
+pub(crate) fn split_materialized_view_target(create_sql: &str) -> Option<(&str, &str)> {
+    let tokens = tokenize(create_sql);
+
+    let mut depth = 0usize;
+    let mut to_idx = None;
+    for (i, t) in tokens.iter().enumerate() {
+        match t.kind {
+            TokenKind::Open => depth += 1,
+            TokenKind::Close => depth = depth.saturating_sub(1),
+            TokenKind::Word if depth == 0 && is_word(create_sql, t, "AS") => return None,
+            TokenKind::Word if depth == 0 && is_word(create_sql, t, "TO") => {
+                let is_name = i > 0 && {
+                    let prev = &tokens[i - 1];
+                    is_word(create_sql, prev, "VIEW")
+                        || is_word(create_sql, prev, "EXISTS")
+                        || text(create_sql, Some(prev)) == "."
+                };
+                if !is_name {
+                    to_idx = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let to_idx = to_idx?;
+
+    // The target name: identifier parts joined by dots.
+    let mut name_end = to_idx + 1;
+    loop {
+        match tokens.get(name_end) {
+            Some(t) if matches!(t.kind, TokenKind::Word | TokenKind::Quoted) => name_end += 1,
+            _ => break,
+        }
+        match tokens.get(name_end) {
+            Some(t) if text(create_sql, Some(t)) == "." => name_end += 1,
+            _ => break,
+        }
+    }
+    if name_end == to_idx + 1 || text(create_sql, tokens.get(name_end - 1)) == "." {
+        return None;
+    }
+    let target = &create_sql[tokens[to_idx + 1].start..tokens[name_end - 1].end];
+
+    let mut depth = 0usize;
+    for t in tokens.iter().skip(name_end) {
+        match t.kind {
+            TokenKind::Open => depth += 1,
+            TokenKind::Close => depth = depth.saturating_sub(1),
+            TokenKind::Word if depth == 0 && is_word(create_sql, t, "AS") => {
+                let select = create_sql[t.end..].trim();
+                return (!select.is_empty()).then_some((target, select));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

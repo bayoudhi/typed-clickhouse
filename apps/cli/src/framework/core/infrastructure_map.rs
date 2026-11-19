@@ -1970,8 +1970,25 @@ impl InfrastructureMap {
             return None;
         }
 
-        // Parse the CREATE MATERIALIZED VIEW statement
-        let parsed = parse_create_materialized_view(setup_sql).ok()?;
+        // Parse the CREATE MATERIALIZED VIEW statement. When sqlparser rejects the
+        // SELECT (tuple element access, `JOIN … AS p FINAL`), read the header from
+        // the text instead: otherwise a view read back from the server is never
+        // recognised, and every plan re-emits a no-op CREATE.
+        let parsed = match parse_create_materialized_view(setup_sql) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::debug!(
+                    "sqlparser rejected materialized view '{}' ({}); reading its header from text",
+                    sql_resource.name,
+                    e
+                );
+                Self::materialized_view_statement_from_text(
+                    &sql_resource.name,
+                    setup_sql,
+                    default_database,
+                )?
+            }
+        };
 
         // Convert source tables to unqualified names for consistency
         let source_tables: Vec<String> = parsed
@@ -2002,6 +2019,47 @@ impl InfrastructureMap {
             metadata,
             life_cycle: crate::framework::core::partial_infrastructure_map::LifeCycle::FullyManaged,
             refresh: parsed.refresh,
+        })
+    }
+
+    /// Reads a library-shaped `CREATE MATERIALIZED VIEW … TO target AS select`
+    /// without sqlparser: the refresh clause, the `TO` target and the raw SELECT
+    /// text, with source tables found by the regex fallback. Target names are
+    /// read as the parse path reads them (backticks stripped, split at the last
+    /// dot), so equivalence with code-side views is unaffected.
+    fn materialized_view_statement_from_text(
+        view_name: &str,
+        setup_sql: &str,
+        default_database: &str,
+    ) -> Option<crate::infrastructure::olap::clickhouse::sql_parser::MaterializedViewStatement>
+    {
+        use super::infrastructure::refresh::{
+            split_materialized_view_target, split_refresh_clause,
+        };
+        use crate::infrastructure::olap::clickhouse::sql_parser::{
+            extract_source_tables_from_query_regex, split_qualified_name, MaterializedViewStatement,
+        };
+
+        let (stripped, refresh) = split_refresh_clause(setup_sql);
+        let (target, select_sql) = split_materialized_view_target(&stripped)?;
+        let (target_database, target_table) = split_qualified_name(&target.replace('`', ""));
+
+        let mut source_tables = Vec::new();
+        for table in extract_source_tables_from_query_regex(select_sql, default_database).ok()? {
+            if !source_tables.contains(&table) {
+                source_tables.push(table);
+            }
+        }
+
+        Some(MaterializedViewStatement {
+            view_name: view_name.to_string(),
+            target_database,
+            target_table,
+            select_statement: select_sql.to_string(),
+            source_tables,
+            if_not_exists: true,
+            populate: false,
+            refresh,
         })
     }
 
@@ -5862,6 +5920,111 @@ mod normalize_tests {
                 "placeholder rendered: {sql}"
             );
         }
+    }
+
+    fn mv_resource(setup: &str) -> SqlResource {
+        SqlResource {
+            name: "mv".to_string(),
+            database: None,
+            source_file: None,
+            source_line: None,
+            source_column: None,
+            setup: vec![setup.to_string()],
+            teardown: vec!["DROP VIEW IF EXISTS mv".to_string()],
+            pulls_data_from: vec![],
+            pushes_data_to: vec![],
+        }
+    }
+
+    fn assert_sqlparser_rejects(sql: &str) {
+        use crate::infrastructure::olap::clickhouse::sql_parser::parse_create_materialized_view;
+        assert!(
+            parse_create_materialized_view(sql).is_err(),
+            "fixture must exercise the fallback, but sqlparser accepted: {sql}"
+        );
+    }
+
+    #[test]
+    fn migrates_mv_whose_select_sqlparser_rejects() {
+        use crate::framework::core::infrastructure::refresh::{
+            IntervalUnit, RefreshInterval, RefreshKind, RefreshSchedule,
+        };
+        let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv REFRESH EVERY 1 DAY OFFSET 10 HOUR TO t AS SELECT a.id, tuple(1, 2).2 AS second FROM src AS a LEFT JOIN other AS p FINAL ON a.id = p.id";
+        assert_sqlparser_rejects(sql);
+        let mv = InfrastructureMap::try_migrate_sql_resource_to_mv(&mv_resource(sql), "local")
+            .expect("library-shaped MV should migrate without sqlparser");
+        assert_eq!(mv.name, "mv");
+        assert_eq!(mv.target_table, "t");
+        assert_eq!(mv.target_database, None);
+        assert_eq!(
+            mv.refresh,
+            Some(RefreshSchedule {
+                kind: RefreshKind::Every,
+                interval: RefreshInterval {
+                    value: 1,
+                    unit: IntervalUnit::Day,
+                },
+                offset: Some(RefreshInterval {
+                    value: 10,
+                    unit: IntervalUnit::Hour,
+                }),
+                randomize_for: None,
+                append: false,
+                unmodelled: None,
+            })
+        );
+        let select = sql.split_once("TO t AS ").unwrap().1;
+        assert!(select.starts_with("SELECT a.id"));
+        assert_eq!(mv.select_sql, select);
+        assert!(mv.source_tables.contains(&"src".to_string()));
+        assert!(mv.source_tables.contains(&"other".to_string()));
+    }
+
+    #[test]
+    fn migrates_incremental_mv_whose_select_sqlparser_rejects() {
+        let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO t AS SELECT a.id, tuple(1, 2).2 AS second FROM src AS a LEFT JOIN other AS p FINAL ON a.id = p.id";
+        assert_sqlparser_rejects(sql);
+        let mv = InfrastructureMap::try_migrate_sql_resource_to_mv(&mv_resource(sql), "local")
+            .expect("library-shaped MV should migrate without sqlparser");
+        assert_eq!(mv.target_table, "t");
+        assert_eq!(mv.refresh, None);
+        assert_eq!(mv.select_sql, sql.split_once("TO t AS ").unwrap().1);
+        assert!(mv.source_tables.contains(&"src".to_string()));
+        assert!(mv.source_tables.contains(&"other".to_string()));
+    }
+
+    #[test]
+    fn fallback_handles_qualified_backticked_names() {
+        let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv` TO `db`.`t` AS SELECT 'x AS y' AS a, t.2 AS b FROM `db`.`s` AS t FINAL";
+        assert_sqlparser_rejects(sql);
+        let mv = InfrastructureMap::try_migrate_sql_resource_to_mv(&mv_resource(sql), "local")
+            .expect("library-shaped MV should migrate without sqlparser");
+        assert_eq!(mv.target_table, "t");
+        assert_eq!(mv.target_database.as_deref(), Some("db"));
+        assert!(
+            mv.select_sql.starts_with("SELECT 'x AS y' AS a"),
+            "select was: {}",
+            mv.select_sql
+        );
+        assert_eq!(mv.source_tables, vec!["s".to_string()]);
+
+        // The names match what the sqlparser path reads from the same header.
+        let parseable = "CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv` TO `db`.`t` AS SELECT a FROM `db`.`s`";
+        let parsed =
+            InfrastructureMap::try_migrate_sql_resource_to_mv(&mv_resource(parseable), "local")
+                .expect("parseable MV migrates");
+        assert_eq!(parsed.target_table, mv.target_table);
+        assert_eq!(parsed.target_database, mv.target_database);
+        assert_eq!(parsed.source_tables, mv.source_tables);
+    }
+
+    #[test]
+    fn fallback_without_select_returns_none() {
+        let sql = "CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO t";
+        assert_sqlparser_rejects(sql);
+        assert!(
+            InfrastructureMap::try_migrate_sql_resource_to_mv(&mv_resource(sql), "local").is_none()
+        );
     }
 
     #[test]

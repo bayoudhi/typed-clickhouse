@@ -177,6 +177,9 @@ fn empty_map() -> InfrastructureMap {
 ///   whose name the formatter quotes on one side only (defect 6)
 /// - `mv_device_snapshot`: refreshable MV (`EVERY 1 DAY OFFSET 10 HOUR`) into
 ///   `device_snapshot`; the clause is stored in `create_table_query`
+/// - `mv_device_pairs`: refreshable MV into `device_pairs` whose SELECT
+///   (tuple element access, an aliased `JOIN … FINAL`) sqlparser rejects, so
+///   it is read back from text alone
 /// - `p_by_device`: references modified columns, so it cascades from 1 and 2
 ///
 /// ClickHouse checks that a view's sources exist, so the schema is built in
@@ -271,6 +274,23 @@ fn fixture(stage: Stage) -> InfrastructureMap {
              LEFT JOIN sensor_readings AS r ON d.id = r.deviceId \
              GROUP BY d.id",
         );
+        map.materialized_views.insert(mv.name.clone(), mv);
+
+        let pairs = table(
+            "device_pairs",
+            vec![
+                column("id", ColumnType::String),
+                column("label", ColumnType::String),
+            ],
+            &["id"],
+            ClickhouseEngine::MergeTree,
+        );
+        map.tables.insert(pairs.id(DB), pairs);
+        let mv = pairs_view(&format!(
+            "SELECT r.deviceId AS id, tuple(d.id, d.label).2 AS label \
+             FROM {DB}.sensor_readings AS r \
+             JOIN {DB}.devices AS d FINAL ON r.deviceId = d.id"
+        ));
         map.materialized_views.insert(mv.name.clone(), mv);
 
         let views = [
@@ -369,6 +389,24 @@ fn snapshot_view(select_sql: &str) -> MaterializedView {
             append: false,
             unmodelled: None,
         }),
+    }
+}
+
+/// The refreshable view of the fixture whose SELECT sqlparser rejects.
+fn pairs_view(select_sql: &str) -> MaterializedView {
+    MaterializedView {
+        name: "mv_device_pairs".to_string(),
+        source_tables: vec!["`sensor_readings`".to_string(), "`devices`".to_string()],
+        target_table: "device_pairs".to_string(),
+        refresh: Some(RefreshSchedule {
+            kind: RefreshKind::Every,
+            interval: every(1, IntervalUnit::Hour),
+            offset: None,
+            randomize_for: None,
+            append: false,
+            unmodelled: None,
+        }),
+        ..snapshot_view(select_sql)
     }
 }
 
@@ -472,8 +510,18 @@ async fn apply(project: &Project, from: &InfrastructureMap, to: &InfrastructureM
 /// Plans `target` against the live database the way `plan_changes` does, with
 /// `target` standing in for the state a previous deploy of it would have stored.
 async fn plan_against_reality(project: &Project, target: &InfrastructureMap) -> InfraChanges {
+    plan_from_state(project, target, target).await
+}
+
+/// Plans `target` against the live database the way `plan_changes` does, with
+/// `stored` as the state a previous deploy stored.
+async fn plan_from_state(
+    project: &Project,
+    stored: &InfrastructureMap,
+    target: &InfrastructureMap,
+) -> InfraChanges {
     let filter = ReconciliationFilter::from_infra_map(target);
-    let reconciled = reconcile_with_reality(project, target, &filter, create_client(config()))
+    let reconciled = reconcile_with_reality(project, stored, &filter, create_client(config()))
         .await
         .unwrap_or_else(|e| panic!("reconciling with reality failed: {e:?}"));
     let normalizer = create_client(config());
@@ -783,6 +831,70 @@ async fn live_refresh_select_change_drops_only_the_view() {
     ))
     .await;
     assert_eq!(view_drops, 1, "the query log did not record the view drop");
+}
+
+#[tokio::test]
+async fn live_unparseable_select_round_trips() {
+    if !enabled() {
+        eprintln!("skipping: set TC_LIVE_CLICKHOUSE=1 to run against a live ClickHouse");
+        return;
+    }
+
+    let project = project();
+    let full = apply_full_fixture(&project).await;
+
+    // A SELECT change is planned as a drop and recreate of the view only.
+    let mut changed = full.clone();
+    changed
+        .materialized_views
+        .get_mut("mv_device_pairs")
+        .expect("fixture has the pairs view")
+        .select_sql
+        .push_str(" WHERE d.label != ''");
+    let changes = plan_against_reality(&project, &changed).await;
+    let (teardown, setup) = order_olap_changes(&changes.olap_changes, DB).unwrap();
+    assert!(
+        matches!(
+            teardown.as_slice(),
+            [AtomicOlapOperation::DropMaterializedView { mv, .. }] if mv.name == "mv_device_pairs"
+        ),
+        "expected only the view drop, got {teardown:?}"
+    );
+    assert!(
+        matches!(
+            setup.as_slice(),
+            [AtomicOlapOperation::CreateMaterializedView { mv, .. }] if mv.name == "mv_device_pairs"
+        ),
+        "expected only the view create, got {setup:?}"
+    );
+
+    apply(&project, &full, &changed).await;
+    let create = create_table_query("mv_device_pairs").await;
+    assert!(
+        create.contains("label != ''"),
+        "server did not record the new SELECT: {create}"
+    );
+    let after = plan_against_reality(&project, &changed).await;
+    let phantoms: Vec<String> = after.olap_changes.iter().map(describe).collect();
+    assert!(
+        phantoms.is_empty(),
+        "changes remain after recreating the view:\n{}",
+        phantoms.join("\n")
+    );
+
+    // Removing the view from code plans its drop.
+    let mut removed = changed.clone();
+    removed.materialized_views.remove("mv_device_pairs");
+    let changes = plan_from_state(&project, &changed, &removed).await;
+    let (teardown, setup) = order_olap_changes(&changes.olap_changes, DB).unwrap();
+    assert!(
+        matches!(
+            teardown.as_slice(),
+            [AtomicOlapOperation::DropMaterializedView { mv, .. }] if mv.name == "mv_device_pairs"
+        ),
+        "expected only the view drop, got {teardown:?}"
+    );
+    assert!(setup.is_empty(), "unexpected setup: {setup:?}");
 }
 
 #[tokio::test]
