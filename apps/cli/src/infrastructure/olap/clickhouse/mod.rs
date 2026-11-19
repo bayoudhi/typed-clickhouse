@@ -3637,7 +3637,8 @@ fn reconstruct_sql_resource_common(
     let source_tables = match extract_source_tables_from_query(&as_select) {
         Ok(tables) => tables,
         Err(e) => {
-            warn!(
+            // Expected for ClickHouse-only syntax, which the regex fallback handles.
+            debug!(
                 "Could not parse {} query with standard SQL parser ({}), using regex fallback",
                 name, e
             );

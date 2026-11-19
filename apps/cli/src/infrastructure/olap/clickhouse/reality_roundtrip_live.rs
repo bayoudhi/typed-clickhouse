@@ -882,6 +882,41 @@ async fn live_unparseable_select_round_trips() {
         phantoms.join("\n")
     );
 
+    // A schedule-only change is one MODIFY REFRESH, not a drop and recreate.
+    let mut rescheduled = changed.clone();
+    rescheduled
+        .materialized_views
+        .get_mut("mv_device_pairs")
+        .expect("fixture has the pairs view")
+        .refresh
+        .as_mut()
+        .expect("pairs view is refreshable")
+        .interval = every(2, IntervalUnit::Hour);
+    let changes = plan_against_reality(&project, &rescheduled).await;
+    let (teardown, setup) = order_olap_changes(&changes.olap_changes, DB).unwrap();
+    assert!(teardown.is_empty(), "unexpected teardown: {teardown:?}");
+    assert!(
+        matches!(
+            setup.as_slice(),
+            [AtomicOlapOperation::ModifyMaterializedViewRefresh { mv, .. }] if mv.name == "mv_device_pairs"
+        ),
+        "expected exactly one ModifyMaterializedViewRefresh, got {setup:?}"
+    );
+    apply(&project, &changed, &rescheduled).await;
+    let create = create_table_query("mv_device_pairs").await;
+    assert!(
+        create.contains("EVERY 2 HOUR"),
+        "server did not record the new schedule: {create}"
+    );
+    let after = plan_against_reality(&project, &rescheduled).await;
+    let phantoms: Vec<String> = after.olap_changes.iter().map(describe).collect();
+    assert!(
+        phantoms.is_empty(),
+        "changes remain after MODIFY REFRESH:\n{}",
+        phantoms.join("\n")
+    );
+    let changed = rescheduled;
+
     // Removing the view from code plans its drop.
     let mut removed = changed.clone();
     removed.materialized_views.remove("mv_device_pairs");

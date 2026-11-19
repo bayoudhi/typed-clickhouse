@@ -988,6 +988,54 @@ mod tests {
     }
 
     #[test]
+    fn splits_materialized_view_target() {
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            (
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO t AS SELECT a FROM s",
+                Some(("t", "SELECT a FROM s")),
+            ),
+            (
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS `db`.`mv` TO `db`.`t` AS SELECT 'x AS y' AS a",
+                Some(("`db`.`t`", "SELECT 'x AS y' AS a")),
+            ),
+            // The column list holds an AS of its own; the body starts after it.
+            (
+                "CREATE MATERIALIZED VIEW mv TO t (a String, b String ALIAS a) AS SELECT a FROM s",
+                Some(("t", "SELECT a FROM s")),
+            ),
+            (
+                "CREATE MATERIALIZED VIEW mv ON CLUSTER c TO db.t AS SELECT a FROM s",
+                Some(("db.t", "SELECT a FROM s")),
+            ),
+            // A view named `to` is not the target keyword.
+            (
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS to TO t AS SELECT 1",
+                Some(("t", "SELECT 1")),
+            ),
+            (
+                "CREATE MATERIALIZED VIEW mv TO t AS   SELECT 1  ",
+                Some(("t", "SELECT 1")),
+            ),
+            ("CREATE MATERIALIZED VIEW IF NOT EXISTS mv TO t", None),
+            ("CREATE MATERIALIZED VIEW mv TO t AS   ", None),
+            ("CREATE MATERIALIZED VIEW mv TO AS SELECT 1", None),
+            ("CREATE MATERIALIZED VIEW mv TO db. AS SELECT 1", None),
+            // TO only inside the body is not a target.
+            (
+                "CREATE MATERIALIZED VIEW mv ENGINE = Memory AS SELECT 1 TO x",
+                None,
+            ),
+        ];
+        for (src, expected) in cases {
+            assert_eq!(
+                split_materialized_view_target(src),
+                *expected,
+                "input: {src}"
+            );
+        }
+    }
+
+    #[test]
     fn split_ignores_view_named_refresh() {
         let src = "CREATE MATERIALIZED VIEW refresh TO t AS SELECT 1";
         assert_eq!(split_refresh_clause(src), (src.to_string(), None));
